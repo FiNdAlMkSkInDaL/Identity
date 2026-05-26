@@ -1,0 +1,6 @@
+/target/
+/.sovereign/
+*.db
+*.db-shm
+*.db-wal
+

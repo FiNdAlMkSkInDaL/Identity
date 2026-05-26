@@ -1,0 +1,336 @@
+use sovereignd::filesystem::{FileWatcher, FileWatcherConfig};
+use sovereignd::identity::IdentityStore;
+use sovereignd::processor::{process_once, process_once_if_idle, promote_once};
+use sovereignd::proxy::LocalCaptureServer;
+use sovereignd::slice::{build_prompt_package, generate_meslice};
+use sovereignd::transit::{TransitBuffer, DEFAULT_PROCESSING_LEASE_MS};
+use sovereignd::workspace::SovereignPaths;
+use std::env;
+use std::error::Error;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("sovereignd error: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let mut args = raw_args.iter().cloned();
+    let command = args.next().unwrap_or_else(|| "init".to_string());
+
+    let paths = SovereignPaths::from_default_home()?;
+    paths.ensure()?;
+
+    match command.as_str() {
+        "init" => {
+            let _buffer = TransitBuffer::open(&paths)?;
+            println!(
+                "initialized Sovereign workspace at {}",
+                paths.root.display()
+            );
+            println!("identity ledger: {}", paths.identity_dir.display());
+            println!("transit buffer: {}", paths.transit_db.display());
+        }
+        "ingest" => {
+            let source = read_flag(&raw_args, "--source").unwrap_or_else(|| "manual".to_string());
+            let content = read_flag(&raw_args, "--content")
+                .ok_or("missing required --content value for ingest command")?;
+
+            let buffer = TransitBuffer::open(&paths)?;
+            let id = buffer.ingest_text(&source, &content)?;
+
+            println!("queued captured event #{id} from {source}");
+        }
+        "list" => {
+            let buffer = TransitBuffer::open(&paths)?;
+            let events = buffer.list_recent(10)?;
+
+            if events.is_empty() {
+                println!("no captured events queued");
+            }
+
+            for event in events {
+                println!(
+                    "#{id} [{status}] retry={retry_count} {source} @ {captured_at_ms}: {content}{error}",
+                    id = event.id,
+                    status = event.status,
+                    retry_count = event.retry_count,
+                    source = event.source,
+                    captured_at_ms = event.captured_at_ms,
+                    content = event.content.replace('\n', " "),
+                    error = event
+                        .error
+                        .as_ref()
+                        .map(|value| format!(" error={value}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        "stats" => {
+            let buffer = TransitBuffer::open(&paths)?;
+            let counts = buffer.status_counts()?;
+
+            if counts.is_empty() {
+                println!("no transit events recorded");
+            }
+
+            for count in counts {
+                println!("{}={}", count.status, count.count);
+            }
+        }
+        "repair-transit" => {
+            let lease_ms = read_flag(&raw_args, "--lease-ms")
+                .map(|value| value.parse::<i64>())
+                .transpose()?
+                .unwrap_or(DEFAULT_PROCESSING_LEASE_MS);
+            let buffer = TransitBuffer::open(&paths)?;
+            let summary = buffer.repair_stale_processing(lease_ms)?;
+
+            println!(
+                "repaired transit buffer: stale_processing_requeued={}",
+                summary.stale_processing_requeued
+            );
+        }
+        "cleaned-list" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let buffer = TransitBuffer::open(&paths)?;
+            let events = buffer.list_cleaned_recent(limit)?;
+
+            if events.is_empty() {
+                println!("no cleaned events staged");
+            }
+
+            for event in events {
+                println!(
+                    "#{id} capture=#{capture_id} {source} hash={hash} @ {cleaned_at_ms}: {content}",
+                    id = event.id,
+                    capture_id = event.captured_event_id,
+                    source = event.source,
+                    hash = event.content_hash,
+                    cleaned_at_ms = event.cleaned_at_ms,
+                    content = event.cleaned_content.replace('\n', " ")
+                );
+            }
+        }
+        "memory-list" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let store = IdentityStore::open(&paths)?;
+            let memories = store.list_recent(limit)?;
+
+            if memories.is_empty() {
+                println!("no memory nodes stored");
+            }
+
+            for memory in memories {
+                println!(
+                    "#{id} cleaned=#{cleaned_id} {domain}/{entity} {source} hash={hash} @ {created_at_ms}: {summary}",
+                    id = memory.id,
+                    cleaned_id = memory.cleaned_event_id,
+                    domain = memory.domain_context,
+                    entity = memory.entity_type,
+                    source = memory.source,
+                    hash = memory.content_hash,
+                    created_at_ms = memory.created_at_ms,
+                    summary = memory.summary.replace('\n', " ")
+                );
+            }
+        }
+        "memory-search" => {
+            let query = read_flag(&raw_args, "--query")
+                .or_else(|| read_flag(&raw_args, "-q"))
+                .ok_or("missing required --query value for memory-search command")?;
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(5);
+            let store = IdentityStore::open(&paths)?;
+            let results = store.search(&query, limit)?;
+
+            if results.is_empty() {
+                println!("no memory search results");
+            }
+
+            for result in results {
+                let memory = result.node;
+                println!(
+                    "#{id} score={score} cleaned={cleaned_id} {domain}/{entity} {source}: {summary}",
+                    id = memory.id,
+                    score = result.score,
+                    cleaned_id = memory.cleaned_event_id,
+                    domain = memory.domain_context,
+                    entity = memory.entity_type,
+                    source = memory.source,
+                    summary = memory.summary.replace('\n', " ")
+                );
+            }
+        }
+        "slice-preview" => {
+            let intent = read_flag(&raw_args, "--intent")
+                .or_else(|| read_flag(&raw_args, "--query"))
+                .ok_or("missing required --intent value for slice-preview command")?;
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(3);
+            let meslice = generate_meslice(&paths, &intent, limit)?;
+
+            println!("{}", meslice.to_context_block());
+        }
+        "prompt-package" => {
+            let intent = read_flag(&raw_args, "--intent")
+                .or_else(|| read_flag(&raw_args, "--query"))
+                .ok_or("missing required --intent value for prompt-package command")?;
+            let prompt = read_flag(&raw_args, "--prompt")
+                .ok_or("missing required --prompt value for prompt-package command")?;
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(3);
+            let package = build_prompt_package(&paths, &intent, &prompt, limit)?;
+
+            println!("{package}");
+        }
+        "process-once" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let summary = process_once(&paths, limit)?;
+
+            println!(
+                "processed transit batch: claimed={claimed} processed={processed} failed={failed} skipped_idle_gate={skipped}",
+                claimed = summary.claimed,
+                processed = summary.processed,
+                failed = summary.failed,
+                skipped = summary.skipped_idle_gate
+            );
+        }
+        "process-idle-once" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let idle_ms = read_flag(&raw_args, "--idle-ms")
+                .map(|value| value.parse::<u64>())
+                .transpose()?
+                .unwrap_or(5000);
+            let summary = process_once_if_idle(&paths, limit, idle_ms)?;
+
+            println!(
+                "idle-gated transit batch: claimed={claimed} processed={processed} failed={failed} skipped_idle_gate={skipped}",
+                claimed = summary.claimed,
+                processed = summary.processed,
+                failed = summary.failed,
+                skipped = summary.skipped_idle_gate
+            );
+        }
+        "promote-once" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let summary = promote_once(&paths, limit)?;
+
+            println!(
+                "promoted cleaned batch: claimed={claimed} promoted={promoted} failed={failed}",
+                claimed = summary.claimed,
+                promoted = summary.promoted,
+                failed = summary.failed
+            );
+        }
+        "serve" => {
+            let addr = read_flag(&raw_args, "--addr")
+                .unwrap_or_else(|| "127.0.0.1:8080".to_string())
+                .parse::<SocketAddr>()?;
+            ensure_loopback_addr(addr, has_flag(&raw_args, "--allow-non-loopback"))?;
+            let server = LocalCaptureServer::new(addr, paths);
+
+            println!("press Ctrl+C to stop sovereignd");
+            server.run().await?;
+        }
+        "watch" => {
+            let watch_path = read_flag(&raw_args, "--path")
+                .map(PathBuf::from)
+                .ok_or("missing required --path value for watch command")?;
+            let recursive = !has_flag(&raw_args, "--non-recursive");
+
+            if !watch_path.exists() {
+                return Err(format!("watch path does not exist: {}", watch_path.display()).into());
+            }
+
+            let watcher = FileWatcher::new(
+                paths,
+                FileWatcherConfig {
+                    root: watch_path,
+                    recursive,
+                },
+            );
+
+            println!("press Ctrl+C to stop filesystem watching");
+            watcher.run().await?;
+        }
+        "help" | "--help" | "-h" => print_help(),
+        other => {
+            return Err(format!("unknown command '{other}'. Run `sovereignd help`.").into());
+        }
+    }
+
+    Ok(())
+}
+
+fn read_flag(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<(), Box<dyn Error>> {
+    if addr.ip().is_loopback() || allow_non_loopback {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to bind capture endpoint to non-loopback address {addr}; pass --allow-non-loopback only for explicit local development"
+        )
+        .into())
+    }
+}
+
+fn print_help() {
+    println!(
+        "sovereignd\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  list\n  stats\n  repair-transit [--lease-ms 300000]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-search --query <text> [--limit 5]\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive]"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_loopback_addr;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn serve_rejects_non_loopback_addresses_by_default() {
+        let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert!(ensure_loopback_addr(addr, false).is_err());
+        assert!(ensure_loopback_addr(addr, true).is_ok());
+    }
+
+    #[test]
+    fn serve_allows_loopback_addresses() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(ensure_loopback_addr(addr, false).is_ok());
+    }
+}
