@@ -161,7 +161,7 @@ mod tests {
     fn allows_normal_local_notes() {
         validate_capture(
             "manual",
-            "Sovereign should ingest local project notes and markdown safely.",
+            "Identity should ingest local project notes and markdown safely.",
         )
         .unwrap();
     }

@@ -1,5 +1,6 @@
 /target/
-/.sovereign/
+/target-h/
+/.identity/
 *.db
 *.db-shm
 *.db-wal

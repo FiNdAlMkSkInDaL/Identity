@@ -1,10 +1,10 @@
-# Technical Challenges and Moats: Sovereign
+# Technical Challenges and Moats: Identity
 
 This document captures the hardest engineering problems behind Identity and the `.me` protocol. These are not just implementation details; they are the technical moats that make the idea ambitious, defensible, and difficult to copy.
 
 ## 1. Local Vector Synthesis via Edge Compute
 
-To maintain true privacy, Sovereign cannot send raw user data such as browsing history, email, documents, app usage, calendar activity, or messages to a cloud server to build the `.me` file.
+To maintain true privacy, Identity cannot send raw user data such as browsing history, email, documents, app usage, calendar activity, or messages to a cloud server to build the `.me` file.
 
 The data must be digested, structured, summarized, and vectorized directly on the user's physical device or trusted edge environment.
 
@@ -12,7 +12,7 @@ The data must be digested, structured, summarized, and vectorized directly on th
 
 Most modern machine learning data pipelines assume centralized cloud infrastructure: large GPU clusters, centralized storage, and bulk user-data aggregation.
 
-Sovereign inverts that model. The core intelligence pipeline moves from centralized cloud GPUs to consumer hardware: CPUs, GPUs, NPUs, and local acceleration APIs.
+Identity inverts that model. The core intelligence pipeline moves from centralized cloud GPUs to consumer hardware: CPUs, GPUs, NPUs, and local acceleration APIs.
 
 ### Why It Is Hard
 
@@ -24,7 +24,7 @@ See [Local Vector Synthesis Architecture](local-vector-synthesis-architecture.md
 
 ## 2. Cryptographic Context Fragmentation
 
-When an external AI agent requests context to perform a task, the user cannot simply hand over the raw `.me` vector file. If a platform receives the entire vector database, it effectively gains ownership over the user's personal context, destroying the sovereignty model.
+When an external AI agent requests context to perform a task, the user cannot simply hand over the raw `.me` vector file. If a platform receives the entire vector database, it effectively gains ownership over the user's personal context, destroying the Identity model.
 
 The `.me` protocol needs an ephemeral handshake: a way to share only the minimum context required for a single task, for a limited time, with strict authorization boundaries.
 
@@ -58,7 +58,7 @@ The system must track what an agent did across APIs and web surfaces, extract th
 
 ### Why It Is Hard
 
-Agentic sessions are often stateless and ephemeral. Sovereign must capture transaction outputs before the remote agent clears its cache and terminates the session.
+Agentic sessions are often stateless and ephemeral. Identity must capture transaction outputs before the remote agent clears its cache and terminates the session.
 
 It needs a dynamic parsing engine that observes background actions, extracts meaningful structural updates, and appends them to the local vector knowledge graph without creating recursive loops, duplicate memories, conflicting facts, or corrupted state.
 
@@ -72,7 +72,7 @@ Large technology companies can build powerful assistants, but they cannot easily
 
 Their business and infrastructure models generally rely on centralizing user data in cloud systems, training large models on aggregated behavior, and preserving platform lock-in.
 
-Sovereign flips that architecture. It creates an infrastructure-level buffer that protects the user from platforms while still allowing the user to receive full AI-agent utility.
+Identity flips that architecture. It creates an infrastructure-level buffer that protects the user from platforms while still allowing the user to receive full AI-agent utility.
 
 The moat is therefore not only technical. It is structural:
 
@@ -84,7 +84,7 @@ The moat is therefore not only technical. It is structural:
 
 ## 5. Moat Summary
 
-The defensibility of Sovereign comes from solving four problems together:
+The defensibility of Identity comes from solving four problems together:
 
 1. Local semantic synthesis without cloud ingestion.
 2. Minimal, encrypted, task-bound context sharing.

@@ -1,8 +1,8 @@
-# Agent Constraints and Performance Budget: Sovereign
+# Agent Constraints and Performance Budget: Identity
 
-This document is a system-prompt supplement for automated coding agents working on Sovereign.
+This document is a system-prompt supplement for automated coding agents working on Identity.
 
-Sovereign runs on user edge hardware. Every kilobyte of memory overhead and every millisecond of latency matters. Agents must follow a subtractive engineering paradigm: do not write code for hypothetical future feature sets. Build the smallest low-level module required for the immediate implementation target.
+Identity runs on user edge hardware. Every kilobyte of memory overhead and every millisecond of latency matters. Agents must follow a subtractive engineering paradigm: do not write code for hypothetical future feature sets. Build the smallest low-level module required for the immediate implementation target.
 
 ## 1. Resource Budgets
 
@@ -10,7 +10,7 @@ Any architecture that requires a breach of these budgets should be rejected or b
 
 | Budget | Limit |
 | :--- | :--- |
-| Production daemon binary, `sovereignd` | Under 15 MB |
+| Production daemon binary, `identityd` | Under 15 MB |
 | Idle background RAM | Under 35 MB |
 | Peak ingestion RAM during local SLM bursts | Under 120 MB |
 | Cold startup to OS hook binding | Under 150ms |
@@ -63,14 +63,14 @@ Before committing substantial daemon changes, agents should run or simulate:
 
 ```bash
 cargo tree --duplicates
-cargo test -p sovereignd
-cargo build --release -p sovereignd
+cargo test -p identityd
+cargo build --release -p identityd
 ```
 
 On Windows PowerShell, binary size can be checked with:
 
 ```powershell
-(Get-Item target/release/sovereignd.exe).Length
+(Get-Item target/release/identityd.exe).Length
 ```
 
 The release binary must remain under 15 MB unless a human explicitly approves a temporary breach.

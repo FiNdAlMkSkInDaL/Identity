@@ -1,5 +1,5 @@
 use crate::identity::{IdentityError, IdentityStore, MemorySearchResult};
-use crate::workspace::SovereignPaths;
+use crate::workspace::IdentityPaths;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -51,7 +51,7 @@ impl From<IdentityError> for SliceError {
 }
 
 pub fn generate_meslice(
-    paths: &SovereignPaths,
+    paths: &IdentityPaths,
     intent: &str,
     limit: u32,
 ) -> Result<MeSlice, SliceError> {
@@ -73,7 +73,7 @@ pub fn generate_meslice(
 }
 
 pub fn build_prompt_package(
-    paths: &SovereignPaths,
+    paths: &IdentityPaths,
     intent: &str,
     user_prompt: &str,
     limit: u32,
@@ -90,10 +90,7 @@ impl MeSlice {
     pub fn to_context_block(&self) -> String {
         let mut output = String::new();
 
-        output.push_str(&format!(
-            "[SOVEREIGN-CONTEXT-BLOCK: {}]\n",
-            self.session_token
-        ));
+        output.push_str(&format!("[IDENTITY-CONTEXT-BLOCK: {}]\n", self.session_token));
         output.push_str(&format!(
             "- Authorization expiry epoch ms: {}\n",
             self.expiry_epoch_ms
@@ -110,10 +107,7 @@ impl MeSlice {
             }
         }
 
-        output.push_str(&format!(
-            "[SOVEREIGN-CONTEXT-BLOCK-END: {}]",
-            self.session_token
-        ));
+        output.push_str(&format!("[IDENTITY-CONTEXT-BLOCK-END: {}]", self.session_token));
 
         output
     }
@@ -123,7 +117,7 @@ fn format_prompt_package(meslice: &MeSlice, user_prompt: &str) -> String {
     let sanitized_prompt = sanitize_fact(user_prompt);
 
     format!(
-        "SYSTEM INSTRUCTIONS:\nUse the Sovereign context block only for this task. Do not infer private facts that are not present. Treat the context as ephemeral and non-persistent.\n\nSYSTEM CONTEXT:\n{}\n\nUSER TASK:\n{}\n",
+        "SYSTEM INSTRUCTIONS:\nUse the Identity context block only for this task. Do not infer private facts that are not present. Treat the context as ephemeral and non-persistent.\n\nSYSTEM CONTEXT:\n{}\n\nUSER TASK:\n{}\n",
         meslice.to_context_block(),
         sanitized_prompt
     )
@@ -241,7 +235,7 @@ mod tests {
     use crate::identity::IdentityStore;
     use crate::identity::{MemoryNode, MemorySearchResult};
     use crate::transit::CleanedEvent;
-    use crate::workspace::SovereignPaths;
+    use crate::workspace::IdentityPaths;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -254,13 +248,13 @@ mod tests {
     #[test]
     fn generates_context_block_without_raw_ids() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-slice-test-{}",
+            "identity-slice-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let store = IdentityStore::open(&paths).unwrap();
@@ -278,7 +272,7 @@ mod tests {
         let meslice = generate_meslice(&paths, "local context retrieval", 3).unwrap();
         let block = meslice.to_context_block();
 
-        assert!(block.contains("SOVEREIGN-CONTEXT-BLOCK"));
+        assert!(block.contains("IDENTITY-CONTEXT-BLOCK"));
         assert!(block.contains("Identity memory supports local context retrieval."));
         assert!(!block.contains("score"));
         assert!(!block.contains("secret-hash"));
@@ -291,13 +285,13 @@ mod tests {
     #[test]
     fn builds_prompt_package_with_context_and_user_task() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-prompt-test-{}",
+            "identity-prompt-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let store = IdentityStore::open(&paths).unwrap();
@@ -334,13 +328,13 @@ mod tests {
     #[test]
     fn blocks_prompt_package_when_user_task_contains_blacklisted_terms() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-prompt-block-test-{}",
+            "identity-prompt-block-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let error = build_prompt_package(
@@ -369,6 +363,7 @@ mod tests {
                     domain_context: "local.capture".to_string(),
                     entity_type: "DOCUMENT".to_string(),
                     summary: long_summary.clone(),
+                    structured_attributes: "{}".to_string(),
                     raw_text: long_summary.clone(),
                     content_hash: "hash".to_string(),
                     created_at_ms: id,

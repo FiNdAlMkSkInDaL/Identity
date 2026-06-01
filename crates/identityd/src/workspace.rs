@@ -5,10 +5,11 @@ use std::io;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub struct SovereignPaths {
+pub struct IdentityPaths {
     pub root: PathBuf,
     pub identity_dir: PathBuf,
     pub identity_db: PathBuf,
+    pub vector_store_dir: PathBuf,
     pub transit_db: PathBuf,
     pub logs_dir: PathBuf,
 }
@@ -36,15 +37,16 @@ impl From<io::Error> for WorkspaceError {
     }
 }
 
-impl SovereignPaths {
+impl IdentityPaths {
     pub fn from_default_home() -> Result<Self, WorkspaceError> {
         let home = home_dir()?;
-        Ok(Self::from_root(home.join(".sovereign")))
+        Ok(Self::from_root(home.join(".identity")))
     }
 
     pub fn from_root(root: PathBuf) -> Self {
         let identity_dir = root.join("identity.me");
         let identity_db = identity_dir.join("state.db");
+        let vector_store_dir = identity_dir.join("vectors");
         let transit_db = root.join("transit.db");
         let logs_dir = root.join("logs");
 
@@ -52,6 +54,7 @@ impl SovereignPaths {
             root,
             identity_dir,
             identity_db,
+            vector_store_dir,
             transit_db,
             logs_dir,
         }
@@ -60,6 +63,7 @@ impl SovereignPaths {
     pub fn ensure(&self) -> Result<(), WorkspaceError> {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.identity_dir)?;
+        fs::create_dir_all(&self.vector_store_dir)?;
         fs::create_dir_all(&self.logs_dir)?;
         Ok(())
     }
@@ -74,15 +78,16 @@ fn home_dir() -> Result<PathBuf, WorkspaceError> {
 
 #[cfg(test)]
 mod tests {
-    use super::SovereignPaths;
+    use super::IdentityPaths;
 
     #[test]
     fn derives_expected_paths_from_root() {
-        let paths = SovereignPaths::from_root("C:/tmp/sovereign-test".into());
+        let paths = IdentityPaths::from_root("C:/tmp/identity-test".into());
 
-        assert!(paths.root.ends_with(".") || paths.root.ends_with("sovereign-test"));
+        assert!(paths.root.ends_with(".") || paths.root.ends_with("identity-test"));
         assert!(paths.identity_dir.ends_with("identity.me"));
         assert!(paths.identity_db.ends_with("state.db"));
+        assert!(paths.vector_store_dir.ends_with("vectors"));
         assert!(paths.transit_db.ends_with("transit.db"));
         assert!(paths.logs_dir.ends_with("logs"));
     }

@@ -1,4 +1,5 @@
 pub const EMBEDDING_DIM: usize = 384;
+pub const EMBEDDING_MODEL_ID: &str = "identity-hash-embedding-v1";
 
 pub fn embed_text(input: &str) -> [f32; EMBEDDING_DIM] {
     let mut vector = [0.0; EMBEDDING_DIM];

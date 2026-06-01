@@ -1,8 +1,8 @@
-# Sovereign Coding Agent Specification
+# Identity Coding Agent Specification
 
 This file is the canonical implementation brief for AI coding agents working in this repository.
 
-Sovereign is a local-first identity and context protocol. The user owns a dynamic encrypted `.me` state bank. External agents must never receive the full `.me` graph; they receive only scoped, ephemeral `.meslice` payloads.
+Identity is a local-first identity and context protocol. The user owns a dynamic encrypted `.me` state bank. External agents must never receive the full `.me` graph; they receive only scoped, ephemeral `.meslice` payloads.
 
 ## Macro Architecture
 
@@ -30,13 +30,13 @@ Sovereign is a local-first identity and context protocol. The user owns a dynami
 
 ## Current Code Spine
 
-The first implementation lives in `crates/sovereignd`.
+The first implementation lives in `crates/identityd`.
 
 Current responsibility:
 
-- Create the local Sovereign workspace.
-- Create `~/.sovereign/identity.me`.
-- Create `~/.sovereign/transit.db`.
+- Create the local Identity workspace.
+- Create `~/.identity/identity.me`.
+- Create `~/.identity/transit.db`.
 - Store captured raw text events in a local SQLite transit buffer.
 
 Do not start by building UI, cloud sync, model orchestration, or cryptographic protocol machinery until the local daemon and ingestion pipeline are stable.
@@ -176,10 +176,10 @@ External prompt
 Client-side injection envelope:
 
 ```text
-[SOVEREIGN-CONTEXT-BLOCK: ID_884920]
+[IDENTITY-CONTEXT-BLOCK: ID_884920]
 - Ephemeral tokenized context segment payload
 - Authorization expiry signature: POSIX_TIMESTAMP + 2000MS
-[SOVEREIGN-CONTEXT-BLOCK-END: ID_884920]
+[IDENTITY-CONTEXT-BLOCK-END: ID_884920]
 ```
 
 TEE pathway is later-stage protocol work. Do not make it an MVP dependency.
@@ -288,7 +288,7 @@ If the local proxy drops or a website prevents loopback routing:
 
 Phase 1, days 1-30:
 
-- Build `sovereignd`.
+- Build `identityd`.
 - Establish local workspace and transit buffer.
 - Add filesystem/accessibility/proxy ingestion.
 - Add local embedding and LanceDB storage.
@@ -310,9 +310,9 @@ Phase 3, days 61-90+:
 
 ## Next Agent Execution Steps
 
-Start from the existing `sovereignd` crate. The next code changes should be:
+Start from the existing `identityd` crate. The next code changes should be:
 
-1. Add `tokio` to `crates/sovereignd`.
+1. Add `tokio` to `crates/identityd`.
 2. Introduce an async daemon entrypoint.
 3. Add a local loopback proxy skeleton on `127.0.0.1:8080`.
 4. Parse `text/html` responses into clean text using a conservative HTML parser.

@@ -1,6 +1,6 @@
-# Local Vector Synthesis Architecture: Sovereign
+# Local Vector Synthesis Architecture: Identity
 
-This document proposes the architecture for solving the first major Sovereign challenge: local vector synthesis via edge compute.
+This document proposes the architecture for solving the first major Identity challenge: local vector synthesis via edge compute.
 
 The goal is to eliminate cloud dependency by executing the complete data ingestion, synthesis, and vectorization pipeline directly on client hardware.
 
@@ -39,7 +39,7 @@ The architecture separates capture from synthesis. Real-time listeners collect l
 
 ## 2. Data Capture Layer
 
-Sovereign should avoid fragile browser extensions or application-specific plugins as the primary capture path. Instead, it runs a lightweight background daemon written in Rust for memory safety, low overhead, and predictable execution.
+Identity should avoid fragile browser extensions or application-specific plugins as the primary capture path. Instead, it runs a lightweight background daemon written in Rust for memory safety, low overhead, and predictable execution.
 
 ### OS-Level Accessibility Hooks
 
@@ -53,7 +53,7 @@ These APIs can pull raw text strings, active application context, window metadat
 
 ### Local Loopback Network Proxy
 
-Sovereign can provision a local loopback proxy on `127.0.0.1` for supported traffic flows.
+Identity can provision a local loopback proxy on `127.0.0.1` for supported traffic flows.
 
 Before raw HTML text is rendered inside a client browser, the proxy can intercept the stream, extract text nodes, strip styling and tracker noise, and transform DOM content into clean Markdown-like payloads for ingestion.
 
@@ -67,7 +67,7 @@ The daemon watches approved local folders using kernel-level file event APIs:
 - macOS: `FSEvents`
 - Windows: `ReadDirectoryChangesW`
 
-When new text-bearing assets are created or modified, Sovereign queues them for ingestion in the local transit buffer.
+When new text-bearing assets are created or modified, Identity queues them for ingestion in the local transit buffer.
 
 ## 3. Compute Layer
 
@@ -115,7 +115,7 @@ The target is millisecond-scale embedding for small chunks during processing bur
 
 ### Smart Throttling Engine
 
-To avoid degrading the user's active workflow, Sovereign should process queued data only under safe conditions.
+To avoid degrading the user's active workflow, Identity should process queued data only under safe conditions.
 
 The daemon monitors:
 
@@ -130,7 +130,7 @@ Captured text is first written to SQLite. When idle markers cross a threshold, s
 
 ## 4. Local Storage Layer
 
-Traditional vector databases are strong at similarity search but weak at modeling chronological evolution and durable identity state. Sovereign needs a hybrid vector-graph architecture.
+Traditional vector databases are strong at similarity search but weak at modeling chronological evolution and durable identity state. Identity needs a hybrid vector-graph architecture.
 
 ### Embedded Deployment Engine
 

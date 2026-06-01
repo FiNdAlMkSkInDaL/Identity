@@ -1,7 +1,7 @@
 use crate::identity::{IdentityError, IdentityStore};
 use crate::idle::{is_idle_for, IdleError};
 use crate::transit::{TransitBuffer, TransitError};
-use crate::workspace::SovereignPaths;
+use crate::workspace::IdentityPaths;
 use std::fmt;
 use std::time::Duration;
 
@@ -18,6 +18,13 @@ pub struct PromoteSummary {
     pub claimed: usize,
     pub promoted: usize,
     pub failed: usize,
+    pub redacted: usize,
+}
+
+#[derive(Debug)]
+pub struct PipelineSummary {
+    pub processed: ProcessSummary,
+    pub promoted: PromoteSummary,
 }
 
 #[derive(Debug)]
@@ -57,7 +64,7 @@ impl From<IdentityError> for ProcessError {
     }
 }
 
-pub fn process_once(paths: &SovereignPaths, limit: u32) -> Result<ProcessSummary, ProcessError> {
+pub fn process_once(paths: &IdentityPaths, limit: u32) -> Result<ProcessSummary, ProcessError> {
     let buffer = TransitBuffer::open(paths)?;
     let events = buffer.claim_queued(limit)?;
     let mut processed = 0;
@@ -85,7 +92,7 @@ pub fn process_once(paths: &SovereignPaths, limit: u32) -> Result<ProcessSummary
 }
 
 pub fn process_once_if_idle(
-    paths: &SovereignPaths,
+    paths: &IdentityPaths,
     limit: u32,
     min_idle_ms: u64,
 ) -> Result<ProcessSummary, ProcessError> {
@@ -101,7 +108,7 @@ pub fn process_once_if_idle(
     process_once(paths, limit)
 }
 
-pub fn promote_once(paths: &SovereignPaths, limit: u32) -> Result<PromoteSummary, ProcessError> {
+pub fn promote_once(paths: &IdentityPaths, limit: u32) -> Result<PromoteSummary, ProcessError> {
     let transit = TransitBuffer::open(paths)?;
     let identity = IdentityStore::open(paths)?;
     let cleaned_events = transit.list_cleaned_pending(limit)?;
@@ -121,10 +128,39 @@ pub fn promote_once(paths: &SovereignPaths, limit: u32) -> Result<PromoteSummary
         }
     }
 
+    let redaction = transit.redact_promoted_content(limit)?;
+
     Ok(PromoteSummary {
         claimed: cleaned_events.len(),
         promoted,
         failed,
+        redacted: redaction
+            .redacted_captured_events
+            .max(redaction.redacted_cleaned_events),
+    })
+}
+
+pub fn pipeline_once_if_idle(
+    paths: &IdentityPaths,
+    process_limit: u32,
+    promote_limit: u32,
+    min_idle_ms: u64,
+) -> Result<PipelineSummary, ProcessError> {
+    let processed = process_once_if_idle(paths, process_limit, min_idle_ms)?;
+    let promoted = if processed.skipped_idle_gate {
+        PromoteSummary {
+            claimed: 0,
+            promoted: 0,
+            failed: 0,
+            redacted: 0,
+        }
+    } else {
+        promote_once(paths, promote_limit)?
+    };
+
+    Ok(PipelineSummary {
+        processed,
+        promoted,
     })
 }
 
@@ -141,10 +177,10 @@ fn clean_for_next_stage(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_for_next_stage, process_once, promote_once};
+    use super::{clean_for_next_stage, pipeline_once_if_idle, process_once, promote_once};
     use crate::identity::IdentityStore;
     use crate::transit::TransitBuffer;
-    use crate::workspace::SovereignPaths;
+    use crate::workspace::IdentityPaths;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -152,21 +188,21 @@ mod tests {
     fn cleaner_discards_empty_content() {
         assert_eq!(clean_for_next_stage(" \n\t "), None);
         assert_eq!(
-            clean_for_next_stage("Sovereign\nkeeps\tlocal context"),
-            Some("Sovereign keeps local context".to_string())
+            clean_for_next_stage("Identity\nkeeps\tlocal context"),
+            Some("Identity keeps local context".to_string())
         );
     }
 
     #[test]
     fn process_and_promote_create_identity_memory() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-promote-test-{}",
+            "identity-promote-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let transit = TransitBuffer::open(&paths).unwrap();
@@ -179,11 +215,48 @@ mod tests {
 
         let promote = promote_once(&paths, 1).unwrap();
         assert_eq!(promote.promoted, 1);
+        assert_eq!(promote.redacted, 1);
 
         let identity = IdentityStore::open(&paths).unwrap();
         let memories = identity.list_recent(10).unwrap();
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].summary, "Local memory promotion works.");
+        let captured = transit.list_recent(10).unwrap();
+        let cleaned = transit.list_cleaned_recent(10).unwrap();
+        assert_eq!(captured[0].content, "");
+        assert_eq!(cleaned[0].cleaned_content, "");
+
+        drop(identity);
+        drop(transit);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pipeline_once_processes_and_promotes_when_idle_gate_passes() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-pipeline-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let transit = TransitBuffer::open(&paths).unwrap();
+        transit
+            .ingest_text("test:pipeline", "Pipeline writes local memory.")
+            .unwrap();
+
+        let summary = pipeline_once_if_idle(&paths, 10, 10, 0).unwrap();
+        assert_eq!(summary.processed.processed, 1);
+        assert_eq!(summary.promoted.promoted, 1);
+        assert_eq!(summary.promoted.redacted, 1);
+
+        let identity = IdentityStore::open(&paths).unwrap();
+        let memories = identity.list_recent(10).unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].summary, "Pipeline writes local memory.");
 
         drop(identity);
         drop(transit);

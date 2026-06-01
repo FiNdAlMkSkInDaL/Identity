@@ -1,6 +1,6 @@
-# Cryptographic Context Fragmentation and Ephemeral Handshake Architecture: Sovereign
+# Cryptographic Context Fragmentation and Ephemeral Handshake Architecture: Identity
 
-This document proposes the architecture for solving the second major Sovereign challenge: cryptographic context fragmentation and trustless context streaming.
+This document proposes the architecture for solving the second major Identity challenge: cryptographic context fragmentation and trustless context streaming.
 
 The goal is to ensure that external AI agents, web applications, and foundational model APIs never interface directly with the master `.me` database. Instead, they receive isolated, time-bound context mutations called `.meslice` blocks.
 
@@ -8,7 +8,7 @@ For implementation sequencing, see the Phase 2 and Phase 3 plans in [Engineering
 
 ## 1. Zero-Trust Access Paradigm
 
-Sovereign treats all external AI agents, web applications, and foundational model APIs as untrusted environments that may scrape, retain, or ingest user data.
+Identity treats all external AI agents, web applications, and foundational model APIs as untrusted environments that may scrape, retain, or ingest user data.
 
 The ephemeral handshake architecture prevents third-party applications from touching the master `.me` database. They interact only with stateless, isolated, task-bound `.meslice` payloads that expire immediately after task completion.
 
@@ -16,7 +16,7 @@ The ephemeral handshake architecture prevents third-party applications from touc
 [External Agent Prompt]
         |
         v
-(Sovereign Local Daemon)
+(Identity Local Daemon)
         |
         |  Evaluates semantic boundary constraints
         v
@@ -37,7 +37,7 @@ The ephemeral handshake architecture prevents third-party applications from touc
 
 ## 2. Prompt Interception and Intent Parsing
 
-Sovereign deploys a local proxy filter that hooks into standard machine transport layers. When an external autonomous worker or API makes an execution-loop request, the outbound payload is paused client-side.
+Identity deploys a local proxy filter that hooks into standard machine transport layers. When an external autonomous worker or API makes an execution-loop request, the outbound payload is paused client-side.
 
 ### Semantic Extraction Pipeline
 
@@ -70,7 +70,7 @@ Example blacklisted entities:
 
 ## 3. Ephemeral Context Generation
 
-Once request boundaries are mapped, the Sovereign local daemon executes a targeted semantic query against the embedded local database.
+Once request boundaries are mapped, the Identity local daemon executes a targeted semantic query against the embedded local database.
 
 ### Dynamic Mutation Engine
 
@@ -88,19 +88,19 @@ These tokens map back to the real user profile only inside the local host loop. 
 
 ## 4. Zero-Knowledge Execution Pipeline
 
-Sovereign supports two deployment pathways depending on the endpoint's capabilities.
+Identity supports two deployment pathways depending on the endpoint's capabilities.
 
 ### Pathway A: Client-Side Runtime Injection
 
-For standard applications running through browser interfaces or open APIs, Sovereign intercepts the data transport layer and encapsulates the temporary `.meslice` payload inside cryptographic delimiters within the outbound system instructions.
+For standard applications running through browser interfaces or open APIs, Identity intercepts the data transport layer and encapsulates the temporary `.meslice` payload inside cryptographic delimiters within the outbound system instructions.
 
 Example context envelope:
 
 ```text
-[SOVEREIGN-CONTEXT-BLOCK: ID_884920]
+[IDENTITY-CONTEXT-BLOCK: ID_884920]
 - Ephemeral tokenized context segment payload
 - Authorization expiry signature: POSIX_TIMESTAMP + 2000MS
-[SOVEREIGN-CONTEXT-BLOCK-END: ID_884920]
+[IDENTITY-CONTEXT-BLOCK-END: ID_884920]
 ```
 
 The client browser streams this combined package to the remote foundational model. When the task finishes or the expiry signature lapses, the local runtime closes the memory window and clears the temporary slice.
@@ -109,12 +109,12 @@ This pathway is practical for early integrations but cannot fully guarantee that
 
 ### Pathway B: Hardware-Enforced Secure Enclaves
 
-For high-security operations, Sovereign can use trusted execution environments through secure cloud hardware instances such as AWS Nitro Enclaves, Intel SGX, or equivalent audited TEE systems.
+For high-security operations, Identity can use trusted execution environments through secure cloud hardware instances such as AWS Nitro Enclaves, Intel SGX, or equivalent audited TEE systems.
 
 In this pathway:
 
 1. The external application routes core processing instructions to an audited TEE instance.
-2. Sovereign streams the encrypted `.meslice` payload over an ephemeral TLS connection terminated inside the secure hardware boundary.
+2. Identity streams the encrypted `.meslice` payload over an ephemeral TLS connection terminated inside the secure hardware boundary.
 3. The foundational model or task-specific runtime processes the data inside isolated encrypted memory.
 4. The final output is returned to the client.
 5. The enclave purges cryptographic keys and context state after execution.

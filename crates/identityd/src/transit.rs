@@ -1,5 +1,5 @@
 use crate::ingest_safety::{validate_capture, IngestSafetyError};
-use crate::workspace::SovereignPaths;
+use crate::workspace::IdentityPaths;
 use rusqlite::{params, Connection};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +26,21 @@ pub struct TransitStatusCount {
 #[derive(Debug)]
 pub struct TransitRepairSummary {
     pub stale_processing_requeued: usize,
+}
+
+#[derive(Debug)]
+pub struct TransitRedactionSummary {
+    pub redacted_captured_events: usize,
+    pub redacted_cleaned_events: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitHealth {
+    pub queued: i64,
+    pub processing: i64,
+    pub processed: i64,
+    pub failed: i64,
+    pub stale_processing: i64,
 }
 
 #[derive(Debug)]
@@ -77,7 +92,7 @@ pub struct TransitBuffer {
 pub const DEFAULT_PROCESSING_LEASE_MS: i64 = 5 * 60 * 1000;
 
 impl TransitBuffer {
-    pub fn open(paths: &SovereignPaths) -> Result<Self, TransitError> {
+    pub fn open(paths: &IdentityPaths) -> Result<Self, TransitError> {
         let conn = Connection::open(&paths.transit_db)?;
         let buffer = Self { conn };
         buffer.initialize_schema()?;
@@ -301,6 +316,39 @@ impl TransitBuffer {
             .map_err(TransitError::from)
     }
 
+    pub fn health(&self, lease_timeout_ms: i64) -> Result<TransitHealth, TransitError> {
+        let mut health = TransitHealth {
+            queued: 0,
+            processing: 0,
+            processed: 0,
+            failed: 0,
+            stale_processing: 0,
+        };
+
+        for count in self.status_counts()? {
+            match count.status.as_str() {
+                "queued" => health.queued = count.count,
+                "processing" => health.processing = count.count,
+                "processed" => health.processed = count.count,
+                "failed" => health.failed = count.count,
+                _ => {}
+            }
+        }
+
+        let stale_before_ms = now_ms()?.saturating_sub(lease_timeout_ms.max(0));
+        health.stale_processing = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM captured_events
+             WHERE status = 'processing'
+               AND claimed_at_ms IS NOT NULL
+               AND claimed_at_ms < ?1",
+            [stale_before_ms],
+            |row| row.get(0),
+        )?;
+
+        Ok(health)
+    }
+
     pub fn list_cleaned_recent(&self, limit: u32) -> Result<Vec<CleanedEvent>, TransitError> {
         let mut statement = self.conn.prepare(
             "SELECT id, captured_event_id, source, cleaned_content, content_hash, cleaned_at_ms, promoted_at_ms
@@ -343,6 +391,65 @@ impl TransitBuffer {
         Ok(())
     }
 
+    pub fn redact_promoted_content(
+        &self,
+        limit: u32,
+    ) -> Result<TransitRedactionSummary, TransitError> {
+        let now = now_ms()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let ids = {
+            let mut statement = tx.prepare(
+                "SELECT cleaned_events.id, cleaned_events.captured_event_id
+                 FROM cleaned_events
+                 JOIN captured_events ON captured_events.id = cleaned_events.captured_event_id
+                 WHERE cleaned_events.promoted_at_ms IS NOT NULL
+                   AND (
+                        cleaned_events.cleaned_content != ''
+                        OR captured_events.content != ''
+                   )
+                 ORDER BY cleaned_events.promoted_at_ms ASC, cleaned_events.id ASC
+                 LIMIT ?1",
+            )?;
+
+            let ids = statement
+                .query_map([limit as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            ids
+        };
+
+        let mut redacted_cleaned_events = 0;
+        let mut redacted_captured_events = 0;
+
+        for (cleaned_id, captured_id) in &ids {
+            redacted_cleaned_events += tx.execute(
+                "UPDATE cleaned_events
+                 SET cleaned_content = '',
+                     content_redacted_at_ms = ?1
+                 WHERE id = ?2
+                   AND cleaned_content != ''",
+                params![now, cleaned_id],
+            )?;
+            redacted_captured_events += tx.execute(
+                "UPDATE captured_events
+                 SET content = '',
+                     content_redacted_at_ms = ?1
+                 WHERE id = ?2
+                   AND content != ''",
+                params![now, captured_id],
+            )?;
+        }
+
+        tx.commit()?;
+
+        Ok(TransitRedactionSummary {
+            redacted_captured_events,
+            redacted_cleaned_events,
+        })
+    }
+
     fn initialize_schema(&self) -> Result<(), TransitError> {
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -357,6 +464,7 @@ impl TransitBuffer {
                 claimed_at_ms INTEGER,
                 processed_at_ms INTEGER,
                 retry_count INTEGER NOT NULL DEFAULT 0,
+                content_redacted_at_ms INTEGER,
                 error TEXT
              );
 
@@ -374,6 +482,7 @@ impl TransitBuffer {
                 content_hash TEXT NOT NULL,
                 cleaned_at_ms INTEGER NOT NULL,
                 promoted_at_ms INTEGER,
+                content_redacted_at_ms INTEGER,
                 FOREIGN KEY(captured_event_id) REFERENCES captured_events(id)
              );
 
@@ -402,9 +511,23 @@ impl TransitBuffer {
             )?;
         }
 
+        if !self.has_column("captured_events", "content_redacted_at_ms")? {
+            self.conn.execute(
+                "ALTER TABLE captured_events ADD COLUMN content_redacted_at_ms INTEGER",
+                [],
+            )?;
+        }
+
         if !self.has_column("cleaned_events", "promoted_at_ms")? {
             self.conn.execute(
                 "ALTER TABLE cleaned_events ADD COLUMN promoted_at_ms INTEGER",
+                [],
+            )?;
+        }
+
+        if !self.has_column("cleaned_events", "content_redacted_at_ms")? {
+            self.conn.execute(
+                "ALTER TABLE cleaned_events ADD COLUMN content_redacted_at_ms INTEGER",
                 [],
             )?;
         }
@@ -491,20 +614,20 @@ fn stable_hash_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::TransitBuffer;
-    use crate::workspace::SovereignPaths;
+    use crate::workspace::IdentityPaths;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn claims_oldest_queued_events_and_marks_processed() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-transit-test-{}",
+            "identity-transit-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let buffer = TransitBuffer::open(&paths).unwrap();
@@ -536,13 +659,13 @@ mod tests {
     #[test]
     fn stores_cleaned_events_as_embedding_stage_handoff() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-cleaned-test-{}",
+            "identity-cleaned-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let buffer = TransitBuffer::open(&paths).unwrap();
@@ -573,13 +696,13 @@ mod tests {
     #[test]
     fn rejects_sensitive_capture_before_persisting_raw_content() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-sensitive-capture-test-{}",
+            "identity-sensitive-capture-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let buffer = TransitBuffer::open(&paths).unwrap();
@@ -596,13 +719,13 @@ mod tests {
     #[test]
     fn stale_processing_claims_are_requeued_with_retry_count() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-stale-claim-test-{}",
+            "identity-stale-claim-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let buffer = TransitBuffer::open(&paths).unwrap();
@@ -628,13 +751,13 @@ mod tests {
     #[test]
     fn completion_atomically_stores_cleaned_text_and_marks_processed() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-atomic-complete-test-{}",
+            "identity-atomic-complete-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let buffer = TransitBuffer::open(&paths).unwrap();
@@ -662,13 +785,13 @@ mod tests {
     #[test]
     fn cleaned_upsert_preserves_promotion_marker() {
         let root = std::env::temp_dir().join(format!(
-            "sovereign-cleaned-upsert-test-{}",
+            "identity-cleaned-upsert-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let paths = SovereignPaths::from_root(root.clone());
+        let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
         let buffer = TransitBuffer::open(&paths).unwrap();
@@ -688,6 +811,65 @@ mod tests {
         assert_eq!(cleaned[0].id, cleaned_id);
         assert_eq!(cleaned[0].cleaned_content, "second clean");
         assert!(cleaned[0].promoted_at_ms.is_some());
+
+        drop(buffer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_transit_health_with_stale_processing_count() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-transit-health-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let buffer = TransitBuffer::open(&paths).unwrap();
+        buffer.ingest_text("test:health", "health text").unwrap();
+        buffer.claim_queued(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let health = buffer.health(0).unwrap();
+        assert_eq!(health.processing, 1);
+        assert_eq!(health.stale_processing, 1);
+
+        drop(buffer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn redacts_promoted_transit_and_cleaned_content() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-transit-redact-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let buffer = TransitBuffer::open(&paths).unwrap();
+        let captured_id = buffer.ingest_text("test:redact", "raw local text").unwrap();
+        buffer.claim_queued(1).unwrap();
+        let cleaned_id = buffer
+            .complete_processing_with_cleaned(captured_id, "test:redact", "clean local text")
+            .unwrap();
+
+        buffer.mark_cleaned_promoted(cleaned_id).unwrap();
+        let summary = buffer.redact_promoted_content(10).unwrap();
+        assert_eq!(summary.redacted_captured_events, 1);
+        assert_eq!(summary.redacted_cleaned_events, 1);
+
+        let captured = buffer.list_recent(10).unwrap();
+        let cleaned = buffer.list_cleaned_recent(10).unwrap();
+        assert_eq!(captured[0].content, "");
+        assert_eq!(cleaned[0].cleaned_content, "");
+        assert_eq!(cleaned[0].content_hash.len(), 16);
 
         drop(buffer);
         fs::remove_dir_all(root).unwrap();

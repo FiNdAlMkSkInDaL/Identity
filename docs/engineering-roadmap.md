@@ -1,6 +1,6 @@
-# Engineering Roadmap: Sovereign
+# Engineering Roadmap: Identity
 
-This roadmap sequences Sovereign from a local-first MVP into a broader protocol architecture.
+This roadmap sequences Identity from a local-first MVP into a broader protocol architecture.
 
 The execution philosophy is to separate immediately viable local engineering from longer-term cryptographic research. Phases 1 and 2 should prove that a useful `.me` state bank can run on consumer hardware without cloud dependency. Phase 3 closes the feedback loop and begins protocol-scale security work.
 
@@ -22,7 +22,7 @@ Objective: Establish the localized ingestion engine and prove that a `.me` datab
 
 - Build a desktop application using Tauri and Rust.
 - Maintain a lightweight system footprint, targeting under 30MB idle RAM where practical.
-- Establish the background daemon, `sovereignd`, to manage file structures, ingestion queues, and execution threads.
+- Establish the background daemon, `identityd`, to manage file structures, ingestion queues, and execution threads.
 
 ### Task 1.2: Database Implementation
 
@@ -30,7 +30,7 @@ Objective: Establish the localized ingestion engine and prove that a `.me` datab
 - Configure a single local encrypted directory path as the master storage ledger:
 
 ```text
-~/.sovereign/identity.me
+~/.identity/identity.me
 ```
 
 - Keep the storage layer local, embedded, and process-owned.

@@ -1,6 +1,6 @@
-# Bi-Directional State Synchronization and Feedback Loop Architecture: Sovereign
+# Bi-Directional State Synchronization and Feedback Loop Architecture: Identity
 
-This document proposes the architecture for solving the third major Sovereign challenge: capturing the outputs and side effects of agent execution and safely writing them back into the local `.me` state bank.
+This document proposes the architecture for solving the third major Identity challenge: capturing the outputs and side effects of agent execution and safely writing them back into the local `.me` state bank.
 
 The goal is to make the `.me` file continuously evolve with the user's real-world actions while avoiding platform-owned memory, recursive ingestion loops, duplicate state, and vector bloat.
 
@@ -8,17 +8,17 @@ For implementation sequencing, see the Phase 3 plan in [Engineering Roadmap](eng
 
 ## 1. Closed-Loop Synchronization Paradigm
 
-Sovereign operates on a closed-loop data architecture.
+Identity operates on a closed-loop data architecture.
 
 The ultra-abstracted agentic web is often stateless, asynchronous, and background-driven. An agent may book travel, update a CRM, sign a document, send a message, or modify account settings without the user manually navigating a GUI.
 
-Sovereign must therefore capture operational outputs, mutations, confirmations, and side effects from each agent execution block. These changes are routed safely back to the user's host machine, where the master `.me` database is updated locally.
+Identity must therefore capture operational outputs, mutations, confirmations, and side effects from each agent execution block. These changes are routed safely back to the user's host machine, where the master `.me` database is updated locally.
 
 The feedback loop ensures that durable memory belongs to the user, not the remote platform.
 
 ## 2. Headless Activity Recorder
 
-Sovereign bundles every outbound ephemeral `.meslice` handshake with an isolated, low-overhead client-side monitoring loop called the Session Watcher Daemon.
+Identity bundles every outbound ephemeral `.meslice` handshake with an isolated, low-overhead client-side monitoring loop called the Session Watcher Daemon.
 
 The watcher observes the session only inside the scope authorized for the active task. It should not become general surveillance infrastructure.
 
@@ -38,7 +38,7 @@ It starts when a task-bound `.meslice` is generated and terminates when the sess
 
 The daemon shadows network communications and agent actions that occur during an active session block.
 
-When a background agent alters a DOM structure, issues an API `POST` request, receives a confirmation token, or completes a transaction, Sovereign mirrors the relevant raw JSON, HTML, or protocol response into a temporary local memory pipe before the remote session terminates.
+When a background agent alters a DOM structure, issues an API `POST` request, receives a confirmation token, or completes a transaction, Identity mirrors the relevant raw JSON, HTML, or protocol response into a temporary local memory pipe before the remote session terminates.
 
 Examples of captured outputs:
 
@@ -55,7 +55,7 @@ The raw shadow log is volatile. It is not committed directly to the master `.me`
 
 Raw logs, telemetry noise, repeated HTML strings, and transport metadata cannot be committed directly to `.me` without causing vector bloat and memory corruption.
 
-Sovereign therefore pipes the captured shadow log into a local extraction pipeline that computes the precise semantic state delta.
+Identity therefore pipes the captured shadow log into a local extraction pipeline that computes the precise semantic state delta.
 
 ### Reverse Token Synthesis
 
@@ -100,7 +100,7 @@ This structure becomes the candidate memory delta. It should still pass validati
 
 Once the structural delta is isolated, it must be merged into the master vector-graph database without destructively overwriting user history.
 
-Sovereign uses a non-destructive, time-aware graph synchronization strategy.
+Identity uses a non-destructive, time-aware graph synchronization strategy.
 
 ### Deterministic Node Insertion and Schema Merging
 
@@ -130,7 +130,7 @@ Conflicts should produce new time-aware edges rather than deleting older records
 
 ### Mathematical Edge-Weight Decay
 
-To track changing human preferences and relationships, Sovereign avoids static overrides.
+To track changing human preferences and relationships, Identity avoids static overrides.
 
 When a conflicting state update occurs, the system applies a decay coefficient to older graph edges:
 
@@ -175,6 +175,6 @@ The feedback loop is powerful and must be constrained carefully.
 
 ## 8. Strategic Importance
 
-This feedback loop is what makes Sovereign more than a private context vault.
+This feedback loop is what makes Identity more than a private context vault.
 
 Without synchronization, `.me` is a static archive. With synchronization, it becomes a living local state bank that evolves from real actions across the web while keeping durable memory under user control.

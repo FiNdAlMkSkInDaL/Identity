@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod embedding;
 pub mod filesystem;
 pub mod identity;
@@ -7,4 +8,5 @@ pub mod processor;
 pub mod proxy;
 pub mod slice;
 pub mod transit;
+pub mod vector_store;
 pub mod workspace;

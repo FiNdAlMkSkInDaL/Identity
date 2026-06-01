@@ -47,33 +47,50 @@ The `.me` client would retrieve only the relevant network graph, writing-tone pr
 - [Ephemeral Handshake Architecture](docs/ephemeral-handshake-architecture.md)
 - [Bi-Directional State Synchronization Architecture](docs/bidirectional-state-synchronization-architecture.md)
 - [Engineering Roadmap](docs/engineering-roadmap.md)
+- [Go-To-Market Plan](docs/go-to-market-plan.md)
 
 ## First Implementation
 
-The first code lives in [crates/sovereignd](crates/sovereignd). It is the local daemon core responsible for creating the Sovereign workspace, writing captured text into the SQLite transit buffer, cleaning/promoting local captures, and storing prototype `.me` memory vectors locally.
+The first code lives in [crates/identityd](crates/identityd). It is the local daemon core responsible for creating the Identity workspace, writing captured text into the SQLite transit buffer, capturing bounded foreground-window context on Windows including focused-control text, message-based control-text fallback, and a narrow accessibility fallback, cleaning/promoting local captures, and storing prototype `.me` memory vectors locally.
 
 ```powershell
-cargo run -p sovereignd -- init
-cargo run -p sovereignd -- ingest --source manual --content "User prefers local-first systems."
-cargo run -p sovereignd -- list
-cargo run -p sovereignd -- stats
-cargo run -p sovereignd -- repair-transit
-cargo run -p sovereignd -- process-once --limit 10
-cargo run -p sovereignd -- process-idle-once --limit 10 --idle-ms 5000
-cargo run -p sovereignd -- cleaned-list --limit 10
-cargo run -p sovereignd -- promote-once --limit 10
-cargo run -p sovereignd -- memory-list --limit 10
-cargo run -p sovereignd -- memory-search --query "local-first systems"
-cargo run -p sovereignd -- slice-preview --intent "draft outreach using local context"
-cargo run -p sovereignd -- prompt-package --intent "draft outreach using local context" --prompt "Write the message."
-cargo run -p sovereignd -- serve
-cargo run -p sovereignd -- watch --path C:\Users\finph\Documents
+cargo run -p identityd -- init
+cargo run -p identityd -- --root C:\Temp\identity-dev doctor
+cargo run -p identityd -- ingest --source manual --content "User prefers local-first systems."
+cargo run -p identityd -- capture-active-window
+cargo run -p identityd -- watch-active-window --interval-ms 1000
+cargo run -p identityd -- list
+cargo run -p identityd -- stats
+cargo run -p identityd -- doctor
+cargo run -p identityd -- repair-transit
+cargo run -p identityd -- process-once --limit 10
+cargo run -p identityd -- process-idle-once --limit 10 --idle-ms 5000
+cargo run -p identityd -- pipeline-once --process-limit 10 --promote-limit 10 --idle-ms 5000
+cargo run -p identityd -- pipeline-loop --process-limit 10 --promote-limit 10 --idle-ms 5000 --interval-ms 2000
+cargo run -p identityd -- daemon --process-limit 10 --promote-limit 10 --idle-ms 5000 --interval-ms 2000
+cargo run -p identityd -- daemon --watch-active-window --activity-interval-ms 1000
+cargo run -p identityd -- daemon --watch-path C:\Users\finph\Documents --process-limit 10 --promote-limit 10
+cargo run -p identityd -- cleaned-list --limit 10
+cargo run -p identityd -- promote-once --limit 10
+cargo run -p identityd -- redact-transit-content --limit 100
+cargo run -p identityd -- memory-list --limit 10
+cargo run -p identityd -- memory-stats
+cargo run -p identityd -- repair-memory-vectors --limit 100
+cargo run -p identityd -- memory-search --query "local-first systems"
+cargo run -p identityd -- slice-preview --intent "draft outreach using local context"
+cargo run -p identityd -- prompt-package --intent "draft outreach using local context" --prompt "Write the message."
+cargo run -p identityd -- serve
+cargo run -p identityd -- watch --path C:\Users\finph\Documents
+cargo run -p identityd -- watch --path C:\Users\finph\Documents --poll
 ```
+
+`watch` uses Windows filesystem events by default on Windows. Use `--poll` only as
+the conservative fallback.
 
 The initial local workspace is created at:
 
 ```text
-~/.sovereign/
+~/.identity/
   identity.me/
     state.db
   transit.db
@@ -84,5 +101,7 @@ The first local capture endpoint listens on `127.0.0.1:8080`:
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri http://127.0.0.1:8080/health
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/capture -ContentType "text/html" -Body "<html><body><h1>Hello Sovereign</h1><script>ignore()</script></body></html>"
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/capture -ContentType "text/html" -Body "<html><body><h1>Hello Identity</h1><script>ignore()</script></body></html>"
 ```
+
+`daemon` is the phase 1 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. On Windows the filesystem watcher stays on the native event path.

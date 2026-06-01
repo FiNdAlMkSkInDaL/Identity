@@ -1,5 +1,5 @@
 use crate::transit::TransitBuffer;
-use crate::workspace::SovereignPaths;
+use crate::workspace::IdentityPaths;
 use lol_html::html_content::TextType;
 use lol_html::{doc_text, HtmlRewriter, Settings};
 use std::fmt;
@@ -34,20 +34,17 @@ impl From<std::io::Error> for ProxyError {
 
 pub struct LocalCaptureServer {
     addr: SocketAddr,
-    paths: SovereignPaths,
+    paths: IdentityPaths,
 }
 
 impl LocalCaptureServer {
-    pub fn new(addr: SocketAddr, paths: SovereignPaths) -> Self {
+    pub fn new(addr: SocketAddr, paths: IdentityPaths) -> Self {
         Self { addr, paths }
     }
 
     pub async fn run(self) -> Result<(), ProxyError> {
         let listener = TcpListener::bind(self.addr).await?;
-        println!(
-            "sovereignd capture endpoint listening on http://{}",
-            self.addr
-        );
+        println!("identityd capture endpoint listening on http://{}", self.addr);
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -64,7 +61,7 @@ impl LocalCaptureServer {
 
 async fn handle_connection(
     mut stream: TcpStream,
-    paths: SovereignPaths,
+    paths: IdentityPaths,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request = timeout(
         Duration::from_millis(REQUEST_TIMEOUT_MS),
@@ -332,7 +329,7 @@ mod tests {
             <html>
               <head><style>.hidden { display: none; }</style></head>
               <body>
-                <h1>Hello&nbsp;Sovereign</h1>
+                                <h1>Hello&nbsp;Identity</h1>
                 <script>alert("nope")</script>
                 <p>Local &amp; private capture.</p>
               </body>
@@ -341,7 +338,7 @@ mod tests {
 
         let cleaned = clean_html_to_text(html);
 
-        assert_eq!(cleaned, "Hello Sovereign Local & private capture.");
+        assert_eq!(cleaned, "Hello Identity Local & private capture.");
         assert!(!cleaned.contains("alert"));
         assert!(!cleaned.contains("display"));
     }
