@@ -1,12 +1,77 @@
-use crate::transit::TransitBuffer;
+use crate::identity::IdentityStore;
+use crate::slice::{build_prompt_package, generate_meslice};
+use crate::transit::{TransitBuffer, DEFAULT_PROCESSING_LEASE_MS};
 use crate::workspace::IdentityPaths;
 use lol_html::html_content::TextType;
 use lol_html::{doc_text, HtmlRewriter, Settings};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
+
+#[derive(Deserialize)]
+struct SearchRequest {
+    query: String,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SearchResultJson {
+    id: i64,
+    cleaned_event_id: i64,
+    source: String,
+    domain_context: String,
+    entity_type: String,
+    summary: String,
+    structured_attributes: String,
+    created_at_ms: i64,
+    score: u32,
+}
+
+#[derive(Deserialize)]
+struct SliceRequest {
+    intent: String,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SliceResponse {
+    session_token: String,
+    expiry_epoch_ms: i64,
+    context_group: String,
+    facts: Vec<String>,
+    context_block: String,
+}
+
+#[derive(Deserialize)]
+struct PromptPackageRequest {
+    intent: String,
+    prompt: String,
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct PromptPackageResponse {
+    package: String,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    transit_queued: i64,
+    transit_processing: i64,
+    transit_stale_processing: i64,
+    transit_processed: i64,
+    transit_failed: i64,
+    memory_nodes: i64,
+    memory_vectorized_nodes: i64,
+    memory_invalid_vectors: i64,
+    embedding_model_id: String,
+    embedding_dim: usize,
+    vector_store_backend: String,
+}
+
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT_MS: u64 = 3000;
@@ -71,6 +136,121 @@ async fn handle_connection(
 
     let response = match request {
         HttpRequest::Health => HttpResponse::ok_json(r#"{"status":"ok"}"#),
+        HttpRequest::Stats => {
+            let stats_result = tokio::task::spawn_blocking(move || {
+                let buffer = TransitBuffer::open(&paths)?;
+                let health = buffer.health(DEFAULT_PROCESSING_LEASE_MS)?;
+                let store = IdentityStore::open(&paths)?;
+                let store_stats = store.stats()?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(StatsResponse {
+                    transit_queued: health.queued,
+                    transit_processing: health.processing,
+                    transit_stale_processing: health.stale_processing,
+                    transit_processed: health.processed,
+                    transit_failed: health.failed,
+                    memory_nodes: store_stats.node_count,
+                    memory_vectorized_nodes: store_stats.vectorized_count,
+                    memory_invalid_vectors: store_stats.invalid_vector_count,
+                    embedding_model_id: store_stats.embedding_model_id,
+                    embedding_dim: store_stats.embedding_dim,
+                    vector_store_backend: store_stats.vector_store_backend,
+                })
+            })
+            .await?;
+
+            match stats_result {
+                Ok(stats) => match serde_json::to_string(&stats) {
+                    Ok(json) => HttpResponse::ok_json(&json),
+                    Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                },
+                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+            }
+        }
+        HttpRequest::Search { body } => {
+            let req_result: Result<SearchRequest, _> = serde_json::from_str(&body);
+            match req_result {
+                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"invalid json: {error}"}}"#)),
+                Ok(req) => {
+                    let search_result = tokio::task::spawn_blocking(move || {
+                        let store = IdentityStore::open(&paths)?;
+                        let limit = req.limit.unwrap_or(5);
+                        let results = store.search(&req.query, limit)?;
+                        let json_results = results.into_iter().map(|res| SearchResultJson {
+                            id: res.node.id,
+                            cleaned_event_id: res.node.cleaned_event_id,
+                            source: res.node.source,
+                            domain_context: res.node.domain_context,
+                            entity_type: res.node.entity_type,
+                            summary: res.node.summary,
+                            structured_attributes: res.node.structured_attributes,
+                            created_at_ms: res.node.created_at_ms,
+                            score: res.score,
+                        }).collect::<Vec<_>>();
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(json_results)
+                    })
+                    .await?;
+
+                    match search_result {
+                        Ok(res) => match serde_json::to_string(&res) {
+                            Ok(json) => HttpResponse::ok_json(&json),
+                            Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                        },
+                        Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                    }
+                }
+            }
+        }
+        HttpRequest::Slice { body } => {
+            let req_result: Result<SliceRequest, _> = serde_json::from_str(&body);
+            match req_result {
+                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"invalid json: {error}"}}"#)),
+                Ok(req) => {
+                    let slice_result = tokio::task::spawn_blocking(move || {
+                        let limit = req.limit.unwrap_or(3);
+                        let slice = generate_meslice(&paths, &req.intent, limit)?;
+                        let context_block = slice.to_context_block();
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(SliceResponse {
+                            session_token: slice.session_token,
+                            expiry_epoch_ms: slice.expiry_epoch_ms,
+                            context_group: slice.context_group,
+                            facts: slice.facts,
+                            context_block,
+                        })
+                    })
+                    .await?;
+
+                    match slice_result {
+                        Ok(res) => match serde_json::to_string(&res) {
+                            Ok(json) => HttpResponse::ok_json(&json),
+                            Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                        },
+                        Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                    }
+                }
+            }
+        }
+        HttpRequest::PromptPackage { body } => {
+            let req_result: Result<PromptPackageRequest, _> = serde_json::from_str(&body);
+            match req_result {
+                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"invalid json: {error}"}}"#)),
+                Ok(req) => {
+                    let pkg_result = tokio::task::spawn_blocking(move || {
+                        let limit = req.limit.unwrap_or(3);
+                        let package = build_prompt_package(&paths, &req.intent, &req.prompt, limit)?;
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(PromptPackageResponse { package })
+                    })
+                    .await?;
+
+                    match pkg_result {
+                        Ok(res) => match serde_json::to_string(&res) {
+                            Ok(json) => HttpResponse::ok_json(&json),
+                            Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                        },
+                        Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                    }
+                }
+            }
+        }
         HttpRequest::Capture { content_type, body } => {
             let cleaned = clean_payload(&content_type, &body);
 
@@ -104,7 +284,11 @@ async fn handle_connection(
 
 enum HttpRequest {
     Health,
+    Stats,
     Capture { content_type: String, body: String },
+    Search { body: String },
+    Slice { body: String },
+    PromptPackage { body: String },
     Unsupported,
 }
 
@@ -230,14 +414,32 @@ fn parse_request(
         return Ok(HttpRequest::Health);
     }
 
-    if !request_line.starts_with("POST /capture ") {
-        return Ok(HttpRequest::Unsupported);
+    if request_line.starts_with("GET /stats ") {
+        return Ok(HttpRequest::Stats);
     }
 
-    let content_type = header_value(&headers, "content-type").unwrap_or_default();
-    let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
+    if request_line.starts_with("POST /capture ") {
+        let content_type = header_value(&headers, "content-type").unwrap_or_default();
+        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
+        return Ok(HttpRequest::Capture { content_type, body });
+    }
 
-    Ok(HttpRequest::Capture { content_type, body })
+    if request_line.starts_with("POST /search ") {
+        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
+        return Ok(HttpRequest::Search { body });
+    }
+
+    if request_line.starts_with("POST /slice ") {
+        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
+        return Ok(HttpRequest::Slice { body });
+    }
+
+    if request_line.starts_with("POST /prompt-package ") {
+        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
+        return Ok(HttpRequest::PromptPackage { body });
+    }
+
+    Ok(HttpRequest::Unsupported)
 }
 
 fn clean_payload(content_type: &str, body: &str) -> String {
@@ -321,7 +523,7 @@ fn header_value(headers: &str, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_html_to_text;
+    use super::{clean_html_to_text, parse_request, HttpRequest};
 
     #[test]
     fn strips_scripts_styles_tags_and_decodes_entities() {
@@ -353,4 +555,52 @@ mod tests {
         assert!(!cleaned.contains("drop"));
         assert!(!cleaned.contains("data-note"));
     }
+
+    #[test]
+    fn parses_supported_http_requests() {
+        use super::find_header_end;
+
+        let req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end).unwrap();
+        assert!(matches!(parsed, HttpRequest::Health));
+
+        let req = b"GET /stats HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end).unwrap();
+        assert!(matches!(parsed, HttpRequest::Stats));
+
+        let req = b"POST /search HTTP/1.1\r\nContent-Length: 16\r\n\r\n{\"query\":\"rust\"}";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end).unwrap();
+        if let HttpRequest::Search { body } = parsed {
+            assert_eq!(body, "{\"query\":\"rust\"}");
+        } else {
+            panic!("expected search request");
+        }
+
+        let req = b"POST /slice HTTP/1.1\r\nContent-Length: 18\r\n\r\n{\"intent\":\"draft\"}";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end).unwrap();
+        if let HttpRequest::Slice { body } = parsed {
+            assert_eq!(body, "{\"intent\":\"draft\"}");
+        } else {
+            panic!("expected slice request");
+        }
+
+        let req = b"POST /prompt-package HTTP/1.1\r\nContent-Length: 26\r\n\r\n{\"intent\":\"t\",\"prompt\":\"p\"}";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end).unwrap();
+        if let HttpRequest::PromptPackage { body } = parsed {
+            assert_eq!(body, "{\"intent\":\"t\",\"prompt\":\"p\"}");
+        } else {
+            panic!("expected prompt package request");
+        }
+
+        let req = b"GET /unsupported HTTP/1.1\r\n\r\n";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end).unwrap();
+        assert!(matches!(parsed, HttpRequest::Unsupported));
+    }
 }
+

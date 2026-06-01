@@ -402,7 +402,8 @@ mod tests {
         paths.ensure().unwrap();
 
         let store = VectorStore::open(&paths, "test-model", 4).unwrap();
-        store.upsert(12, &[1_u8, 2, 3, 4]).unwrap();
+        let test_data = [1_u8; 16];
+        store.upsert(12, &test_data).unwrap();
 
         let meta = fs::read_to_string(paths.vector_store_dir.join("store.meta")).unwrap();
         let vector = store.read(12).unwrap().unwrap();
@@ -412,7 +413,7 @@ mod tests {
         assert!(meta.contains("embedding_dim=4"));
         assert!(paths.vector_store_dir.join("lancedb").exists());
         assert_eq!(store.backend_name(), "lancedb+filesystem+sqlite");
-        assert_eq!(vector, vec![1_u8, 2, 3, 4]);
+        assert_eq!(vector, test_data.to_vec());
 
         fs::remove_dir_all(root).unwrap();
     }

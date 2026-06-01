@@ -1116,7 +1116,7 @@ mod tests {
             crate::embedding::EMBEDDING_MODEL_ID
         );
         assert_eq!(stats.embedding_dim, crate::embedding::EMBEDDING_DIM);
-        assert_eq!(stats.vector_store_backend, "filesystem+sqlite");
+        assert_eq!(stats.vector_store_backend, "lancedb+filesystem+sqlite");
 
         drop(store);
         fs::remove_dir_all(root).unwrap();

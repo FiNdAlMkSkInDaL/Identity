@@ -2354,6 +2354,8 @@ dependencies = [
  "lancedb",
  "lol_html",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
