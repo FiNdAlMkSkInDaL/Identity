@@ -15,12 +15,14 @@ flowchart TD
     Cleaned["Cleaned Event Staging\ncleaned_events"]
     EmbedProto["Local Embedding Prototype\nembedding.rs"]
     Memory["Identity Memory Store\nidentity.rs"]
+    MemoryGraph["Prototype Memory Graph Edges\ngraph_edges"]
     VectorStore["Vector Blob Store\nfilesystem default\noptional LanceDB feature"]
     MemoryMeta["Memory Metadata\nstore_metadata"]
     Slice[".meslice Preview Generator\nslice.rs"]
     Proxy["Local Capture Endpoint + lol-html Cleaner\nproxy.rs"]
     FS["Filesystem Watcher\nfilesystem.rs"]
     Safety["Ingest Safety Filter\ningest_safety.rs"]
+    Crypto["Local Content Protection\ncrypto.rs"]
     Processor["Transit Processor\nprocessor.rs"]
     Idle["Idle Telemetry Gate\nidle.rs"]
     Redaction["Transit Content Redaction\npost-promotion minimization"]
@@ -45,11 +47,13 @@ flowchart TD
     CLI -->|"watch-active-window"| Safety
     CLI -->|"list / stats / doctor / repair-transit"| Transit
     CLI -->|"doctor"| Resources
+    CLI -->|"protect-at-rest"| Crypto
     CLI -->|"redact-transit-content"| Redaction
     CLI -->|"cleaned-list"| Cleaned
     CLI -->|"memory-list"| Memory
     CLI -->|"memory-stats / repair-memory-vectors"| Memory
     CLI -->|"memory-search"| Memory
+    CLI -->|"memory-edge-* / memory-graph-health"| MemoryGraph
     CLI -->|"slice-preview / prompt-package"| Slice
     CLI -->|"serve"| Proxy
     CLI -->|"watch"| FS
@@ -65,21 +69,24 @@ flowchart TD
     CaptureToken -->|"X-Identity-Capture-Token"| Proxy
     Proxy -->|"authorized POST /capture\ncleaned HTML/text"| Safety
     FS -->|"approved text/code file captures"| Safety
-    Safety -->|"non-sensitive captures only"| Transit
+    Safety -->|"non-sensitive captures only"| Crypto
+    Crypto -->|"protected capture text\n+ source labels"| Transit
     Processor -->|"claim queued"| Transit
     Idle -->|"allows processing only after idle threshold"| Processor
-    Processor -->|"atomically store cleaned output + mark processed"| Cleaned
+    Processor -->|"protect cleaned output\n+ mark processed"| Cleaned
     Processor -->|"mark failed"| Transit
-    Processor -->|"embed cleaned text"| EmbedProto
+    Processor -->|"decrypt local cleaned text\nthen embed"| EmbedProto
     EmbedProto -->|"384-float vector blob"| Memory
+    Memory -->|"similarity/manual links"| MemoryGraph
     Memory -->|"mirror vector blobs"| VectorStore
-    Processor -->|"promote cleaned rows"| Memory
+    Processor -->|"promote protected\nsemantic text"| Memory
     Processor -->|"mark promoted"| Cleaned
     Processor -->|"redact promoted transit duplicates"| Redaction
     Redaction -->|"clear captured/cleaned content after .me write"| Transit
     Redaction --> Cleaned
     Memory --> MemoryMeta
     Slice -->|"search scoped memory"| Memory
+    MemoryGraph --> IdentityDir
     Transit --> TransitDb
     Cleaned --> TransitDb
     Memory --> IdentityDir
@@ -130,13 +137,15 @@ flowchart TD
 | :--- | :--- | :--- | :--- | :--- |
 | `identityd` | Daemon crate | Implemented | `crates/identityd` | Local ingestion and transit-buffer orchestration. |
 | `Workspace Manager` | Module | Implemented | `crates/identityd/src/workspace.rs` | Creates local Identity directories and a stable local `capture.token` used to authorize loopback capture writes. |
-| `SQLite Transit Buffer` | Local store | Implemented | `crates/identityd/src/transit.rs` | Stores captured text temporarily, queue status, retry counts, stale processing lease repair, redaction timestamps, transit health reporting, and rollback-only insert latency probes. |
+| `SQLite Transit Buffer` | Local store | Implemented | `crates/identityd/src/transit.rs` | Stores captured text temporarily, queue status, retry counts, stale processing lease repair, claimed-state enforcement for processing completion, redaction timestamps, transit health reporting, and rollback-only insert latency probes. |
 | `Cleaned Event Staging` | Local store | Implemented | `crates/identityd/src/transit.rs` | Stores normalized text ready for future embedding; promoted rows are redacted after insertion into local memory. |
 | `Transit Content Redaction` | Privacy guard | Implemented | `crates/identityd/src/transit.rs`, `crates/identityd/src/processor.rs` | Clears duplicate captured and cleaned content after successful promotion into `.me` prototype storage while preserving hashes, timestamps, and pipeline state. |
 | `Resource Budget Probe` | Resource guard | Implemented | `crates/identityd/src/resource.rs`, `crates/identityd/src/main.rs` | Reports current process working-set/pagefile memory on Windows, binary size, and budget status through `doctor` without adding a measurement dependency. |
-| `Ingest Safety Filter` | Privacy guard | Implemented | `crates/identityd/src/ingest_safety.rs` | Enforces a universal 1MB capture-content budget and 2048-byte source-label budget, then blocks secret-bearing paths, SSH/AWS/Azure/GPG config roots, private keys, credential markers, known secret token prefixes, card-like numbers, bank-routing markers, and precise-location markers before SQLite persistence. |
+| `Ingest Safety Filter` | Privacy guard | Implemented | `crates/identityd/src/ingest_safety.rs` | Enforces a universal 1MB capture-content budget and 2048-byte source-label budget, then blocks secret-bearing paths, SSH/AWS/Azure/GPG config roots, private keys, credential markers, known secret token prefixes, card-like numbers including spaced/dashed variants, bank-routing markers, and precise-location markers before SQLite persistence. |
+| `Local Content Protection` | Privacy guard | Implemented on Windows | `crates/identityd/src/crypto.rs`, `crates/identityd/src/transit.rs`, `crates/identityd/src/identity.rs`, `crates/identityd/src/main.rs` | Protects captured text, source labels, cleaned staging text, and prototype `.me` semantic text fields before SQLite persistence. On Windows this uses the local user's DPAPI boundary; legacy plaintext rows remain readable for development migration compatibility. `doctor` reports legacy plaintext field counts and `protect-at-rest` migrates them locally. Cross-platform OS-backed backends remain future hardening work. |
 | `Local Embedding Prototype` | Compute stage | Implemented prototype | `crates/identityd/src/embedding.rs` | Generates deterministic local 384-dimensional embeddings for promoted cleaned text, exposes model metadata, and reports local embedding latency against the 200ms map-stage budget through `doctor`. This is a Phase 1 spike, not the final ONNX embedding runtime. |
-| `Identity Memory Store` | Local store | Implemented prototype | `crates/identityd/src/identity.rs` | Stores local `.me` memory nodes plus fixed-width vector blobs in `identity.me/state.db`; now separates memory-domain derivation from the concrete SQLite persistence backend and routes vector encode/decode/similarity decisions through a local embedding-engine boundary to keep the promotion and retrieval surface stable ahead of later ONNX and vector-store swaps; mirrors promoted vector blobs into the reserved local vector-store root, backfills that mirror from valid SQLite vectors on open, and can fall back to that store when SQLite vector blobs are missing or corrupt; classifies promoted captures by source type such as filesystem, local web capture, and Windows UI activity; derives structured summaries and lightweight JSON attributes for Windows activity captures from application, window, focus, and visible-text fields; searches with vector similarity plus lexical scoring; reports and repairs vector health. |
+| `Identity Memory Store` | Local store | Implemented prototype | `crates/identityd/src/identity.rs` | Stores local `.me` memory nodes plus fixed-width vector blobs in `identity.me/state.db`; assigns each node a stable UUIDv4-style `node_uid` while keeping compact SQLite row ids for local joins; now separates memory-domain derivation from the concrete SQLite persistence backend and routes vector encode/decode/similarity decisions through a local embedding-engine boundary to keep the promotion and retrieval surface stable ahead of later ONNX and vector-store swaps; mirrors promoted vector blobs into the reserved local vector-store root, backfills that mirror from valid SQLite vectors on open, and can fall back to that store when SQLite vector blobs are missing or corrupt; classifies promoted captures by source type such as filesystem, local web capture, and Windows UI activity; derives structured summaries and lightweight JSON attributes for Windows activity captures from application, window, focus, and visible-text fields; searches with vector similarity plus lexical scoring; reports and repairs vector health; stores prototype graph edges between memory nodes. |
+| `Prototype Memory Graph Edges` | Local store table | Implemented prototype | `crates/identityd/src/identity.rs` | Stores bounded weighted edges in `graph_edges`, rejects invalid/self edges, uses SQLite foreign-key checks, auto-links nearby vectors during memory promotion, exposes manual edge commands, reports graph health, and applies explicit edge-weight decay. This is local graph scaffolding inside the SQLite `.me` prototype, not final LanceDB graph completion. |
 | `Vector Blob Store` | Local store | Implemented default + optional feature | `crates/identityd/src/vector_store.rs` | Persists fixed-width vector blobs under `identity.me/vectors`, writes local store metadata, and serves as the default implementation behind a small vector-blob backend boundary. Retrieval falls through to a SQLite-backed implementation that reads inline vector blobs from `identity.me/state.db`. The LanceDB implementation is available behind the explicit `lancedb-backend` Cargo feature and is not part of the default daemon build until the native toolchain/protoc requirement is intentionally accepted. |
 | `Memory Metadata` | Local store table | Implemented prototype | `crates/identityd/src/identity.rs` | Persists current embedding model id and embedding dimension for local `.me` schema inspection. |
 | `.meslice Preview Generator` | Privacy boundary | Implemented prototype | `crates/identityd/src/slice.rs` | Builds scoped context blocks and prompt packages from local memory search. |
@@ -144,10 +153,10 @@ flowchart TD
 | `HTML/Text Cleaner` | Capture normalizer | Implemented | `crates/identityd/src/proxy.rs`, `lol-html` | Extracts visible document text through a lightweight streaming parser and ignores script/style raw text before transit persistence. |
 | `Active Window Capture` | Ingestion adapter | Implemented minimal on Windows | `crates/identityd/src/activity.rs`, `crates/identityd/src/main.rs` | Captures the current foreground window title, executable name, focused-control text, and a bounded set of visible child-window text strings, using bounded `WM_GETTEXT` and focused-control MSAA accessibility fallback when plain caption APIs do not expose enough control text, then writes local activity snapshots into the transit buffer. One-shot and bounded watch modes are both available. This is a phase-1 foothold, not yet full UI Automation text extraction. |
 | `Filesystem Watcher` | Ingestion adapter | Implemented | `crates/identityd/src/filesystem.rs` | Uses `ReadDirectoryChangesW` on Windows, falls back to polling with `--poll`, filters conservative text/code files, retries transient Windows file locks, and dedupes burst events by per-path content hash. |
-| `Idle Telemetry Gate` | Resource guard | Implemented | `crates/identityd/src/idle.rs` | Gates processing by recent user input on Windows (`GetLastInputInfo`), macOS (`CGDisplaySecondsSinceLastEvent`), and Linux (`xprintidle` subprocess). Falls open (assumes idle) where OS telemetry is unavailable. |
+| `Idle Telemetry Gate` | Resource guard | Implemented minimal | `crates/identityd/src/idle.rs` | Gates processing by recent user input on Windows (`GetLastInputInfo`) and falls open where OS telemetry is unavailable. |
 | `Transit Processor` | Pipeline worker | Implemented | `crates/identityd/src/processor.rs` | Claims queued captures, stages cleaned output, promotes cleaned rows into local memory, and runs idle-gated pipeline cycles. |
 | `Tauri Overlay` | UI shell | Planned | `docs/engineering-roadmap.md` | Ambient command interface. |
-| `.me Vector Graph` | Durable local state | Planned | `docs/local-vector-synthesis-architecture.md` | Stores hybrid document-vector-graph state. |
+| `.me Vector Graph` | Durable local state | Prototype partial | `crates/identityd/src/identity.rs`, `docs/local-vector-synthesis-architecture.md` | Current SQLite prototype stores memory nodes, vector blobs, and weighted graph edges; final embedded LanceDB or equivalent hybrid graph remains planned. |
 | `Local Embedding Runtime` | Compute stage | Implemented prototype / final runtime planned | `crates/identityd/src/embedding.rs`, `docs/local-vector-synthesis-architecture.md` | Current implementation is deterministic local hashing; final ONNX/ort embedding runtime remains planned. |
 | `Boundary Engine` | Privacy gate | Planned | `docs/ephemeral-handshake-architecture.md` | Chooses minimum context needed for a task. |
 | `.meslice` | Ephemeral payload | Planned | `docs/ephemeral-handshake-architecture.md` | Task-bound context stream for external agents. |
@@ -162,8 +171,10 @@ flowchart TD
   identity.me/   implemented prototype memory store directory
     state.db     implemented SQLite `.me` staging ledger with vector blobs
             memory_nodes
+                node_uid               UUIDv4-style protocol-facing memory id
                 structured_attributes  lightweight JSON capture facets for direct local lookup
       store_metadata
+      graph_edges
         vectors/     default filesystem-backed vector blob store and reserved future embedded vector DB root
             store.meta
             node-*.f32le
@@ -187,14 +198,19 @@ Global `--root <folder>` can be used before a command to run against an explicit
 | `watch-active-window` | Windows activity watch | `--interval-ms` | `captured_events` | Polls the foreground window at a bounded interval and queues captures only when the application or title changes. |
 | `list` | Inspection | None | None | Lists recent captured events. |
 | `stats` | Inspection | None | None | Counts events by status. |
-| `doctor` | Phase 1 health inspection | `--lease-ms` | Rollback-only SQLite probe, embedding latency probe, resource budget probe | Prints workspace paths, transit health, stale processing count, memory vector health, embedding metadata, workspace startup readiness timing, local transit insert latency budget status, embedding map-stage latency budget status, process memory budget status, binary-size budget status, and explicit Phase 1 readiness markers for workspace, transit, capture adapters, memory vectors, embedding runtime, vector backend, local pipeline status, and remaining blockers. |
+| `doctor` | Phase 1 health inspection | `--lease-ms` | Rollback-only SQLite probe, embedding latency probe, resource budget probe | Prints workspace paths, transit health, stale processing count, memory vector health, memory `node_uid` schema health, embedding metadata, workspace startup readiness timing, local transit insert latency budget status, embedding map-stage latency budget status, process memory budget status, binary-size budget status, content-protection backend, unprotected legacy field counts, and explicit Phase 1 readiness markers for workspace, transit, content protection, capture adapters, memory schema, memory vectors, embedding runtime, vector backend, local pipeline status, and remaining blockers. |
 | `repair-transit` | Transit repair | `--lease-ms` | `captured_events.status`, `captured_events.retry_count` | Requeues stale `processing` claims after a bounded lease timeout. |
+| `protect-at-rest` | Privacy repair | `--limit` | `captured_events.source`, `captured_events.content`, `cleaned_events.source`, `cleaned_events.cleaned_content`, memory semantic text fields | Converts legacy plaintext development rows into the current protected-at-rest format without changing local API output. |
 | `redact-transit-content` | Data minimization | `--limit` | `captured_events.content`, `cleaned_events.cleaned_content`, redaction timestamps | Clears duplicate content from promoted transit rows after `.me` storage succeeds. |
 | `cleaned-list` | Inspection | `--limit` | None | Lists normalized text staged for vectorization. |
-| `memory-list` | Inspection | `--limit` | None | Lists local identity memory nodes. |
+| `memory-list` | Inspection | `--limit` | None | Lists local identity memory nodes, including internal row ids and protocol-facing `node_uid` values. |
 | `memory-stats` | Inspection | None | None | Prints `.me` prototype node count, vector health, embedding model id, and embedding dimension. |
 | `repair-memory-vectors` | Memory repair | `--limit` | `identity.me/state.db.memory_nodes.vector_embedding` | Rebuilds missing or corrupt vector blobs locally from stored raw text. |
 | `memory-search` | Local retrieval | `--query`, `--limit` | None | Searches memory nodes by vector similarity plus lexical overlap. |
+| `memory-edge-add` | Memory graph mutation | `--source-id`, `--target-id`, `--relationship`, `--weight` | `identity.me/state.db.graph_edges` | Adds or updates a bounded weighted relationship between two persisted memory nodes. |
+| `memory-edges-list` | Memory graph inspection | `--limit` | None | Lists recent prototype graph edges. |
+| `memory-edge-decay` | Memory graph decay | `--limit` | `identity.me/state.db.graph_edges` | Applies the documented edge-weight decay formula to recent graph edges. |
+| `memory-graph-health` | Memory graph inspection | None | None | Prints node, edge, orphan, and decayed-edge counts for the prototype graph. |
 | `slice-preview` | Context boundary | `--intent`, `--limit` | None | Emits an ephemeral context block without raw memory IDs, hashes, or scores. |
 | `prompt-package` | Context injection artifact | `--intent`, `--prompt`, `--limit` | None | Emits a local prompt package containing scoped context plus user task. |
 | `serve` | Local proxy capture | `--addr`, `--allow-non-loopback`, `X-Identity-Capture-Token` for writes | `captured_events` | Runs `/health` and token-authorized `/capture`; defaults to loopback-only binding and returns bounded HTTP errors for invalid or oversized captures. |
@@ -459,9 +475,9 @@ sequenceDiagram
 
 | Boundary | Upstream | Downstream | Rule |
 | :--- | :--- | :--- | :--- |
-| Capture to transit | Proxy / filesystem / manual / active-window | Ingest safety filter, then SQLite transit buffer | Enforce shared source/content budgets and reject deterministic sensitive paths, credential markers, known token prefixes, private keys, payment-card-like numbers, routing markers, and precise-location markers before any SQLite persistence. |
-| Transit to cleaned staging | SQLite transit buffer | Transit processor | Process only claimed events; successful cleaned writes and `processed` status updates share one SQLite transaction. |
-| Cleaned staging to `.me` prototype | `cleaned_events` | Local embedding prototype, then identity memory store | Promote normalized text into local memory nodes with fixed-width vector blobs, then redact duplicate transit content. |
+| Capture to transit | Proxy / filesystem / manual / active-window | Ingest safety filter, local content protection, then SQLite transit buffer | Enforce shared source/content budgets, reject deterministic sensitive paths, credential markers, known token prefixes, private keys, payment-card-like numbers, routing markers, and precise-location markers, then protect accepted text before SQLite persistence. |
+| Transit to cleaned staging | SQLite transit buffer | Transit processor | Process only claimed events; successful cleaned writes and `processed` status updates share one SQLite transaction, and completion is rejected unless the capture is still in `processing`. |
+| Cleaned staging to `.me` prototype | `cleaned_events` | Local embedding prototype, local content protection, then identity memory store | Decrypt locally for embedding, promote normalized text into local memory nodes with fixed-width vector blobs, protect semantic text fields at rest, then redact duplicate transit content. |
 | Promoted transit to redacted transit | `captured_events`, `cleaned_events` | Transit redaction routine | Keep queue state, hashes, promotion markers, and redaction timestamps; clear duplicate content after `.me` insertion. |
 | Idle gate to local state pipeline | Idle telemetry gate | Transit processor and memory promotion | Skip local synthesis/promotion while the user is active. |
 | `.me` prototype to retrieval | Identity memory store | Local query caller | Return vector/lexical ranked memory nodes. |

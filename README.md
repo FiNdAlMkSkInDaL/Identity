@@ -63,6 +63,7 @@ cargo run -p identityd -- list
 cargo run -p identityd -- stats
 cargo run -p identityd -- doctor
 cargo run -p identityd -- repair-transit
+cargo run -p identityd -- protect-at-rest --limit 100
 cargo run -p identityd -- process-once --limit 10
 cargo run -p identityd -- process-idle-once --limit 10 --idle-ms 5000
 cargo run -p identityd -- pipeline-once --process-limit 10 --promote-limit 10 --idle-ms 5000
@@ -77,6 +78,10 @@ cargo run -p identityd -- memory-list --limit 10
 cargo run -p identityd -- memory-stats
 cargo run -p identityd -- repair-memory-vectors --limit 100
 cargo run -p identityd -- memory-search --query "local-first systems"
+cargo run -p identityd -- memory-graph-health
+cargo run -p identityd -- memory-edges-list --limit 10
+cargo run -p identityd -- memory-edge-add --source-id 1 --target-id 2 --relationship RELATED_TO --weight 0.8
+cargo run -p identityd -- memory-edge-decay --limit 100
 cargo run -p identityd -- slice-preview --intent "draft outreach using local context"
 cargo run -p identityd -- prompt-package --intent "draft outreach using local context" --prompt "Write the message."
 cargo run -p identityd -- serve
@@ -96,6 +101,11 @@ current Rust LanceDB stack requires a heavier native build toolchain, including
 cargo build -p identityd --features lancedb-backend
 ```
 
+Prototype `.me` memory nodes include a stable UUIDv4-style `node_uid` alongside
+the compact internal SQLite row id. The row id remains the local graph join key
+for now; `node_uid` is the protocol-facing identifier for future schema and
+interoperability work.
+
 The initial local workspace is created at:
 
 ```text
@@ -107,6 +117,13 @@ The initial local workspace is created at:
   capture.token
   logs/
 ```
+
+Captured content, source labels, cleaned staging rows, and prototype `.me`
+semantic text fields are protected before SQLite persistence. On Windows the
+daemon uses the local user's DPAPI boundary; existing plaintext development
+rows remain readable so local migrations do not strand old test data.
+Use `protect-at-rest` to convert legacy plaintext development rows into the
+current protected format.
 
 The first local capture endpoint listens on `127.0.0.1:8080`:
 
@@ -133,6 +150,7 @@ remaining blockers before Phase 1 can be considered complete. On Windows it
 also reports current process memory usage, idle-memory budget status, binary
 size, and binary-size budget status without pulling in a heavy measurement
 dependency. It also probes the current local embedding path against the
-200ms map-stage target.
+200ms map-stage target and reports whether any legacy plaintext fields still
+need `protect-at-rest`.
 
 `daemon` is the phase 1 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. On Windows the filesystem watcher stays on the native event path.

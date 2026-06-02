@@ -27,7 +27,7 @@ pub fn validate_capture(source: &str, content: &str) -> Result<(), IngestSafetyE
 }
 
 fn validate_source(source: &str) -> Result<(), IngestSafetyError> {
-    if source.as_bytes().len() > MAX_CAPTURE_SOURCE_BYTES {
+    if source.len() > MAX_CAPTURE_SOURCE_BYTES {
         return Err(IngestSafetyError::BlockedSource(
             "source label exceeds 2048-byte budget".to_string(),
         ));
@@ -66,7 +66,7 @@ fn validate_source(source: &str) -> Result<(), IngestSafetyError> {
 }
 
 fn validate_content(content: &str) -> Result<(), IngestSafetyError> {
-    if content.as_bytes().len() > MAX_CAPTURE_CONTENT_BYTES {
+    if content.len() > MAX_CAPTURE_CONTENT_BYTES {
         return Err(IngestSafetyError::BlockedContent(
             "capture exceeds 1MB transit budget".to_string(),
         ));
@@ -165,7 +165,7 @@ fn contains_known_secret_prefix(input: &str) -> bool {
 fn contains_luhn_number(input: &str) -> bool {
     let mut digits = String::with_capacity(19);
 
-    for character in input.chars().chain(std::iter::once(' ')) {
+    for character in input.chars().chain(std::iter::once('\0')) {
         if character.is_ascii_digit() {
             if digits.len() < 19 {
                 digits.push(character);
@@ -173,7 +173,11 @@ fn contains_luhn_number(input: &str) -> bool {
             continue;
         }
 
-        if digits.len() >= 13 && luhn_valid(&digits) {
+        if matches!(character, ' ' | '-' | '_' | '.') && !digits.is_empty() {
+            continue;
+        }
+
+        if card_candidate_is_blocked(&digits) {
             return true;
         }
 
@@ -181,6 +185,10 @@ fn contains_luhn_number(input: &str) -> bool {
     }
 
     false
+}
+
+fn card_candidate_is_blocked(digits: &str) -> bool {
+    (13..=19).contains(&digits.len()) && luhn_valid(digits)
 }
 
 fn luhn_valid(digits: &str) -> bool {
@@ -251,6 +259,8 @@ mod tests {
     #[test]
     fn blocks_card_like_numbers_and_location_markers() {
         assert!(validate_capture("manual", "card 4111111111111111").is_err());
+        assert!(validate_capture("manual", "card 4111 1111 1111 1111").is_err());
+        assert!(validate_capture("manual", "card 4111-1111-1111-1111").is_err());
         assert!(validate_capture("manual", "latitude=10 longitude=20").is_err());
     }
 

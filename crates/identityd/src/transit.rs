@@ -1,3 +1,6 @@
+use crate::crypto::{
+    is_protected_text, protect_text, unprotect_text, CryptoError, PROTECTED_PREFIX,
+};
 use crate::ingest_safety::{validate_capture, IngestSafetyError};
 use crate::workspace::IdentityPaths;
 use rusqlite::{params, Connection};
@@ -48,6 +51,18 @@ pub struct TransitBudgetProbe {
     pub insert_rollback_ms: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitProtectionHealth {
+    pub unprotected_captured_fields: i64,
+    pub unprotected_cleaned_fields: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitProtectionSummary {
+    pub protected_captured_fields: usize,
+    pub protected_cleaned_fields: usize,
+}
+
 #[derive(Debug)]
 pub struct CleanedEvent {
     pub id: i64,
@@ -62,7 +77,9 @@ pub struct CleanedEvent {
 #[derive(Debug)]
 pub enum TransitError {
     ClockBeforeUnixEpoch,
+    Crypto(CryptoError),
     IngestSafety(IngestSafetyError),
+    InvalidState(String),
     Sqlite(rusqlite::Error),
 }
 
@@ -70,7 +87,9 @@ impl fmt::Display for TransitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ClockBeforeUnixEpoch => write!(f, "system clock is before the Unix epoch"),
+            Self::Crypto(error) => write!(f, "{error}"),
             Self::IngestSafety(error) => write!(f, "{error}"),
+            Self::InvalidState(reason) => write!(f, "invalid transit state: {reason}"),
             Self::Sqlite(error) => write!(f, "{error}"),
         }
     }
@@ -81,6 +100,12 @@ impl std::error::Error for TransitError {}
 impl From<rusqlite::Error> for TransitError {
     fn from(value: rusqlite::Error) -> Self {
         Self::Sqlite(value)
+    }
+}
+
+impl From<CryptoError> for TransitError {
+    fn from(value: CryptoError) -> Self {
+        Self::Crypto(value)
     }
 }
 
@@ -108,11 +133,13 @@ impl TransitBuffer {
     pub fn ingest_text(&self, source: &str, content: &str) -> Result<i64, TransitError> {
         validate_capture(source, content)?;
         let captured_at_ms = now_ms()?;
+        let protected_source = protect_text(source)?;
+        let protected_content = protect_text(content)?;
 
         self.conn.execute(
             "INSERT INTO captured_events (source, content, status, captured_at_ms)
              VALUES (?1, ?2, 'queued', ?3)",
-            params![source, content, captured_at_ms],
+            params![protected_source, protected_content, captured_at_ms],
         )?;
 
         Ok(self.conn.last_insert_rowid())
@@ -141,22 +168,11 @@ impl TransitBuffer {
              LIMIT ?1",
         )?;
 
-        let rows = statement.query_map([limit as i64], |row| {
-            Ok(TransitEvent {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                content: row.get(2)?,
-                status: row.get(3)?,
-                captured_at_ms: row.get(4)?,
-                claimed_at_ms: row.get(5)?,
-                processed_at_ms: row.get(6)?,
-                retry_count: row.get(7)?,
-                error: row.get(8)?,
-            })
-        })?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(TransitError::from)
+        let rows = statement.query_map([limit as i64], raw_transit_event_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(decrypt_transit_event)
+            .collect()
     }
 
     pub fn claim_queued(&self, limit: u32) -> Result<Vec<TransitEvent>, TransitError> {
@@ -239,6 +255,8 @@ impl TransitBuffer {
     ) -> Result<i64, TransitError> {
         let cleaned_at_ms = now_ms()?;
         let content_hash = stable_hash_hex(cleaned_content.as_bytes());
+        let protected_source = protect_text(source)?;
+        let protected_cleaned_content = protect_text(cleaned_content)?;
 
         self.conn.execute(
             "INSERT INTO cleaned_events
@@ -246,8 +264,8 @@ impl TransitBuffer {
              VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
             params![
                 captured_event_id,
-                source,
-                cleaned_content,
+                protected_source,
+                protected_cleaned_content,
                 content_hash,
                 cleaned_at_ms
             ],
@@ -264,6 +282,8 @@ impl TransitBuffer {
     ) -> Result<i64, TransitError> {
         let now = now_ms()?;
         let content_hash = stable_hash_hex(cleaned_content.as_bytes());
+        let protected_source = protect_text(source)?;
+        let protected_cleaned_content = protect_text(cleaned_content)?;
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
@@ -278,8 +298,8 @@ impl TransitBuffer {
                 promoted_at_ms = cleaned_events.promoted_at_ms",
             params![
                 captured_event_id,
-                source,
-                cleaned_content,
+                protected_source,
+                protected_cleaned_content,
                 content_hash,
                 now
             ],
@@ -291,7 +311,7 @@ impl TransitBuffer {
             |row| row.get::<_, i64>(0),
         )?;
 
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE captured_events
              SET status = 'processed',
                  processed_at_ms = ?1,
@@ -300,6 +320,12 @@ impl TransitBuffer {
                AND status = 'processing'",
             params![now, captured_event_id],
         )?;
+
+        if changed != 1 {
+            return Err(TransitError::InvalidState(format!(
+                "capture #{captured_event_id} was not in processing state"
+            )));
+        }
 
         tx.commit()?;
 
@@ -369,6 +395,36 @@ impl TransitBuffer {
         Ok(health)
     }
 
+    pub fn protection_health(&self) -> Result<TransitProtectionHealth, TransitError> {
+        Ok(TransitProtectionHealth {
+            unprotected_captured_fields: self
+                .count_unprotected_fields("captured_events", &["source", "content"])?,
+            unprotected_cleaned_fields: self
+                .count_unprotected_fields("cleaned_events", &["source", "cleaned_content"])?,
+        })
+    }
+
+    pub fn protect_legacy_content(
+        &self,
+        limit: u32,
+    ) -> Result<TransitProtectionSummary, TransitError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let captured =
+            protect_transit_table_fields(&tx, "captured_events", &["source", "content"], limit)?;
+        let cleaned = protect_transit_table_fields(
+            &tx,
+            "cleaned_events",
+            &["source", "cleaned_content"],
+            limit,
+        )?;
+        tx.commit()?;
+
+        Ok(TransitProtectionSummary {
+            protected_captured_fields: captured,
+            protected_cleaned_fields: cleaned,
+        })
+    }
+
     pub fn list_cleaned_recent(&self, limit: u32) -> Result<Vec<CleanedEvent>, TransitError> {
         let mut statement = self.conn.prepare(
             "SELECT id, captured_event_id, source, cleaned_content, content_hash, cleaned_at_ms, promoted_at_ms
@@ -378,9 +434,10 @@ impl TransitBuffer {
         )?;
 
         let rows = statement.query_map([limit as i64], cleaned_event_from_row)?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(TransitError::from)
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(decrypt_cleaned_event)
+            .collect()
     }
 
     pub fn list_cleaned_pending(&self, limit: u32) -> Result<Vec<CleanedEvent>, TransitError> {
@@ -393,9 +450,10 @@ impl TransitBuffer {
         )?;
 
         let rows = statement.query_map([limit as i64], cleaned_event_from_row)?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(TransitError::from)
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(decrypt_cleaned_event)
+            .collect()
     }
 
     pub fn mark_cleaned_promoted(&self, id: i64) -> Result<(), TransitError> {
@@ -474,6 +532,7 @@ impl TransitBuffer {
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
 
              CREATE TABLE IF NOT EXISTS captured_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -568,6 +627,24 @@ impl TransitBuffer {
         Ok(false)
     }
 
+    fn count_unprotected_fields(&self, table: &str, fields: &[&str]) -> Result<i64, TransitError> {
+        let mut total = 0;
+
+        for field in fields {
+            let sql = format!(
+                "SELECT COUNT(*)
+                 FROM {table}
+                 WHERE {field} != ''
+                   AND {field} NOT LIKE ?1"
+            );
+            total += self
+                .conn
+                .query_row(&sql, [protected_like_pattern()], |row| row.get::<_, i64>(0))?;
+        }
+
+        Ok(total)
+    }
+
     fn get_events_by_ids(&self, ids: &[i64]) -> Result<Vec<TransitEvent>, TransitError> {
         let mut events = Vec::with_capacity(ids.len());
 
@@ -577,26 +654,34 @@ impl TransitBuffer {
                  FROM captured_events
                  WHERE id = ?1",
                 [id],
-                |row| {
-                    Ok(TransitEvent {
-                        id: row.get(0)?,
-                        source: row.get(1)?,
-                        content: row.get(2)?,
-                        status: row.get(3)?,
-                        captured_at_ms: row.get(4)?,
-                        claimed_at_ms: row.get(5)?,
-                        processed_at_ms: row.get(6)?,
-                        retry_count: row.get(7)?,
-                        error: row.get(8)?,
-                    })
-                },
+                raw_transit_event_from_row,
             )?;
 
-            events.push(event);
+            events.push(decrypt_transit_event(event)?);
         }
 
         Ok(events)
     }
+}
+
+fn raw_transit_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransitEvent> {
+    Ok(TransitEvent {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        content: row.get(2)?,
+        status: row.get(3)?,
+        captured_at_ms: row.get(4)?,
+        claimed_at_ms: row.get(5)?,
+        processed_at_ms: row.get(6)?,
+        retry_count: row.get(7)?,
+        error: row.get(8)?,
+    })
+}
+
+fn decrypt_transit_event(mut event: TransitEvent) -> Result<TransitEvent, TransitError> {
+    event.source = unprotect_text(&event.source)?;
+    event.content = unprotect_text(&event.content)?;
+    Ok(event)
 }
 
 fn cleaned_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanedEvent> {
@@ -609,6 +694,55 @@ fn cleaned_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanedEv
         cleaned_at_ms: row.get(5)?,
         promoted_at_ms: row.get(6)?,
     })
+}
+
+fn decrypt_cleaned_event(mut event: CleanedEvent) -> Result<CleanedEvent, TransitError> {
+    event.source = unprotect_text(&event.source)?;
+    event.cleaned_content = unprotect_text(&event.cleaned_content)?;
+    Ok(event)
+}
+
+fn protect_transit_table_fields(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    fields: &[&str],
+    limit: u32,
+) -> Result<usize, TransitError> {
+    let select_fields = fields.join(", ");
+    let sql = format!("SELECT id, {select_fields} FROM {table} ORDER BY id ASC LIMIT ?1");
+    let rows = {
+        let mut statement = tx.prepare(&sql)?;
+        let rows = statement.query_map([limit as i64], |row| {
+            let id = row.get::<_, i64>(0)?;
+            let values = (0..fields.len())
+                .map(|index| row.get::<_, String>(index + 1))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((id, values))
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut protected_fields = 0;
+
+    for (id, values) in rows {
+        for (field, value) in fields.iter().zip(values.iter()) {
+            if value.is_empty() || is_protected_text(value) {
+                continue;
+            }
+
+            let protected = protect_text(value)?;
+            let update = format!("UPDATE {table} SET {field} = ?1 WHERE id = ?2");
+            tx.execute(&update, params![protected, id])?;
+            protected_fields += 1;
+        }
+    }
+
+    Ok(protected_fields)
+}
+
+fn protected_like_pattern() -> String {
+    format!("{PROTECTED_PREFIX}%")
 }
 
 fn now_ms() -> Result<i64, TransitError> {
@@ -634,7 +768,9 @@ fn stable_hash_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::TransitBuffer;
+    use crate::crypto::is_protected_text;
     use crate::workspace::IdentityPaths;
+    use rusqlite::Connection;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -737,6 +873,93 @@ mod tests {
     }
 
     #[test]
+    fn protects_transit_content_at_rest() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-transit-protection-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let buffer = TransitBuffer::open(&paths).unwrap();
+        let captured_id = buffer
+            .ingest_text("test:protected", "plain local capture")
+            .unwrap();
+        let visible = buffer.list_recent(10).unwrap();
+        assert_eq!(visible[0].content, "plain local capture");
+
+        let conn = Connection::open(&paths.transit_db).unwrap();
+        let (stored_source, stored_content): (String, String) = conn
+            .query_row(
+                "SELECT source, content FROM captured_events WHERE id = ?1",
+                [captured_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_ne!(stored_source, "test:protected");
+        assert_ne!(stored_content, "plain local capture");
+        assert!(is_protected_text(&stored_source));
+        assert!(is_protected_text(&stored_content));
+
+        drop(conn);
+        drop(buffer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_and_protects_legacy_transit_plaintext() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-transit-protection-migration-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let buffer = TransitBuffer::open(&paths).unwrap();
+        let conn = Connection::open(&paths.transit_db).unwrap();
+        conn.execute(
+            "INSERT INTO captured_events (source, content, status, captured_at_ms)
+             VALUES ('legacy:source', 'legacy capture text', 'queued', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cleaned_events (captured_event_id, source, cleaned_content, content_hash, cleaned_at_ms)
+             VALUES (1, 'legacy:source', 'legacy cleaned text', 'hash', 2)",
+            [],
+        )
+        .unwrap();
+
+        let before = buffer.protection_health().unwrap();
+        assert_eq!(before.unprotected_captured_fields, 2);
+        assert_eq!(before.unprotected_cleaned_fields, 2);
+
+        let summary = buffer.protect_legacy_content(100).unwrap();
+        assert_eq!(summary.protected_captured_fields, 2);
+        assert_eq!(summary.protected_cleaned_fields, 2);
+
+        let after = buffer.protection_health().unwrap();
+        assert_eq!(after.unprotected_captured_fields, 0);
+        assert_eq!(after.unprotected_cleaned_fields, 0);
+        assert_eq!(buffer.list_recent(10).unwrap()[0].source, "legacy:source");
+        assert_eq!(
+            buffer.list_cleaned_recent(10).unwrap()[0].cleaned_content,
+            "legacy cleaned text"
+        );
+
+        drop(conn);
+        drop(buffer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn stale_processing_claims_are_requeued_with_retry_count() {
         let root = std::env::temp_dir().join(format!(
             "identity-stale-claim-test-{}",
@@ -803,7 +1026,31 @@ mod tests {
     }
 
     #[test]
-    fn cleaned_upsert_preserves_promotion_marker() {
+    fn completion_requires_a_processing_capture() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-processing-state-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let buffer = TransitBuffer::open(&paths).unwrap();
+        let captured_id = buffer.ingest_text("test:state", "raw text").unwrap();
+        let result = buffer.complete_processing_with_cleaned(captured_id, "test:state", "clean");
+
+        assert!(result.is_err());
+        assert!(buffer.list_cleaned_recent(10).unwrap().is_empty());
+        assert_eq!(buffer.list_recent(10).unwrap()[0].status, "queued");
+
+        drop(buffer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_completion_rejects_without_touching_promoted_cleaned_row() {
         let root = std::env::temp_dir().join(format!(
             "identity-cleaned-upsert-test-{}",
             SystemTime::now()
@@ -822,14 +1069,14 @@ mod tests {
             .unwrap();
         buffer.mark_cleaned_promoted(cleaned_id).unwrap();
 
-        buffer
-            .complete_processing_with_cleaned(captured_id, "test:upsert", "second clean")
-            .unwrap();
+        let duplicate =
+            buffer.complete_processing_with_cleaned(captured_id, "test:upsert", "second clean");
+        assert!(duplicate.is_err());
 
         let cleaned = buffer.list_cleaned_recent(10).unwrap();
         assert_eq!(cleaned.len(), 1);
         assert_eq!(cleaned[0].id, cleaned_id);
-        assert_eq!(cleaned[0].cleaned_content, "second clean");
+        assert_eq!(cleaned[0].cleaned_content, "first clean");
         assert!(cleaned[0].promoted_at_ms.is_some());
 
         drop(buffer);

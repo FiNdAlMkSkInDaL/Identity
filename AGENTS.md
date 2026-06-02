@@ -38,6 +38,13 @@ Current responsibility:
 - Create `~/.identity/identity.me`.
 - Create `~/.identity/transit.db`.
 - Store captured raw text events in a local SQLite transit buffer.
+- Capture bounded local inputs through manual CLI, token-protected loopback HTTP, Windows foreground-window capture, and filesystem watching.
+- Process queued captures through an idle-gated local pipeline.
+- Promote cleaned captures into the prototype local `.me` memory store with fixed-width local embeddings, vector blob mirroring, and prototype weighted graph edges.
+- Assign every prototype `.me` memory node a UUIDv4-style `node_uid` for protocol-facing identity, while retaining compact SQLite row ids for local joins.
+- Protect captured text, source labels, cleaned staging text, and prototype `.me` semantic text fields before SQLite persistence, while preserving legacy plaintext reads for development data.
+- Report and repair legacy plaintext development rows through `doctor` and `protect-at-rest`.
+- Redact duplicate transit content after successful local `.me` promotion.
 
 Do not start by building UI, cloud sync, model orchestration, or cryptographic protocol machinery until the local daemon and ingestion pipeline are stable.
 
@@ -312,13 +319,13 @@ Phase 3, days 61-90+:
 
 Start from the existing `identityd` crate. The next code changes should be:
 
-1. Add `tokio` to `crates/identityd`.
-2. Introduce an async daemon entrypoint.
-3. Add a local loopback proxy skeleton on `127.0.0.1:8080`.
-4. Parse `text/html` responses into clean text using a conservative HTML parser.
-5. Write cleaned payloads into the existing SQLite transit buffer.
+1. Keep Phase 1 hardening ahead of Phase 2 surface work.
+2. Replace the deterministic hash-embedding prototype with a lean local ONNX/`ort` embedding runtime behind the existing embedding-engine boundary.
+3. Decide whether the default durable vector backend should become LanceDB now, or keep the current lean filesystem+SQLite vector store until the native build-toolchain cost is explicitly accepted.
+4. Add local encryption for real captured `.me` content before any broad always-on capture defaults.
+5. Expand OS-native accessibility and filesystem capture coverage without adding heavy frameworks or hosted services.
 
-Do not skip ahead to `.meslice`, UI, or vector DB until the local capture and buffer loop is working.
+Treat `.meslice`, prompt packaging, and UI work as experimental until Phase 1 local synthesis, storage, resource budget checks, and capture privacy controls are stable.
 
 ## Reference Documents
 

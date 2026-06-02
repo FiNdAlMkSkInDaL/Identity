@@ -1,6 +1,7 @@
 use identityd::activity::{
     capture_active_window_once, watch_active_window_until_shutdown, DEFAULT_ACTIVITY_POLL_MS,
 };
+use identityd::crypto::protection_backend;
 use identityd::embedding::{probe_embedding_latency, EMBEDDING_LATENCY_TARGET_MS};
 use identityd::filesystem::{FileWatcher, FileWatcherConfig, FileWatcherMode};
 use identityd::identity::IdentityStore;
@@ -125,9 +126,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .unwrap_or(DEFAULT_PROCESSING_LEASE_MS);
             let buffer = TransitBuffer::open(&paths)?;
             let transit = buffer.health(lease_ms)?;
+            let transit_protection = buffer.protection_health()?;
             let transit_probe = buffer.probe_insert_rollback_latency()?;
             let store = IdentityStore::open(&paths)?;
             let memory = store.stats()?;
+            let memory_protection = store.protection_health()?;
             let embedding_probe = probe_embedding_latency("Identity local embedding budget probe.");
             let resources = current_process_resources();
             let working_set_bytes = resources.as_ref().map(|probe| probe.working_set_bytes);
@@ -144,6 +147,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("transit_processed={}", transit.processed);
             println!("transit_failed={}", transit.failed);
             println!("memory_nodes={}", memory.node_count);
+            println!("memory_node_uids={}", memory.node_uid_count);
             println!("memory_vectorized_nodes={}", memory.vectorized_count);
             println!("memory_invalid_vectors={}", memory.invalid_vector_count);
             println!("embedding_model_id={}", memory.embedding_model_id);
@@ -151,7 +155,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("embedding_probe_model_id={}", embedding_probe.model_id);
             println!("embedding_probe_dim={}", embedding_probe.dimension);
             println!("embedding_probe_ms={}", embedding_probe.latency_ms);
-                        println!("embedding_target_ms={EMBEDDING_LATENCY_TARGET_MS} within_budget={}",
+            println!(
+                "embedding_target_ms={EMBEDDING_LATENCY_TARGET_MS} within_budget={}",
                 embedding_probe.latency_ms <= EMBEDDING_LATENCY_TARGET_MS
             );
             println!("vector_store_backend={}", memory.vector_store_backend);
@@ -159,6 +164,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("graph_edges={}", graph.edge_count);
             println!("graph_orphans={}", graph.orphan_count);
             println!("graph_decayed_edges={}", graph.decayed_edges);
+            println!(
+                "content_unprotected_transit_fields={}",
+                transit_protection.unprotected_captured_fields
+                    + transit_protection.unprotected_cleaned_fields
+            );
+            println!(
+                "content_unprotected_memory_fields={}",
+                memory_protection.unprotected_semantic_fields
+            );
             println!("startup_workspace_ready_ms={workspace_ready_ms}");
             println!(
                 "transit_insert_rollback_probe_ms={}",
@@ -190,6 +204,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
             println!("phase1_workspace=ready");
             println!("phase1_transit_buffer=ready");
+            println!("phase1_content_protection={}", protection_backend());
+            println!(
+                "phase1_content_protection_health={}",
+                if transit_protection.unprotected_captured_fields == 0
+                    && transit_protection.unprotected_cleaned_fields == 0
+                    && memory_protection.unprotected_semantic_fields == 0
+                {
+                    "ready"
+                } else {
+                    "needs-repair"
+                }
+            );
             println!("phase1_capture_adapters=partial");
             println!(
                 "phase1_transit_health={}",
@@ -202,6 +228,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!(
                 "phase1_memory_vector_health={}",
                 if memory.invalid_vector_count == 0 {
+                    "ready"
+                } else {
+                    "needs-repair"
+                }
+            );
+            println!(
+                "phase1_memory_schema_health={}",
+                if memory.node_count == memory.node_uid_count {
                     "ready"
                 } else {
                     "needs-repair"
@@ -222,7 +256,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 )
             );
             println!(
-                "phase1_remaining=final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; local encryption for real captured content; fuller OS accessibility coverage"
+                "phase1_remaining=final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
             );
         }
         "repair-transit" => {
@@ -236,6 +270,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!(
                 "repaired transit buffer: stale_processing_requeued={}",
                 summary.stale_processing_requeued
+            );
+        }
+        "protect-at-rest" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(100);
+            let buffer = TransitBuffer::open(&paths)?;
+            let transit = buffer.protect_legacy_content(limit)?;
+            let store = IdentityStore::open(&paths)?;
+            let memory = store.protect_legacy_semantic_text(limit)?;
+
+            println!(
+                "protected legacy content: captured_fields={} cleaned_fields={} memory_semantic_fields={}",
+                transit.protected_captured_fields,
+                transit.protected_cleaned_fields,
+                memory.protected_semantic_fields
             );
         }
         "redact-transit-content" => {
@@ -290,8 +341,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
             for memory in memories {
                 println!(
-                    "#{id} cleaned=#{cleaned_id} {domain}/{entity} {source} hash={hash} @ {created_at_ms}: {summary}",
+                    "#{id} uid={node_uid} cleaned=#{cleaned_id} {domain}/{entity} {source} hash={hash} @ {created_at_ms}: {summary}",
                     id = memory.id,
+                    node_uid = memory.node_uid,
                     cleaned_id = memory.cleaned_event_id,
                     domain = memory.domain_context,
                     entity = memory.entity_type,
@@ -307,6 +359,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let stats = store.stats()?;
 
             println!("memory_nodes={}", stats.node_count);
+            println!("memory_node_uids={}", stats.node_uid_count);
             println!("vectorized_nodes={}", stats.vectorized_count);
             println!("invalid_vectors={}", stats.invalid_vector_count);
             println!("embedding_model_id={}", stats.embedding_model_id);
@@ -415,10 +468,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let store = IdentityStore::open(&paths)?;
             let summary = store.decay_edges(limit)?;
 
-            println!(
-                "decayed edges: edges_decayed={}",
-                summary.edges_decayed
-            );
+            println!("decayed edges: edges_decayed={}", summary.edges_decayed);
         }
         "memory-graph-health" => {
             let store = IdentityStore::open(&paths)?;
@@ -619,15 +669,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("press Ctrl+C to stop identityd daemon");
             run_daemon(
                 paths,
-                addr,
-                process_limit,
-                promote_limit,
-                idle_ms,
-                interval_ms,
-                watch_path,
-                watch_active_window,
-                activity_interval_ms,
-                recursive,
+                DaemonConfig {
+                    addr,
+                    process_limit,
+                    promote_limit,
+                    idle_ms,
+                    interval_ms,
+                    watch_path,
+                    watch_active_window,
+                    activity_interval_ms,
+                    recursive,
+                },
             )
             .await?;
         }
@@ -698,7 +750,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback]"
     );
 }
 
@@ -749,8 +801,7 @@ async fn run_active_window_watch(
     }
 }
 
-async fn run_daemon(
-    paths: IdentityPaths,
+struct DaemonConfig {
     addr: SocketAddr,
     process_limit: u32,
     promote_limit: u32,
@@ -760,26 +811,32 @@ async fn run_daemon(
     watch_active_window: bool,
     activity_interval_ms: u64,
     recursive: bool,
-) -> Result<(), Box<dyn Error>> {
-    let server = LocalCaptureServer::new(addr, paths.clone())?;
+}
+
+async fn run_daemon(paths: IdentityPaths, config: DaemonConfig) -> Result<(), Box<dyn Error>> {
+    let server = LocalCaptureServer::new(config.addr, paths.clone())?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let pipeline = run_pipeline_loop(
         paths.clone(),
-        process_limit,
-        promote_limit,
-        idle_ms,
-        interval_ms,
+        config.process_limit,
+        config.promote_limit,
+        config.idle_ms,
+        config.interval_ms,
     );
-    let activity_watch = watch_active_window.then(|| {
-        watch_active_window_until_shutdown(paths.clone(), activity_interval_ms, shutdown.clone())
+    let activity_watch = config.watch_active_window.then(|| {
+        watch_active_window_until_shutdown(
+            paths.clone(),
+            config.activity_interval_ms,
+            shutdown.clone(),
+        )
     });
 
-    if let Some(watch_root) = watch_path {
+    if let Some(watch_root) = config.watch_path {
         let watcher = FileWatcher::new(
             paths,
             FileWatcherConfig {
                 root: watch_root,
-                recursive,
+                recursive: config.recursive,
                 mode: FileWatcherMode::NativePreferred,
             },
         );

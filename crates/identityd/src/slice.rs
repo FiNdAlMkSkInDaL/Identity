@@ -157,16 +157,14 @@ fn sanitize_fact(input: &str) -> String {
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     let mut output = String::new();
-    let mut count = 0;
 
-    for character in input.chars() {
+    for (count, character) in input.chars().enumerate() {
         if count == max_chars {
             output.push_str("...");
             break;
         }
 
         output.push(character);
-        count += 1;
     }
 
     output
@@ -364,6 +362,7 @@ mod tests {
                 score: 1,
                 node: MemoryNode {
                     id,
+                    node_uid: format!("00000000-0000-4000-8000-{id:012}"),
                     cleaned_event_id: id,
                     source: "test".to_string(),
                     domain_context: "local.capture".to_string(),

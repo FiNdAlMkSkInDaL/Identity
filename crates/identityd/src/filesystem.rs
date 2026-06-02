@@ -389,7 +389,7 @@ fn process_windows_events(
             let name_start = offset + 12;
             let name_end = name_start.saturating_add(file_name_len);
 
-            if name_end <= events.len() && file_name_len % 2 == 0 {
+            if name_end <= events.len() && file_name_len.is_multiple_of(2) {
                 let name_slice = unsafe {
                     std::slice::from_raw_parts(
                         events.as_ptr().add(name_start).cast::<u16>(),
