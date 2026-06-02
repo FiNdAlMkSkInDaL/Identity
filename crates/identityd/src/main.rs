@@ -151,11 +151,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("embedding_probe_model_id={}", embedding_probe.model_id);
             println!("embedding_probe_dim={}", embedding_probe.dimension);
             println!("embedding_probe_ms={}", embedding_probe.latency_ms);
-            println!(
-                "embedding_target_ms={EMBEDDING_LATENCY_TARGET_MS} within_budget={}",
+                        println!("embedding_target_ms={EMBEDDING_LATENCY_TARGET_MS} within_budget={}",
                 embedding_probe.latency_ms <= EMBEDDING_LATENCY_TARGET_MS
             );
             println!("vector_store_backend={}", memory.vector_store_backend);
+            let graph = store.graph_health()?;
+            println!("graph_edges={}", graph.edge_count);
+            println!("graph_orphans={}", graph.orphan_count);
+            println!("graph_decayed_edges={}", graph.decayed_edges);
             println!("startup_workspace_ready_ms={workspace_ready_ms}");
             println!(
                 "transit_insert_rollback_probe_ms={}",
@@ -351,6 +354,80 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     summary = memory.summary.replace('\n', " ")
                 );
             }
+        }
+        "memory-edge-add" => {
+            let source_id = read_flag(&raw_args, "--source-id")
+                .ok_or("missing required --source-id value for memory-edge-add command")?
+                .parse::<i64>()?;
+            let target_id = read_flag(&raw_args, "--target-id")
+                .ok_or("missing required --target-id value for memory-edge-add command")?
+                .parse::<i64>()?;
+            let relationship = read_flag(&raw_args, "--relationship")
+                .ok_or("missing required --relationship value for memory-edge-add command")?;
+            let weight = read_flag(&raw_args, "--weight")
+                .map(|value| value.parse::<f64>())
+                .transpose()?
+                .unwrap_or(1.0);
+
+            let store = IdentityStore::open(&paths)?;
+            let edge = store.link_nodes(source_id, target_id, &relationship, weight)?;
+
+            println!(
+                "linked nodes: #{id} {source} -> {target} [{relationship}] weight={weight}",
+                id = edge.id,
+                source = edge.source_node_id,
+                target = edge.target_node_id,
+                relationship = edge.relationship_type,
+                weight = edge.edge_weight
+            );
+        }
+        "memory-edges-list" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+
+            let store = IdentityStore::open(&paths)?;
+            let edges = store.list_edges(limit)?;
+
+            if edges.is_empty() {
+                println!("no graph edges recorded");
+            }
+
+            for edge in edges {
+                println!(
+                    "#{id} {source} -> {target} [{relationship}] weight={weight} updated={updated_at_ms}",
+                    id = edge.id,
+                    source = edge.source_node_id,
+                    target = edge.target_node_id,
+                    relationship = edge.relationship_type,
+                    weight = edge.edge_weight,
+                    updated_at_ms = edge.updated_at_ms
+                );
+            }
+        }
+        "memory-edge-decay" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(100);
+
+            let store = IdentityStore::open(&paths)?;
+            let summary = store.decay_edges(limit)?;
+
+            println!(
+                "decayed edges: edges_decayed={}",
+                summary.edges_decayed
+            );
+        }
+        "memory-graph-health" => {
+            let store = IdentityStore::open(&paths)?;
+            let health = store.graph_health()?;
+
+            println!("graph_nodes={}", health.node_count);
+            println!("graph_edges={}", health.edge_count);
+            println!("graph_orphans={}", health.orphan_count);
+            println!("graph_decayed_edges={}", health.decayed_edges);
         }
         "slice-preview" => {
             let intent = read_flag(&raw_args, "--intent")
@@ -621,7 +698,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback]"
     );
 }
 

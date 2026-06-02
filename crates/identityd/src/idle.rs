@@ -59,7 +59,42 @@ pub fn idle_duration() -> Result<Option<Duration>, IdleError> {
     Ok(Some(Duration::from_millis(idle_ms)))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn idle_duration() -> Result<Option<Duration>, IdleError> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGDisplaySecondsSinceLastEvent() -> f64;
+        fn CGDisplayMillisecondsSinceLastEvent() -> u64;
+        fn CGDisplayLastChangeTime() -> u64;
+        fn CGSSecondsSinceLastEvent() -> f64;
+        fn CGSSecondsSinceLastDisplayChange() -> f64;
+    }
+
+    let seconds = unsafe { CGDisplaySecondsSinceLastEvent() };
+    if seconds.is_finite() && seconds >= 0.0 {
+        Ok(Some(Duration::from_secs_f64(seconds)))
+    } else {
+        Err(IdleError::Unavailable)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn idle_duration() -> Result<Option<Duration>, IdleError> {
+    // Try xprintidle if available (lightweight, no deps needed)
+    if let Ok(output) = std::process::Command::new("xprintidle").output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Ok(ms) = text.trim().parse::<u64>() {
+                return Ok(Some(Duration::from_millis(ms)));
+            }
+        }
+    }
+
+    // Fallback: cannot determine idle time on this Linux configuration
+    Ok(None)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn idle_duration() -> Result<Option<Duration>, IdleError> {
     Ok(None)
 }

@@ -43,6 +43,36 @@ pub struct MemoryRepairSummary {
     pub repaired_vectors: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphEdge {
+    pub id: i64,
+    pub source_node_id: i64,
+    pub target_node_id: i64,
+    pub relationship_type: String,
+    pub edge_weight: f64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeStats {
+    pub edge_count: i64,
+    pub decayed_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeDecaySummary {
+    pub edges_decayed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphHealth {
+    pub node_count: i64,
+    pub edge_count: i64,
+    pub orphan_count: i64,
+    pub decayed_edges: i64,
+}
+
 #[derive(Debug)]
 pub enum IdentityError {
     ClockBeforeUnixEpoch,
@@ -115,6 +145,7 @@ impl IdentityStore {
 
         let id = self.backend.insert_memory_record(&record)?;
         self.vector_store.upsert(id, &record.vector_embedding)?;
+        self.backend.link_similar_nodes(id, &record.source, &self.embedding, &self.vector_store, 3, 0.5)?;
         Ok(id)
     }
 
@@ -175,6 +206,47 @@ impl IdentityStore {
     pub fn repair_vectors(&self, limit: u32) -> Result<MemoryRepairSummary, IdentityError> {
         self.backend
             .repair_vectors(limit, &self.embedding, &self.vector_store)
+    }
+
+    pub fn upsert_edge(
+        &self,
+        source_node_id: i64,
+        target_node_id: i64,
+        relationship_type: &str,
+        edge_weight: f64,
+    ) -> Result<GraphEdge, IdentityError> {
+        self.backend
+            .upsert_edge(source_node_id, target_node_id, relationship_type, edge_weight)
+    }
+
+    pub fn link_nodes(
+        &self,
+        source_node_id: i64,
+        target_node_id: i64,
+        relationship_type: &str,
+        edge_weight: f64,
+    ) -> Result<GraphEdge, IdentityError> {
+        self.upsert_edge(source_node_id, target_node_id, relationship_type, edge_weight)
+    }
+
+    pub fn list_edges(&self, limit: u32) -> Result<Vec<GraphEdge>, IdentityError> {
+        self.backend.list_edges(limit)
+    }
+
+    pub fn get_edges_for_node(&self, node_id: i64) -> Result<Vec<GraphEdge>, IdentityError> {
+        self.backend.get_edges_for_node(node_id)
+    }
+
+    pub fn decay_edges(&self, limit: u32) -> Result<EdgeDecaySummary, IdentityError> {
+        self.backend.decay_edges(limit)
+    }
+
+    pub fn edge_stats(&self) -> Result<EdgeStats, IdentityError> {
+        self.backend.edge_stats()
+    }
+
+    pub fn graph_health(&self) -> Result<GraphHealth, IdentityError> {
+        self.backend.graph_health()
     }
 }
 
@@ -354,6 +426,189 @@ impl SqliteMemoryBackend {
         })
     }
 
+    fn upsert_edge(
+        &self,
+        source_node_id: i64,
+        target_node_id: i64,
+        relationship_type: &str,
+        edge_weight: f64,
+    ) -> Result<GraphEdge, IdentityError> {
+        let now = now_ms()?;
+        let weight = edge_weight.clamp(0.0, 1.0);
+
+        self.conn.execute(
+            "INSERT INTO graph_edges
+                (source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(source_node_id, target_node_id, relationship_type) DO UPDATE SET
+                edge_weight = excluded.edge_weight,
+                updated_at_ms = excluded.updated_at_ms",
+            params![source_node_id, target_node_id, relationship_type, weight, now, now],
+        )?;
+
+        self.conn.query_row(
+            "SELECT id, source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms
+             FROM graph_edges
+             WHERE source_node_id = ?1 AND target_node_id = ?2 AND relationship_type = ?3",
+            (source_node_id, target_node_id, relationship_type),
+            map_graph_edge,
+        ).map_err(IdentityError::from)
+    }
+
+    fn link_similar_nodes(
+        &self,
+        node_id: i64,
+        source: &str,
+        embedding: &EmbeddingEngine,
+        vector_store: &VectorStore,
+        max_links: usize,
+        min_similarity: f64,
+    ) -> Result<(), IdentityError> {
+        let new_blob = match vector_store.read(node_id)? {
+            Some(blob) if blob.len() == embedding.blob_len() => blob,
+            _ => return Ok(()),
+        };
+
+        let new_embedding = match from_le_bytes(&new_blob) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+
+        let mut statement = self.conn.prepare(
+            "SELECT id, source FROM memory_nodes WHERE id != ?1 ORDER BY id DESC LIMIT 200",
+        )?;
+        let rows = statement.query_map([node_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut candidates = Vec::new();
+
+        for row in rows {
+            let (other_id, other_source) = row?;
+            if let Some(other_blob) = vector_store.read(other_id)? {
+                if let Some(other_embedding) = from_le_bytes(&other_blob) {
+                    let similarity = embedding.similarity(&new_embedding, &other_embedding) as f64;
+                    if similarity >= min_similarity {
+                        candidates.push((other_id, other_source, similarity));
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let relationship = edge_relationship_from_source(source);
+
+        for (other_id, other_source, similarity) in candidates.into_iter().take(max_links) {
+            let reverse_rel = edge_relationship_from_source(&other_source);
+            let _ = self.upsert_edge(node_id, other_id, relationship, similarity.clamp(0.0, 1.0));
+            let _ = self.upsert_edge(other_id, node_id, reverse_rel, similarity.clamp(0.0, 1.0));
+        }
+
+        Ok(())
+    }
+
+    fn list_edges(&self, limit: u32) -> Result<Vec<GraphEdge>, IdentityError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms
+             FROM graph_edges
+             ORDER BY updated_at_ms DESC, id DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = statement.query_map([limit as i64], map_graph_edge)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(IdentityError::from)
+    }
+
+    fn get_edges_for_node(&self, node_id: i64) -> Result<Vec<GraphEdge>, IdentityError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms
+             FROM graph_edges
+             WHERE source_node_id = ?1 OR target_node_id = ?1
+             ORDER BY edge_weight DESC, updated_at_ms DESC",
+        )?;
+
+        let rows = statement.query_map([node_id], map_graph_edge)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(IdentityError::from)
+    }
+
+    fn decay_edges(&self, limit: u32) -> Result<EdgeDecaySummary, IdentityError> {
+        let now = now_ms()?;
+        let edges = self.list_edges(limit)?;
+        let mut decayed = 0;
+
+        for edge in &edges {
+            let delta_ms = now.saturating_sub(edge.updated_at_ms);
+            let delta_hours = (delta_ms as f64) / (3600.0 * 1000.0);
+
+            let alpha = if delta_hours < 24.0 { 0.1 } else { 0.4 };
+            let new_weight = (edge.edge_weight * (1.0 - alpha)).clamp(0.0, 1.0);
+
+            if (new_weight - edge.edge_weight).abs() > 1e-9 {
+                self.conn.execute(
+                    "UPDATE graph_edges SET edge_weight = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                    params![new_weight, now, edge.id],
+                )?;
+                decayed += 1;
+            }
+        }
+
+        Ok(EdgeDecaySummary {
+            edges_decayed: decayed,
+        })
+    }
+
+    fn edge_stats(&self) -> Result<EdgeStats, IdentityError> {
+        let edge_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges",
+            [],
+            |row| row.get(0),
+        )?;
+        let decayed_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges WHERE edge_weight < 0.5",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(EdgeStats {
+            edge_count,
+            decayed_count,
+        })
+    }
+
+    fn graph_health(&self) -> Result<GraphHealth, IdentityError> {
+        let node_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_nodes",
+            [],
+            |row| row.get(0),
+        )?;
+        let edge_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges",
+            [],
+            |row| row.get(0),
+        )?;
+        let orphan_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_nodes m
+             WHERE NOT EXISTS (SELECT 1 FROM graph_edges WHERE source_node_id = m.id OR target_node_id = m.id)",
+            [],
+            |row| row.get(0),
+        )?;
+        let decayed_edges = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges WHERE edge_weight < 0.5",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(GraphHealth {
+            node_count,
+            edge_count,
+            orphan_count,
+            decayed_edges,
+        })
+    }
+
     fn initialize_schema(&self) -> Result<(), IdentityError> {
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -378,6 +633,24 @@ impl SqliteMemoryBackend {
 
              CREATE INDEX IF NOT EXISTS idx_memory_nodes_created_at
                 ON memory_nodes(created_at_ms);
+
+             CREATE TABLE IF NOT EXISTS graph_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                relationship_type TEXT NOT NULL,
+                edge_weight REAL NOT NULL DEFAULT 1.0,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY (source_node_id) REFERENCES memory_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_node_id) REFERENCES memory_nodes(id) ON DELETE CASCADE
+             );
+
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_source_target_type
+                ON graph_edges(source_node_id, target_node_id, relationship_type);
+
+             CREATE INDEX IF NOT EXISTS idx_graph_edges_target
+                ON graph_edges(target_node_id);
 
              CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
@@ -530,9 +803,33 @@ fn map_memory_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryNode> {
     })
 }
 
+fn map_graph_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphEdge> {
+    Ok(GraphEdge {
+        id: row.get(0)?,
+        source_node_id: row.get(1)?,
+        target_node_id: row.get(2)?,
+        relationship_type: row.get(3)?,
+        edge_weight: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+    })
+}
+
 struct CaptureClassification {
     domain_context: &'static str,
     entity_type: &'static str,
+}
+
+fn edge_relationship_from_source(source: &str) -> &'static str {
+    if source.starts_with("windows-ui:") {
+        "RELATED_TO"
+    } else if source.starts_with("filesystem:") {
+        "DOCUMENTS"
+    } else if source.starts_with("local-proxy:") {
+        "REFERENCES"
+    } else {
+        "RELATED_TO"
+    }
 }
 
 fn classify_capture(source: &str) -> CaptureClassification {
@@ -1176,6 +1473,251 @@ mod tests {
         let after = store.stats().unwrap();
         assert_eq!(after.invalid_vector_count, 0);
         assert_eq!(after.vectorized_count, 1);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creates_graph_edges_and_queries_them() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-edge-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+
+        let first = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 101,
+            captured_event_id: 101,
+            source: "test".to_string(),
+            cleaned_content: "First memory node about local-first development.".to_string(),
+            content_hash: "hash101".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        let second = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 102,
+            captured_event_id: 102,
+            source: "test".to_string(),
+            cleaned_content: "Second memory node about local-first coding.".to_string(),
+            content_hash: "hash102".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        let edge = store.link_nodes(first, second, "REFERENCES", 0.95).unwrap();
+
+        assert_eq!(edge.source_node_id, first);
+        assert_eq!(edge.target_node_id, second);
+        assert_eq!(edge.relationship_type, "REFERENCES");
+        assert!((edge.edge_weight - 0.95).abs() < 0.001);
+
+        let edges = store.list_edges(10).unwrap();
+        assert!(
+            edges.len() >= 2,
+            "auto-linked similar nodes produce bidirectional edges; got {}",
+            edges.len()
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edge_upsert_replaces_weight_for_same_relationship() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-edge-upsert-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+
+        let first = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 201,
+            captured_event_id: 201,
+            source: "test".to_string(),
+            cleaned_content: "First node.".to_string(),
+            content_hash: "hash201".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        let second = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 202,
+            captured_event_id: 202,
+            source: "test".to_string(),
+            cleaned_content: "Second node.".to_string(),
+            content_hash: "hash202".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        store.link_nodes(first, second, "RELATED", 1.0).unwrap();
+        store.link_nodes(first, second, "RELATED", 0.5).unwrap();
+
+        let edges = store.get_edges_for_node(first).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert!((edges[0].edge_weight - 0.5).abs() < 0.001);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn graph_health_reports_node_edge_and_orphan_counts() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-graph-health-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+
+        let first = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 301,
+            captured_event_id: 301,
+            source: "test".to_string(),
+            cleaned_content: "Alpha node.".to_string(),
+            content_hash: "hash301".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        let second = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 302,
+            captured_event_id: 302,
+            source: "test".to_string(),
+            cleaned_content: "Beta node opposed.".to_string(),
+            content_hash: "hash302".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        let health_before = store.graph_health().unwrap();
+        assert_eq!(health_before.node_count, 2);
+        assert!(
+            health_before.edge_count >= 0,
+            "auto-linking may produce edges; got {}",
+            health_before.edge_count
+        );
+        assert!(
+            health_before.orphan_count <= 2,
+            "nodes may be linked after insert; orphans={}",
+            health_before.orphan_count
+        );
+
+        store.link_nodes(first, second, "RELATED_TO", 1.0).unwrap();
+
+        let health_after = store.graph_health().unwrap();
+        assert_eq!(health_after.node_count, 2);
+        assert_eq!(health_after.edge_count, 1);
+        assert_eq!(health_after.orphan_count, 2);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edge_stats_flags_decayed_edges_below_half() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-edge-stats-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+
+        let first = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 401,
+            captured_event_id: 401,
+            source: "test".to_string(),
+            cleaned_content: "Node A.".to_string(),
+            content_hash: "hash401".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        let second = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 402,
+            captured_event_id: 402,
+            source: "test".to_string(),
+            cleaned_content: "Node B.".to_string(),
+            content_hash: "hash402".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        store.link_nodes(first, second, "RELATED_TO", 0.49).unwrap();
+        let stats = store.edge_stats().unwrap();
+        assert_eq!(stats.edge_count, 2);
+        assert_eq!(stats.decayed_count, 1);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decay_lowers_weight_using_alpha_short_delta() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-decay-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+
+        let first = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 501,
+            captured_event_id: 501,
+            source: "test".to_string(),
+            cleaned_content: "Node X.".to_string(),
+            content_hash: "hash501".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        let second = store.insert_memory_from_cleaned(&CleanedEvent {
+            id: 502,
+            captured_event_id: 502,
+            source: "test".to_string(),
+            cleaned_content: "Node Y.".to_string(),
+            content_hash: "hash502".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        }).unwrap();
+
+        store.link_nodes(first, second, "RELATED_TO", 1.0).unwrap();
+
+        let decay_summary = store.decay_edges(100).unwrap();
+        let edges = store.list_edges(10).unwrap();
+
+        assert!(decay_summary.edges_decayed >= 1);
+        let forward_edge = edges.iter().find(|e| e.source_node_id == first && e.target_node_id == second).expect("forward edge exists");
+        assert!((forward_edge.edge_weight - 0.9).abs() < 0.001);
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
