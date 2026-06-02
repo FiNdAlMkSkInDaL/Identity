@@ -1,13 +1,13 @@
 use crate::transit::{TransitBuffer, TransitError};
 use crate::workspace::IdentityPaths;
 use std::fmt;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 #[cfg(windows)]
 use std::path::Path;
-use tokio::time::{Duration, sleep};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::time::{sleep, Duration};
 
 pub const DEFAULT_ACTIVITY_POLL_MS: u64 = 1000;
 #[cfg(windows)]
@@ -42,7 +42,10 @@ impl fmt::Display for ActivityError {
             Self::EmptyCapture => write!(f, "active window did not expose captureable text"),
             Self::Transit(error) => write!(f, "{error}"),
             Self::UnsupportedPlatform => {
-                write!(f, "active window capture is currently implemented only on Windows")
+                write!(
+                    f,
+                    "active window capture is currently implemented only on Windows"
+                )
             }
         }
     }
@@ -176,11 +179,7 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn OpenProcess(
-            dwDesiredAccess: Dword,
-            bInheritHandle: Bool,
-            dwProcessId: Dword,
-        ) -> Handle;
+        fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> Handle;
         fn QueryFullProcessImageNameW(
             hProcess: Handle,
             dwFlags: Dword,
@@ -367,10 +366,8 @@ fn read_accessible_text(hwnd: *mut std::ffi::c_void) -> String {
         get_acc_parent: usize,
         get_acc_child_count: usize,
         get_acc_child: usize,
-        get_acc_name:
-            unsafe extern "system" fn(*mut IAccessible, Variant, *mut Bstr) -> Hresult,
-        get_acc_value:
-            unsafe extern "system" fn(*mut IAccessible, Variant, *mut Bstr) -> Hresult,
+        get_acc_name: unsafe extern "system" fn(*mut IAccessible, Variant, *mut Bstr) -> Hresult,
+        get_acc_value: unsafe extern "system" fn(*mut IAccessible, Variant, *mut Bstr) -> Hresult,
     }
 
     const IID_IACCESSIBLE: Guid = Guid {
@@ -466,12 +463,7 @@ fn read_accessible_text(hwnd: *mut std::ffi::c_void) -> String {
 
     let mut raw_object = std::ptr::null_mut();
     let accessible_result = unsafe {
-        AccessibleObjectFromWindow(
-            hwnd,
-            OBJID_CLIENT,
-            &IID_IACCESSIBLE,
-            &mut raw_object,
-        )
+        AccessibleObjectFromWindow(hwnd, OBJID_CLIENT, &IID_IACCESSIBLE, &mut raw_object)
     };
 
     if accessible_result < 0 || raw_object.is_null() {
@@ -517,11 +509,7 @@ fn read_window_text_via_caption(hwnd: *mut std::ffi::c_void) -> String {
     #[link(name = "user32")]
     extern "system" {
         fn GetWindowTextLengthW(hWnd: *mut std::ffi::c_void) -> i32;
-        fn GetWindowTextW(
-            hWnd: *mut std::ffi::c_void,
-            lpString: *mut u16,
-            nMaxCount: i32,
-        ) -> i32;
+        fn GetWindowTextW(hWnd: *mut std::ffi::c_void, lpString: *mut u16, nMaxCount: i32) -> i32;
     }
 
     let title_len = unsafe { GetWindowTextLengthW(hwnd) };
@@ -530,9 +518,8 @@ fn read_window_text_via_caption(hwnd: *mut std::ffi::c_void) -> String {
     }
 
     let mut title_buffer = vec![0_u16; title_len as usize + 1];
-    let title_written = unsafe {
-        GetWindowTextW(hwnd, title_buffer.as_mut_ptr(), title_buffer.len() as i32)
-    };
+    let title_written =
+        unsafe { GetWindowTextW(hwnd, title_buffer.as_mut_ptr(), title_buffer.len() as i32) };
 
     normalize_capture_text(&String::from_utf16_lossy(
         &title_buffer[..title_written.max(0) as usize],
@@ -608,7 +595,10 @@ fn read_window_text_via_message(hwnd: *mut std::ffi::c_void) -> String {
         return String::new();
     }
 
-    let end = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+    let end = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
     normalize_capture_text(&String::from_utf16_lossy(&buffer[..end]))
 }
 
@@ -757,10 +747,7 @@ mod tests {
             prefer_text("Save".to_string(), "Save draft to workspace".to_string()),
             "Save draft to workspace"
         );
-        assert_eq!(
-            prefer_text("Open".to_string(), String::new()),
-            "Open"
-        );
+        assert_eq!(prefer_text("Open".to_string(), String::new()), "Open");
     }
 
     #[cfg(windows)]

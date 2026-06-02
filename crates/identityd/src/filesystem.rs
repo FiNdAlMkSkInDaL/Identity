@@ -5,7 +5,10 @@ use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::SystemTime;
 use tokio::task::JoinError;
 use tokio::time::{sleep, Duration};
@@ -89,13 +92,11 @@ impl FileWatcher {
     }
 
     pub async fn run(self) -> Result<(), FileWatchError> {
-        self.run_until_shutdown(Arc::new(AtomicBool::new(false))).await
+        self.run_until_shutdown(Arc::new(AtomicBool::new(false)))
+            .await
     }
 
-    pub async fn run_until_shutdown(
-        self,
-        shutdown: Arc<AtomicBool>,
-    ) -> Result<(), FileWatchError> {
+    pub async fn run_until_shutdown(self, shutdown: Arc<AtomicBool>) -> Result<(), FileWatchError> {
         #[cfg(windows)]
         {
             if self.config.mode == FileWatcherMode::NativePreferred {
@@ -291,7 +292,8 @@ fn windows_watch_loop(
         }
 
         let mut bytes_returned = 0;
-        let ok = unsafe { GetOverlappedResult(raw_handle, &mut overlapped, &mut bytes_returned, 0) };
+        let ok =
+            unsafe { GetOverlappedResult(raw_handle, &mut overlapped, &mut bytes_returned, 0) };
 
         if ok == 0 {
             return Err(std::io::Error::last_os_error().into());

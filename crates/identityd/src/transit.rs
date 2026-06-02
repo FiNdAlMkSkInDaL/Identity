@@ -43,6 +43,11 @@ pub struct TransitHealth {
     pub stale_processing: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitBudgetProbe {
+    pub insert_rollback_ms: u128,
+}
+
 #[derive(Debug)]
 pub struct CleanedEvent {
     pub id: i64,
@@ -111,6 +116,21 @@ impl TransitBuffer {
         )?;
 
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn probe_insert_rollback_latency(&self) -> Result<TransitBudgetProbe, TransitError> {
+        let started = std::time::Instant::now();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO captured_events (source, content, status, captured_at_ms)
+             VALUES ('doctor:budget-probe', 'local rollback latency probe', 'queued', ?1)",
+            [now_ms()?],
+        )?;
+        tx.rollback()?;
+
+        Ok(TransitBudgetProbe {
+            insert_rollback_ms: started.elapsed().as_millis(),
+        })
     }
 
     pub fn list_recent(&self, limit: u32) -> Result<Vec<TransitEvent>, TransitError> {
@@ -870,6 +890,27 @@ mod tests {
         assert_eq!(captured[0].content, "");
         assert_eq!(cleaned[0].cleaned_content, "");
         assert_eq!(cleaned[0].content_hash.len(), 16);
+
+        drop(buffer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn budget_probe_does_not_persist_capture_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-transit-budget-probe-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let buffer = TransitBuffer::open(&paths).unwrap();
+        let probe = buffer.probe_insert_rollback_latency().unwrap();
+        assert!(probe.insert_rollback_ms < 10_000);
+        assert!(buffer.list_recent(10).unwrap().is_empty());
 
         drop(buffer);
         fs::remove_dir_all(root).unwrap();

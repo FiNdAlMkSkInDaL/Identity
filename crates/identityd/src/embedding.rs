@@ -1,5 +1,13 @@
 pub const EMBEDDING_DIM: usize = 384;
 pub const EMBEDDING_MODEL_ID: &str = "identity-hash-embedding-v1";
+pub const EMBEDDING_LATENCY_TARGET_MS: u128 = 200;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingProbe {
+    pub model_id: &'static str,
+    pub dimension: usize,
+    pub latency_ms: u128,
+}
 
 pub fn embed_text(input: &str) -> [f32; EMBEDDING_DIM] {
     let mut vector = [0.0; EMBEDDING_DIM];
@@ -13,6 +21,17 @@ pub fn embed_text(input: &str) -> [f32; EMBEDDING_DIM] {
 
     normalize(&mut vector);
     vector
+}
+
+pub fn probe_embedding_latency(input: &str) -> EmbeddingProbe {
+    let started = std::time::Instant::now();
+    let _embedding = embed_text(input);
+
+    EmbeddingProbe {
+        model_id: EMBEDDING_MODEL_ID,
+        dimension: EMBEDDING_DIM,
+        latency_ms: started.elapsed().as_millis(),
+    }
 }
 
 pub fn to_le_bytes(vector: &[f32; EMBEDDING_DIM]) -> Vec<u8> {
@@ -80,7 +99,10 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{cosine_similarity, embed_text, from_le_bytes, to_le_bytes, EMBEDDING_DIM};
+    use super::{
+        cosine_similarity, embed_text, from_le_bytes, probe_embedding_latency, to_le_bytes,
+        EMBEDDING_DIM, EMBEDDING_LATENCY_TARGET_MS, EMBEDDING_MODEL_ID,
+    };
 
     #[test]
     fn embedding_round_trips_as_fixed_width_little_endian_blob() {
@@ -99,5 +121,14 @@ mod tests {
         let unrelated = embed_text("weather forecast tomorrow");
 
         assert!(cosine_similarity(&query, &related) > cosine_similarity(&query, &unrelated));
+    }
+
+    #[test]
+    fn embedding_probe_reports_model_dimension_and_latency() {
+        let probe = probe_embedding_latency("Identity maps local context into private memory.");
+
+        assert_eq!(probe.model_id, EMBEDDING_MODEL_ID);
+        assert_eq!(probe.dimension, EMBEDDING_DIM);
+        assert!(probe.latency_ms < EMBEDDING_LATENCY_TARGET_MS);
     }
 }

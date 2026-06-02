@@ -1,20 +1,33 @@
-use arrow_array::types::Float32Type;
-use arrow_array::{Array, BinaryArray, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator};
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use crate::workspace::IdentityPaths;
+#[cfg(feature = "lancedb-backend")]
+use arrow_array::types::Float32Type;
+#[cfg(feature = "lancedb-backend")]
+use arrow_array::{
+    Array, BinaryArray, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator,
+};
+#[cfg(feature = "lancedb-backend")]
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+#[cfg(feature = "lancedb-backend")]
 use futures_util::TryStreamExt;
+#[cfg(feature = "lancedb-backend")]
 use lancedb::query::{ExecutableQuery, QueryBase};
+#[cfg(feature = "lancedb-backend")]
 use lancedb::{Connection as LanceConnection, Error as LanceError, Table as LanceTable};
 use rusqlite::Connection;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+#[cfg(feature = "lancedb-backend")]
 use std::sync::Arc;
+#[cfg(feature = "lancedb-backend")]
 use std::thread;
+#[cfg(feature = "lancedb-backend")]
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 
+#[cfg(feature = "lancedb-backend")]
 const LANCEDB_DIR: &str = "lancedb";
+#[cfg(feature = "lancedb-backend")]
 const LANCEDB_TABLE: &str = "memory_vectors";
 const STORE_META_FILE: &str = "store.meta";
 const VECTOR_FILE_SUFFIX: &str = ".f32le";
@@ -23,9 +36,12 @@ const FORMAT_VERSION: &str = "raw-f32-le-v1";
 #[derive(Debug)]
 pub enum VectorStoreError {
     Io(io::Error),
+    #[cfg(feature = "lancedb-backend")]
     Arrow(ArrowError),
     InvalidData(String),
+    #[cfg(feature = "lancedb-backend")]
     LanceDb(LanceError),
+    #[cfg(feature = "lancedb-backend")]
     Runtime(String),
     Sqlite(rusqlite::Error),
 }
@@ -34,9 +50,12 @@ impl fmt::Display for VectorStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "{error}"),
+            #[cfg(feature = "lancedb-backend")]
             Self::Arrow(error) => write!(f, "{error}"),
             Self::InvalidData(message) => write!(f, "{message}"),
+            #[cfg(feature = "lancedb-backend")]
             Self::LanceDb(error) => write!(f, "{error}"),
+            #[cfg(feature = "lancedb-backend")]
             Self::Runtime(message) => write!(f, "{message}"),
             Self::Sqlite(error) => write!(f, "{error}"),
         }
@@ -51,12 +70,14 @@ impl From<io::Error> for VectorStoreError {
     }
 }
 
+#[cfg(feature = "lancedb-backend")]
 impl From<ArrowError> for VectorStoreError {
     fn from(value: ArrowError) -> Self {
         Self::Arrow(value)
     }
 }
 
+#[cfg(feature = "lancedb-backend")]
 impl From<LanceError> for VectorStoreError {
     fn from(value: LanceError) -> Self {
         Self::LanceDb(value)
@@ -77,10 +98,12 @@ pub trait VectorBlobStore {
 
 pub struct VectorStore {
     primary: Box<dyn VectorBlobStore>,
+    #[cfg(feature = "lancedb-backend")]
     mirror: Box<dyn VectorBlobStore>,
     fallback: Box<dyn VectorBlobStore>,
 }
 
+#[cfg(feature = "lancedb-backend")]
 #[derive(Debug, Clone)]
 struct LanceDbVectorStore {
     schema: SchemaRef,
@@ -106,7 +129,6 @@ impl VectorStore {
         model_id: &str,
         dimension: usize,
     ) -> Result<Self, VectorStoreError> {
-        let lance = LanceDbVectorStore::open(paths.vector_store_dir.join(LANCEDB_DIR), dimension)?;
         let filesystem = FilesystemVectorStore {
             root: paths.vector_store_dir.clone(),
             model_id: model_id.to_string(),
@@ -116,33 +138,61 @@ impl VectorStore {
         let fallback = SqliteVectorStore {
             identity_db: paths.identity_db.clone(),
         };
+
+        #[cfg(feature = "lancedb-backend")]
+        let lance = LanceDbVectorStore::open(paths.vector_store_dir.join(LANCEDB_DIR), dimension)?;
+
         Ok(Self {
+            #[cfg(feature = "lancedb-backend")]
             primary: Box::new(lance),
+            #[cfg(not(feature = "lancedb-backend"))]
+            primary: Box::new(filesystem),
+            #[cfg(feature = "lancedb-backend")]
             mirror: Box::new(filesystem),
             fallback: Box::new(fallback),
         })
     }
 
     pub fn backend_name(&self) -> &'static str {
-        "lancedb+filesystem+sqlite"
+        #[cfg(feature = "lancedb-backend")]
+        {
+            "lancedb+filesystem+sqlite"
+        }
+        #[cfg(not(feature = "lancedb-backend"))]
+        {
+            "filesystem+sqlite"
+        }
     }
 
     pub fn upsert(&self, node_id: i64, bytes: &[u8]) -> Result<(), VectorStoreError> {
         self.primary.upsert(node_id, bytes)?;
-        self.mirror.upsert(node_id, bytes)
+        #[cfg(feature = "lancedb-backend")]
+        {
+            self.mirror.upsert(node_id, bytes)
+        }
+        #[cfg(not(feature = "lancedb-backend"))]
+        {
+            Ok(())
+        }
     }
 
     pub fn read(&self, node_id: i64) -> Result<Option<Vec<u8>>, VectorStoreError> {
         if let Some(bytes) = self.primary.read(node_id)? {
-            Ok(Some(bytes))
-        } else if let Some(bytes) = self.mirror.read(node_id)? {
-            Ok(Some(bytes))
-        } else {
-            self.fallback.read(node_id)
+            return Ok(Some(bytes));
         }
+
+        #[cfg(feature = "lancedb-backend")]
+        {
+            if let Some(bytes) = self.mirror.read(node_id)? {
+                return Ok(Some(bytes));
+            }
+        }
+
+        self.fallback.read(node_id)
     }
 }
 
+#[cfg(feature = "lancedb-backend")]
 impl LanceDbVectorStore {
     fn open(root: PathBuf, dimension: usize) -> Result<Self, VectorStoreError> {
         fs::create_dir_all(&root)?;
@@ -165,10 +215,12 @@ impl LanceDbVectorStore {
     fn record_batch(&self, node_id: i64, bytes: &[u8]) -> Result<RecordBatch, VectorStoreError> {
         let vector = decode_f32_bytes(bytes, self.dimension)?;
         let id_column = Arc::new(Int64Array::from(vec![node_id]));
-        let vector_column = Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            std::iter::once(Some(vector.into_iter().map(Some).collect::<Vec<_>>())),
-            self.dimension as i32,
-        ));
+        let vector_column = Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                std::iter::once(Some(vector.into_iter().map(Some).collect::<Vec<_>>())),
+                self.dimension as i32,
+            ),
+        );
         let blob_column = Arc::new(BinaryArray::from_iter_values(std::iter::once(bytes)));
 
         Ok(RecordBatch::try_new(
@@ -178,6 +230,7 @@ impl LanceDbVectorStore {
     }
 }
 
+#[cfg(feature = "lancedb-backend")]
 impl VectorBlobStore for LanceDbVectorStore {
     fn backend_name(&self) -> &'static str {
         "lancedb"
@@ -191,7 +244,9 @@ impl VectorBlobStore for LanceDbVectorStore {
         run_lancedb(async move {
             let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
             let mut merge = table.merge_insert(&["id"]);
-            merge.when_matched_update_all(None).when_not_matched_insert_all();
+            merge
+                .when_matched_update_all(None)
+                .when_not_matched_insert_all();
             merge.execute(Box::new(reader)).await?;
             Ok(())
         })
@@ -238,7 +293,8 @@ impl FilesystemVectorStore {
     }
 
     fn vector_path(&self, node_id: i64) -> PathBuf {
-        self.root.join(format!("node-{node_id:020}{VECTOR_FILE_SUFFIX}"))
+        self.root
+            .join(format!("node-{node_id:020}{VECTOR_FILE_SUFFIX}"))
     }
 }
 
@@ -293,6 +349,7 @@ impl VectorBlobStore for SqliteVectorStore {
     }
 }
 
+#[cfg(feature = "lancedb-backend")]
 fn vector_table_schema(dimension: usize) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -308,34 +365,37 @@ fn vector_table_schema(dimension: usize) -> SchemaRef {
     ]))
 }
 
-async fn ensure_table(
-    db: &LanceConnection,
-    schema: SchemaRef,
-) -> Result<LanceTable, LanceError> {
+#[cfg(feature = "lancedb-backend")]
+async fn ensure_table(db: &LanceConnection, schema: SchemaRef) -> Result<LanceTable, LanceError> {
     match db.open_table(LANCEDB_TABLE).execute().await {
         Ok(table) => Ok(table),
         Err(_) => {
-            db.create_empty_table(LANCEDB_TABLE, schema).execute().await?;
+            db.create_empty_table(LANCEDB_TABLE, schema)
+                .execute()
+                .await?;
             db.open_table(LANCEDB_TABLE).execute().await
         }
     }
 }
 
+#[cfg(feature = "lancedb-backend")]
 fn run_lancedb<F, T>(future: F) -> Result<T, VectorStoreError>
 where
     F: std::future::Future<Output = Result<T, LanceError>> + Send + 'static,
     T: Send + 'static,
 {
     let task = thread::spawn(move || -> Result<T, VectorStoreError> {
-        let runtime = TokioRuntimeBuilder::new_current_thread().enable_all().build()?;
+        let runtime = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()?;
         runtime.block_on(future).map_err(VectorStoreError::from)
     });
 
-    task.join().map_err(|_| {
-        VectorStoreError::Runtime("lancedb runtime thread panicked".to_string())
-    })?
+    task.join()
+        .map_err(|_| VectorStoreError::Runtime("lancedb runtime thread panicked".to_string()))?
 }
 
+#[cfg(feature = "lancedb-backend")]
 fn decode_f32_bytes(bytes: &[u8], dimension: usize) -> Result<Vec<f32>, VectorStoreError> {
     let expected_len = dimension * std::mem::size_of::<f32>();
     if bytes.len() != expected_len {
@@ -355,6 +415,7 @@ fn decode_f32_bytes(bytes: &[u8], dimension: usize) -> Result<Vec<f32>, VectorSt
         .collect())
 }
 
+#[cfg(feature = "lancedb-backend")]
 fn extract_blob_bytes(batches: &[RecordBatch]) -> Result<Option<Vec<u8>>, VectorStoreError> {
     let Some(batch) = batches.first() else {
         return Ok(None);
@@ -411,8 +472,12 @@ mod tests {
         assert!(meta.contains("format=raw-f32-le-v1"));
         assert!(meta.contains("model_id=test-model"));
         assert!(meta.contains("embedding_dim=4"));
+        #[cfg(feature = "lancedb-backend")]
         assert!(paths.vector_store_dir.join("lancedb").exists());
+        #[cfg(feature = "lancedb-backend")]
         assert_eq!(store.backend_name(), "lancedb+filesystem+sqlite");
+        #[cfg(not(feature = "lancedb-backend"))]
+        assert_eq!(store.backend_name(), "filesystem+sqlite");
         assert_eq!(vector, test_data.to_vec());
 
         fs::remove_dir_all(root).unwrap();

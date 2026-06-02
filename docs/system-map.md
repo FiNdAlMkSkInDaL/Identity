@@ -15,7 +15,7 @@ flowchart TD
     Cleaned["Cleaned Event Staging\ncleaned_events"]
     EmbedProto["Local Embedding Prototype\nembedding.rs"]
     Memory["Identity Memory Store\nidentity.rs"]
-    VectorStore["Filesystem Vector Store\nvector_store.rs"]
+    VectorStore["Vector Blob Store\nfilesystem default\noptional LanceDB feature"]
     MemoryMeta["Memory Metadata\nstore_metadata"]
     Slice[".meslice Preview Generator\nslice.rs"]
     Proxy["Local Capture Endpoint + lol-html Cleaner\nproxy.rs"]
@@ -24,9 +24,11 @@ flowchart TD
     Processor["Transit Processor\nprocessor.rs"]
     Idle["Idle Telemetry Gate\nidle.rs"]
     Redaction["Transit Content Redaction\npost-promotion minimization"]
+    Resources["Resource Budget Probe\nresource.rs"]
     LocalRoot["~/.identity/"]
     IdentityDir["identity.me/"]
     TransitDb["transit.db"]
+    CaptureToken["capture.token"]
     Logs["logs/"]
 
     User --> CLI
@@ -34,6 +36,7 @@ flowchart TD
     Workspace --> LocalRoot
     LocalRoot --> IdentityDir
     LocalRoot --> TransitDb
+    LocalRoot --> CaptureToken
     LocalRoot --> Logs
 
     CLI -->|"init"| Workspace
@@ -41,6 +44,7 @@ flowchart TD
     CLI -->|"capture-active-window"| Safety
     CLI -->|"watch-active-window"| Safety
     CLI -->|"list / stats / doctor / repair-transit"| Transit
+    CLI -->|"doctor"| Resources
     CLI -->|"redact-transit-content"| Redaction
     CLI -->|"cleaned-list"| Cleaned
     CLI -->|"memory-list"| Memory
@@ -58,7 +62,8 @@ flowchart TD
     CLI -->|"pipeline-once / pipeline-loop"| Processor
     CLI -->|"promote-once"| Processor
 
-    Proxy -->|"POST /capture\ncleaned HTML/text"| Safety
+    CaptureToken -->|"X-Identity-Capture-Token"| Proxy
+    Proxy -->|"authorized POST /capture\ncleaned HTML/text"| Safety
     FS -->|"approved text/code file captures"| Safety
     Safety -->|"non-sensitive captures only"| Transit
     Processor -->|"claim queued"| Transit
@@ -124,17 +129,18 @@ flowchart TD
 | Entity | Type | Current Status | Code / Document | Responsibility |
 | :--- | :--- | :--- | :--- | :--- |
 | `identityd` | Daemon crate | Implemented | `crates/identityd` | Local ingestion and transit-buffer orchestration. |
-| `Workspace Manager` | Module | Implemented | `crates/identityd/src/workspace.rs` | Creates local Identity directories. |
-| `SQLite Transit Buffer` | Local store | Implemented | `crates/identityd/src/transit.rs` | Stores captured text temporarily, queue status, retry counts, stale processing lease repair, redaction timestamps, and transit health reporting. |
+| `Workspace Manager` | Module | Implemented | `crates/identityd/src/workspace.rs` | Creates local Identity directories and a stable local `capture.token` used to authorize loopback capture writes. |
+| `SQLite Transit Buffer` | Local store | Implemented | `crates/identityd/src/transit.rs` | Stores captured text temporarily, queue status, retry counts, stale processing lease repair, redaction timestamps, transit health reporting, and rollback-only insert latency probes. |
 | `Cleaned Event Staging` | Local store | Implemented | `crates/identityd/src/transit.rs` | Stores normalized text ready for future embedding; promoted rows are redacted after insertion into local memory. |
 | `Transit Content Redaction` | Privacy guard | Implemented | `crates/identityd/src/transit.rs`, `crates/identityd/src/processor.rs` | Clears duplicate captured and cleaned content after successful promotion into `.me` prototype storage while preserving hashes, timestamps, and pipeline state. |
-| `Ingest Safety Filter` | Privacy guard | Implemented | `crates/identityd/src/ingest_safety.rs` | Blocks secret-bearing paths, private keys, credential markers, card-like numbers, bank-routing markers, and precise-location markers before SQLite persistence. |
-| `Local Embedding Prototype` | Compute stage | Implemented prototype | `crates/identityd/src/embedding.rs` | Generates deterministic local 384-dimensional embeddings for promoted cleaned text and exposes model metadata. This is a Phase 1 spike, not the final ONNX embedding runtime. |
+| `Resource Budget Probe` | Resource guard | Implemented | `crates/identityd/src/resource.rs`, `crates/identityd/src/main.rs` | Reports current process working-set/pagefile memory on Windows, binary size, and budget status through `doctor` without adding a measurement dependency. |
+| `Ingest Safety Filter` | Privacy guard | Implemented | `crates/identityd/src/ingest_safety.rs` | Enforces a universal 1MB capture-content budget and 2048-byte source-label budget, then blocks secret-bearing paths, SSH/AWS/Azure/GPG config roots, private keys, credential markers, known secret token prefixes, card-like numbers, bank-routing markers, and precise-location markers before SQLite persistence. |
+| `Local Embedding Prototype` | Compute stage | Implemented prototype | `crates/identityd/src/embedding.rs` | Generates deterministic local 384-dimensional embeddings for promoted cleaned text, exposes model metadata, and reports local embedding latency against the 200ms map-stage budget through `doctor`. This is a Phase 1 spike, not the final ONNX embedding runtime. |
 | `Identity Memory Store` | Local store | Implemented prototype | `crates/identityd/src/identity.rs` | Stores local `.me` memory nodes plus fixed-width vector blobs in `identity.me/state.db`; now separates memory-domain derivation from the concrete SQLite persistence backend and routes vector encode/decode/similarity decisions through a local embedding-engine boundary to keep the promotion and retrieval surface stable ahead of later ONNX and vector-store swaps; mirrors promoted vector blobs into the reserved local vector-store root, backfills that mirror from valid SQLite vectors on open, and can fall back to that store when SQLite vector blobs are missing or corrupt; classifies promoted captures by source type such as filesystem, local web capture, and Windows UI activity; derives structured summaries and lightweight JSON attributes for Windows activity captures from application, window, focus, and visible-text fields; searches with vector similarity plus lexical scoring; reports and repairs vector health. |
-| `Filesystem Vector Store` | Local store | Implemented prototype | `crates/identityd/src/vector_store.rs` | Persists fixed-width vector blobs under `identity.me/vectors`, writes local store metadata, and now serves as the primary implementation behind a small vector-blob backend boundary. Retrieval falls through to a second SQLite-backed implementation that reads inline vector blobs from `identity.me/state.db`, making the backend seam concrete ahead of later embedded vector-database work. |
+| `Vector Blob Store` | Local store | Implemented default + optional feature | `crates/identityd/src/vector_store.rs` | Persists fixed-width vector blobs under `identity.me/vectors`, writes local store metadata, and serves as the default implementation behind a small vector-blob backend boundary. Retrieval falls through to a SQLite-backed implementation that reads inline vector blobs from `identity.me/state.db`. The LanceDB implementation is available behind the explicit `lancedb-backend` Cargo feature and is not part of the default daemon build until the native toolchain/protoc requirement is intentionally accepted. |
 | `Memory Metadata` | Local store table | Implemented prototype | `crates/identityd/src/identity.rs` | Persists current embedding model id and embedding dimension for local `.me` schema inspection. |
 | `.meslice Preview Generator` | Privacy boundary | Implemented prototype | `crates/identityd/src/slice.rs` | Builds scoped context blocks and prompt packages from local memory search. |
-| `Local Capture Endpoint` | Ingestion adapter | Implemented | `crates/identityd/src/proxy.rs`, `crates/identityd/src/main.rs` | Accepts local HTTP captures at `127.0.0.1:8080`; non-loopback binds are rejected unless explicitly forced for local development. |
+| `Local Capture Endpoint` | Ingestion adapter | Implemented | `crates/identityd/src/proxy.rs`, `crates/identityd/src/main.rs` | Accepts local HTTP captures at `127.0.0.1:8080` only when `X-Identity-Capture-Token` matches the workspace-local `capture.token`; caps headers at 16KB and uses the shared 1MB ingest safety capture budget; accepts only textual content types; non-loopback binds are rejected unless explicitly forced for local development. |
 | `HTML/Text Cleaner` | Capture normalizer | Implemented | `crates/identityd/src/proxy.rs`, `lol-html` | Extracts visible document text through a lightweight streaming parser and ignores script/style raw text before transit persistence. |
 | `Active Window Capture` | Ingestion adapter | Implemented minimal on Windows | `crates/identityd/src/activity.rs`, `crates/identityd/src/main.rs` | Captures the current foreground window title, executable name, focused-control text, and a bounded set of visible child-window text strings, using bounded `WM_GETTEXT` and focused-control MSAA accessibility fallback when plain caption APIs do not expose enough control text, then writes local activity snapshots into the transit buffer. One-shot and bounded watch modes are both available. This is a phase-1 foothold, not yet full UI Automation text extraction. |
 | `Filesystem Watcher` | Ingestion adapter | Implemented | `crates/identityd/src/filesystem.rs` | Uses `ReadDirectoryChangesW` on Windows, falls back to polling with `--poll`, filters conservative text/code files, retries transient Windows file locks, and dedupes burst events by per-path content hash. |
@@ -158,12 +164,14 @@ flowchart TD
             memory_nodes
                 structured_attributes  lightweight JSON capture facets for direct local lookup
       store_metadata
-        vectors/     implemented filesystem-backed vector blob store and reserved future embedded vector DB root
+        vectors/     default filesystem-backed vector blob store and reserved future embedded vector DB root
             store.meta
             node-*.f32le
+            lancedb/  optional when built with the `lancedb-backend` feature
   transit.db     implemented SQLite transit buffer and cleaned staging
     captured_events.content_redacted_at_ms
     cleaned_events.content_redacted_at_ms
+  capture.token  local loopback capture write token
   logs/          reserved local daemon logs
 ```
 
@@ -173,13 +181,13 @@ Global `--root <folder>` can be used before a command to run against an explicit
 
 | Command | Pipeline | Inputs | Writes | Current Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| `init` | Workspace bootstrap | None | `~/.identity/*` | Creates local workspace and transit DB. |
+| `init` | Workspace bootstrap | None | `~/.identity/*`, `capture.token` | Creates local workspace, capture token, and transit DB. |
 | `ingest` | Manual capture | `--source`, `--content` | `captured_events` | Queues a text event manually. |
 | `capture-active-window` | Windows activity capture | None | `captured_events` | Captures the current foreground window title, application name, focused-control text, and bounded visible UI text into the local transit buffer on Windows. |
 | `watch-active-window` | Windows activity watch | `--interval-ms` | `captured_events` | Polls the foreground window at a bounded interval and queues captures only when the application or title changes. |
 | `list` | Inspection | None | None | Lists recent captured events. |
 | `stats` | Inspection | None | None | Counts events by status. |
-| `doctor` | Phase 1 health inspection | `--lease-ms` | None | Prints workspace paths, transit health, stale processing count, memory vector health, and embedding metadata. |
+| `doctor` | Phase 1 health inspection | `--lease-ms` | Rollback-only SQLite probe, embedding latency probe, resource budget probe | Prints workspace paths, transit health, stale processing count, memory vector health, embedding metadata, workspace startup readiness timing, local transit insert latency budget status, embedding map-stage latency budget status, process memory budget status, binary-size budget status, and explicit Phase 1 readiness markers for workspace, transit, capture adapters, memory vectors, embedding runtime, vector backend, local pipeline status, and remaining blockers. |
 | `repair-transit` | Transit repair | `--lease-ms` | `captured_events.status`, `captured_events.retry_count` | Requeues stale `processing` claims after a bounded lease timeout. |
 | `redact-transit-content` | Data minimization | `--limit` | `captured_events.content`, `cleaned_events.cleaned_content`, redaction timestamps | Clears duplicate content from promoted transit rows after `.me` storage succeeds. |
 | `cleaned-list` | Inspection | `--limit` | None | Lists normalized text staged for vectorization. |
@@ -189,7 +197,7 @@ Global `--root <folder>` can be used before a command to run against an explicit
 | `memory-search` | Local retrieval | `--query`, `--limit` | None | Searches memory nodes by vector similarity plus lexical overlap. |
 | `slice-preview` | Context boundary | `--intent`, `--limit` | None | Emits an ephemeral context block without raw memory IDs, hashes, or scores. |
 | `prompt-package` | Context injection artifact | `--intent`, `--prompt`, `--limit` | None | Emits a local prompt package containing scoped context plus user task. |
-| `serve` | Local proxy capture | `--addr`, `--allow-non-loopback` | `captured_events` | Runs `/health` and `/capture`; defaults to loopback-only binding. |
+| `serve` | Local proxy capture | `--addr`, `--allow-non-loopback`, `X-Identity-Capture-Token` for writes | `captured_events` | Runs `/health` and token-authorized `/capture`; defaults to loopback-only binding and returns bounded HTTP errors for invalid or oversized captures. |
 | `watch` | Filesystem capture | `--path`, `--non-recursive`, `--poll` | `captured_events` | Uses Windows filesystem events by default on Windows and keeps polling as an explicit fallback. Dedupes repeated same-content events per path. |
 | `daemon` | Phase 1 local daemon orchestration | `--addr`, `--process-limit`, `--promote-limit`, `--idle-ms`, `--interval-ms`, optional `--watch-path`, `--watch-active-window`, `--activity-interval-ms`, `--non-recursive`, `--allow-non-loopback` | `captured_events`, `cleaned_events`, `identity.me/state.db`, optional filesystem and OS activity captures | Runs the loopback capture endpoint and idle-gated clean/promote pipeline together in one process. Optional `--watch-path` adds a shutdown-aware filesystem watcher; optional `--watch-active-window` adds bounded foreground-window capture. On Windows the filesystem watcher keeps the native `ReadDirectoryChangesW` path while still stopping cleanly on `Ctrl+C`. |
 | `process-once` | Transit processing | `--limit` | `captured_events.status`, `cleaned_events` | Claims captures and stages normalized text. |
@@ -245,7 +253,10 @@ sequenceDiagram
     participant Cleaner as lol-html Cleaner
     participant Transit as SQLite Transit Buffer
 
-    Client->>Proxy: POST /capture
+    Client->>Proxy: POST /capture + X-Identity-Capture-Token
+    Proxy->>Proxy: verify workspace capture token
+    Proxy->>Proxy: enforce 16KB header / 1MB body budget
+    Proxy->>Proxy: allow only textual media types
     Proxy->>Cleaner: clean_payload(content_type, body)
     Cleaner-->>Proxy: cleaned text
     Proxy->>Transit: ingest_text(local-proxy:*, cleaned) with ingest safety filter
@@ -400,9 +411,14 @@ sequenceDiagram
     User->>CLI: doctor
     CLI->>Transit: health(lease-ms)
     Transit-->>CLI: queue counts + stale processing count
+    CLI->>Transit: rollback-only insert probe
+    Transit-->>CLI: transit insert latency
     CLI->>Memory: stats()
     Memory-->>CLI: node count + vector health + embedding metadata
-    CLI-->>User: local Phase 1 health summary
+    CLI->>CLI: probe local embedding latency
+    CLI->>CLI: measure process resources and binary size
+    CLI->>CLI: derive Phase 1 readiness markers
+    CLI-->>User: local Phase 1 health summary + remaining blockers
 ```
 
 ### Ephemeral Context Slice Preview
@@ -443,7 +459,7 @@ sequenceDiagram
 
 | Boundary | Upstream | Downstream | Rule |
 | :--- | :--- | :--- | :--- |
-| Capture to transit | Proxy / filesystem / manual | Ingest safety filter, then SQLite transit buffer | Reject deterministic sensitive material before any SQLite persistence. |
+| Capture to transit | Proxy / filesystem / manual / active-window | Ingest safety filter, then SQLite transit buffer | Enforce shared source/content budgets and reject deterministic sensitive paths, credential markers, known token prefixes, private keys, payment-card-like numbers, routing markers, and precise-location markers before any SQLite persistence. |
 | Transit to cleaned staging | SQLite transit buffer | Transit processor | Process only claimed events; successful cleaned writes and `processed` status updates share one SQLite transaction. |
 | Cleaned staging to `.me` prototype | `cleaned_events` | Local embedding prototype, then identity memory store | Promote normalized text into local memory nodes with fixed-width vector blobs, then redact duplicate transit content. |
 | Promoted transit to redacted transit | `captured_events`, `cleaned_events` | Transit redaction routine | Keep queue state, hashes, promotion markers, and redaction timestamps; clear duplicate content after `.me` insertion. |

@@ -87,13 +87,24 @@ cargo run -p identityd -- watch --path C:\Users\finph\Documents --poll
 `watch` uses Windows filesystem events by default on Windows. Use `--poll` only as
 the conservative fallback.
 
+The default daemon build uses the lean filesystem-backed vector blob store with
+SQLite fallback. The experimental LanceDB backend is feature-gated because the
+current Rust LanceDB stack requires a heavier native build toolchain, including
+`protoc`:
+
+```powershell
+cargo build -p identityd --features lancedb-backend
+```
+
 The initial local workspace is created at:
 
 ```text
 ~/.identity/
   identity.me/
     state.db
+    vectors/
   transit.db
+  capture.token
   logs/
 ```
 
@@ -101,7 +112,27 @@ The first local capture endpoint listens on `127.0.0.1:8080`:
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri http://127.0.0.1:8080/health
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/capture -ContentType "text/html" -Body "<html><body><h1>Hello Identity</h1><script>ignore()</script></body></html>"
+$token = Get-Content "$env:USERPROFILE\.identity\capture.token"
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/capture -Headers @{"X-Identity-Capture-Token"=$token} -ContentType "text/html" -Body "<html><body><h1>Hello Identity</h1><script>ignore()</script></body></html>"
 ```
+
+`/capture` is intentionally narrow: it requires the workspace-local token,
+accepts headers up to 16KB, accepts capture bodies up to 1MB, and only accepts
+textual media types: `text/plain`, `text/html`, `text/markdown`,
+`application/json`, `application/x-ndjson`, `application/xml`, and
+`application/xhtml+xml`.
+
+All capture paths share the same transit safety gate before SQLite persistence:
+capture content is capped at 1MB, source labels are capped at 2048 bytes, and
+deterministic secret, credential, payment-card, routing, and precise-location
+markers are rejected.
+
+Use `doctor` as the Phase 1 readiness check. It reports raw queue/vector health
+plus explicit Phase 1 markers, including the local pipeline status and the
+remaining blockers before Phase 1 can be considered complete. On Windows it
+also reports current process memory usage, idle-memory budget status, binary
+size, and binary-size budget status without pulling in a heavy measurement
+dependency. It also probes the current local embedding path against the
+200ms map-stage target.
 
 `daemon` is the phase 1 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. On Windows the filesystem watcher stays on the native event path.

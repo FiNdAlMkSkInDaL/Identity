@@ -90,7 +90,10 @@ impl MeSlice {
     pub fn to_context_block(&self) -> String {
         let mut output = String::new();
 
-        output.push_str(&format!("[IDENTITY-CONTEXT-BLOCK: {}]\n", self.session_token));
+        output.push_str(&format!(
+            "[IDENTITY-CONTEXT-BLOCK: {}]\n",
+            self.session_token
+        ));
         output.push_str(&format!(
             "- Authorization expiry epoch ms: {}\n",
             self.expiry_epoch_ms
@@ -107,7 +110,10 @@ impl MeSlice {
             }
         }
 
-        output.push_str(&format!("[IDENTITY-CONTEXT-BLOCK-END: {}]", self.session_token));
+        output.push_str(&format!(
+            "[IDENTITY-CONTEXT-BLOCK-END: {}]",
+            self.session_token
+        ));
 
         output
     }

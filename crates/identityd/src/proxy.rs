@@ -1,90 +1,28 @@
-use crate::identity::IdentityStore;
-use crate::slice::{build_prompt_package, generate_meslice};
-use crate::transit::{TransitBuffer, DEFAULT_PROCESSING_LEASE_MS};
-use crate::workspace::IdentityPaths;
+use crate::ingest_safety::MAX_CAPTURE_CONTENT_BYTES;
+use crate::transit::TransitBuffer;
+use crate::workspace::{IdentityPaths, WorkspaceError};
 use lol_html::html_content::TextType;
 use lol_html::{doc_text, HtmlRewriter, Settings};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 
-#[derive(Deserialize)]
-struct SearchRequest {
-    query: String,
-    limit: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct SearchResultJson {
-    id: i64,
-    cleaned_event_id: i64,
-    source: String,
-    domain_context: String,
-    entity_type: String,
-    summary: String,
-    structured_attributes: String,
-    created_at_ms: i64,
-    score: u32,
-}
-
-#[derive(Deserialize)]
-struct SliceRequest {
-    intent: String,
-    limit: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct SliceResponse {
-    session_token: String,
-    expiry_epoch_ms: i64,
-    context_group: String,
-    facts: Vec<String>,
-    context_block: String,
-}
-
-#[derive(Deserialize)]
-struct PromptPackageRequest {
-    intent: String,
-    prompt: String,
-    limit: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct PromptPackageResponse {
-    package: String,
-}
-
-#[derive(Serialize)]
-struct StatsResponse {
-    transit_queued: i64,
-    transit_processing: i64,
-    transit_stale_processing: i64,
-    transit_processed: i64,
-    transit_failed: i64,
-    memory_nodes: i64,
-    memory_vectorized_nodes: i64,
-    memory_invalid_vectors: i64,
-    embedding_model_id: String,
-    embedding_dim: usize,
-    vector_store_backend: String,
-}
-
-
-const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 const REQUEST_TIMEOUT_MS: u64 = 3000;
 
 #[derive(Debug)]
 pub enum ProxyError {
     Io(std::io::Error),
+    Workspace(WorkspaceError),
 }
 
 impl fmt::Display for ProxyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "{error}"),
+            Self::Workspace(error) => write!(f, "{error}"),
         }
     }
 }
@@ -97,26 +35,42 @@ impl From<std::io::Error> for ProxyError {
     }
 }
 
+impl From<WorkspaceError> for ProxyError {
+    fn from(value: WorkspaceError) -> Self {
+        Self::Workspace(value)
+    }
+}
+
 pub struct LocalCaptureServer {
     addr: SocketAddr,
     paths: IdentityPaths,
+    capture_token: String,
 }
 
 impl LocalCaptureServer {
-    pub fn new(addr: SocketAddr, paths: IdentityPaths) -> Self {
-        Self { addr, paths }
+    pub fn new(addr: SocketAddr, paths: IdentityPaths) -> Result<Self, ProxyError> {
+        let capture_token = paths.ensure_capture_token()?;
+        Ok(Self {
+            addr,
+            paths,
+            capture_token,
+        })
     }
 
     pub async fn run(self) -> Result<(), ProxyError> {
         let listener = TcpListener::bind(self.addr).await?;
-        println!("identityd capture endpoint listening on http://{}", self.addr);
+        println!(
+            "identityd capture endpoint listening on http://{}",
+            self.addr
+        );
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let paths = self.paths.clone();
+            let capture_token = self.capture_token.clone();
 
             tokio::spawn(async move {
-                if let Err(error) = handle_connection(stream, paths).await {
+                if let Err(error) = handle_connection(stream, paths, capture_token).await {
                     eprintln!("failed to handle capture request from {peer_addr}: {error}");
                 }
             });
@@ -127,154 +81,51 @@ impl LocalCaptureServer {
 async fn handle_connection(
     mut stream: TcpStream,
     paths: IdentityPaths,
+    capture_token: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request = timeout(
         Duration::from_millis(REQUEST_TIMEOUT_MS),
-        read_http_request(&mut stream),
+        read_http_request(&mut stream, &capture_token),
     )
     .await??;
 
     let response = match request {
         HttpRequest::Health => HttpResponse::ok_json(r#"{"status":"ok"}"#),
-        HttpRequest::Stats => {
-            let stats_result = tokio::task::spawn_blocking(move || {
-                let buffer = TransitBuffer::open(&paths)?;
-                let health = buffer.health(DEFAULT_PROCESSING_LEASE_MS)?;
-                let store = IdentityStore::open(&paths)?;
-                let store_stats = store.stats()?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(StatsResponse {
-                    transit_queued: health.queued,
-                    transit_processing: health.processing,
-                    transit_stale_processing: health.stale_processing,
-                    transit_processed: health.processed,
-                    transit_failed: health.failed,
-                    memory_nodes: store_stats.node_count,
-                    memory_vectorized_nodes: store_stats.vectorized_count,
-                    memory_invalid_vectors: store_stats.invalid_vector_count,
-                    embedding_model_id: store_stats.embedding_model_id,
-                    embedding_dim: store_stats.embedding_dim,
-                    vector_store_backend: store_stats.vector_store_backend,
-                })
-            })
-            .await?;
-
-            match stats_result {
-                Ok(stats) => match serde_json::to_string(&stats) {
-                    Ok(json) => HttpResponse::ok_json(&json),
-                    Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-                },
-                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-            }
-        }
-        HttpRequest::Search { body } => {
-            let req_result: Result<SearchRequest, _> = serde_json::from_str(&body);
-            match req_result {
-                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"invalid json: {error}"}}"#)),
-                Ok(req) => {
-                    let search_result = tokio::task::spawn_blocking(move || {
-                        let store = IdentityStore::open(&paths)?;
-                        let limit = req.limit.unwrap_or(5);
-                        let results = store.search(&req.query, limit)?;
-                        let json_results = results.into_iter().map(|res| SearchResultJson {
-                            id: res.node.id,
-                            cleaned_event_id: res.node.cleaned_event_id,
-                            source: res.node.source,
-                            domain_context: res.node.domain_context,
-                            entity_type: res.node.entity_type,
-                            summary: res.node.summary,
-                            structured_attributes: res.node.structured_attributes,
-                            created_at_ms: res.node.created_at_ms,
-                            score: res.score,
-                        }).collect::<Vec<_>>();
-                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(json_results)
-                    })
-                    .await?;
-
-                    match search_result {
-                        Ok(res) => match serde_json::to_string(&res) {
-                            Ok(json) => HttpResponse::ok_json(&json),
-                            Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-                        },
-                        Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-                    }
-                }
-            }
-        }
-        HttpRequest::Slice { body } => {
-            let req_result: Result<SliceRequest, _> = serde_json::from_str(&body);
-            match req_result {
-                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"invalid json: {error}"}}"#)),
-                Ok(req) => {
-                    let slice_result = tokio::task::spawn_blocking(move || {
-                        let limit = req.limit.unwrap_or(3);
-                        let slice = generate_meslice(&paths, &req.intent, limit)?;
-                        let context_block = slice.to_context_block();
-                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(SliceResponse {
-                            session_token: slice.session_token,
-                            expiry_epoch_ms: slice.expiry_epoch_ms,
-                            context_group: slice.context_group,
-                            facts: slice.facts,
-                            context_block,
-                        })
-                    })
-                    .await?;
-
-                    match slice_result {
-                        Ok(res) => match serde_json::to_string(&res) {
-                            Ok(json) => HttpResponse::ok_json(&json),
-                            Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-                        },
-                        Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-                    }
-                }
-            }
-        }
-        HttpRequest::PromptPackage { body } => {
-            let req_result: Result<PromptPackageRequest, _> = serde_json::from_str(&body);
-            match req_result {
-                Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"invalid json: {error}"}}"#)),
-                Ok(req) => {
-                    let pkg_result = tokio::task::spawn_blocking(move || {
-                        let limit = req.limit.unwrap_or(3);
-                        let package = build_prompt_package(&paths, &req.intent, &req.prompt, limit)?;
-                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(PromptPackageResponse { package })
-                    })
-                    .await?;
-
-                    match pkg_result {
-                        Ok(res) => match serde_json::to_string(&res) {
-                            Ok(json) => HttpResponse::ok_json(&json),
-                            Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-                        },
-                        Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
-                    }
-                }
-            }
-        }
         HttpRequest::Capture { content_type, body } => {
-            let cleaned = clean_payload(&content_type, &body);
-
-            if cleaned.trim().is_empty() {
-                HttpResponse::bad_request(r#"{"error":"empty capture payload"}"#)
+            if !supported_capture_content_type(&content_type) {
+                HttpResponse::unsupported_media_type(
+                    r#"{"error":"unsupported capture content type"}"#,
+                )
             } else {
-                let source = if content_type.contains("text/html") {
-                    "local-proxy:text/html"
+                let cleaned = clean_payload(&content_type, &body);
+
+                if cleaned.trim().is_empty() {
+                    HttpResponse::bad_request(r#"{"error":"empty capture payload"}"#)
                 } else {
-                    "local-proxy:text/plain"
-                };
+                    let source = capture_source_for_content_type(&content_type);
 
-                let ingest_result = tokio::task::spawn_blocking(move || {
-                    let buffer = TransitBuffer::open(&paths)?;
-                    buffer.ingest_text(source, &cleaned)
-                })
-                .await?;
+                    let ingest_result = tokio::task::spawn_blocking(move || {
+                        let buffer = TransitBuffer::open(&paths)?;
+                        buffer.ingest_text(source, &cleaned)
+                    })
+                    .await?;
 
-                match ingest_result {
-                    Ok(id) => HttpResponse::ok_json(&format!(r#"{{"captured":true,"id":{id}}}"#)),
-                    Err(error) => HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#)),
+                    match ingest_result {
+                        Ok(id) => {
+                            HttpResponse::ok_json(&format!(r#"{{"captured":true,"id":{id}}}"#))
+                        }
+                        Err(error) => {
+                            HttpResponse::bad_request(&format!(r#"{{"error":"{error}"}}"#))
+                        }
+                    }
                 }
             }
         }
+        HttpRequest::Unauthorized => HttpResponse::unauthorized(r#"{"error":"unauthorized"}"#),
+        HttpRequest::PayloadTooLarge => {
+            HttpResponse::payload_too_large(r#"{"error":"capture payload too large"}"#)
+        }
+        HttpRequest::BadRequest => HttpResponse::bad_request(r#"{"error":"bad request"}"#),
         HttpRequest::Unsupported => HttpResponse::not_found(r#"{"error":"not found"}"#),
     };
 
@@ -284,11 +135,10 @@ async fn handle_connection(
 
 enum HttpRequest {
     Health,
-    Stats,
     Capture { content_type: String, body: String },
-    Search { body: String },
-    Slice { body: String },
-    PromptPackage { body: String },
+    Unauthorized,
+    PayloadTooLarge,
+    BadRequest,
     Unsupported,
 }
 
@@ -319,6 +169,27 @@ impl HttpResponse {
         }
     }
 
+    fn unauthorized(body: &str) -> Self {
+        Self {
+            status: "401 Unauthorized",
+            body: body.to_string(),
+        }
+    }
+
+    fn payload_too_large(body: &str) -> Self {
+        Self {
+            status: "413 Payload Too Large",
+            body: body.to_string(),
+        }
+    }
+
+    fn unsupported_media_type(body: &str) -> Self {
+        Self {
+            status: "415 Unsupported Media Type",
+            body: body.to_string(),
+        }
+    }
+
     fn as_bytes(&self) -> Vec<u8> {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}",
@@ -332,6 +203,7 @@ impl HttpResponse {
 
 async fn read_http_request(
     stream: &mut TcpStream,
+    capture_token: &str,
 ) -> Result<HttpRequest, Box<dyn std::error::Error + Send + Sync>> {
     let mut buffer = Vec::new();
     let mut chunk = [0; 4096];
@@ -344,14 +216,23 @@ async fn read_http_request(
 
         buffer.extend_from_slice(&chunk[..read]);
 
-        if buffer.len() > MAX_CAPTURE_BYTES {
-            return Err("capture request exceeded maximum payload size".into());
-        }
-
         if let Some(header_end) = find_header_end(&buffer) {
             let headers = String::from_utf8_lossy(&buffer[..header_end]);
-            let content_length = content_length(&headers).unwrap_or(0);
-            let total_needed = header_end + 4 + content_length;
+            let content_length = match content_length(&headers) {
+                Ok(value) => value,
+                Err(request) => return Ok(request),
+            };
+
+            if content_length > MAX_CAPTURE_CONTENT_BYTES {
+                return Ok(HttpRequest::PayloadTooLarge);
+            }
+
+            let Some(body_start) = header_end.checked_add(4) else {
+                return Ok(HttpRequest::PayloadTooLarge);
+            };
+            let Some(total_needed) = body_start.checked_add(content_length) else {
+                return Ok(HttpRequest::PayloadTooLarge);
+            };
 
             while buffer.len() < total_needed {
                 let read = read_chunk(stream, &mut chunk).await?;
@@ -361,12 +242,16 @@ async fn read_http_request(
 
                 buffer.extend_from_slice(&chunk[..read]);
 
-                if buffer.len() > MAX_CAPTURE_BYTES {
-                    return Err("capture request exceeded maximum payload size".into());
+                if buffer.len().saturating_sub(body_start) > MAX_CAPTURE_CONTENT_BYTES {
+                    return Ok(HttpRequest::PayloadTooLarge);
                 }
             }
 
-            return parse_request(&buffer, header_end);
+            return parse_request(&buffer, header_end, total_needed, capture_token);
+        }
+
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Ok(HttpRequest::PayloadTooLarge);
         }
     }
 
@@ -405,6 +290,8 @@ async fn write_all(stream: &TcpStream, bytes: &[u8]) -> std::io::Result<()> {
 fn parse_request(
     buffer: &[u8],
     header_end: usize,
+    body_end: usize,
+    capture_token: &str,
 ) -> Result<HttpRequest, Box<dyn std::error::Error + Send + Sync>> {
     let headers = String::from_utf8_lossy(&buffer[..header_end]);
     let mut lines = headers.lines();
@@ -414,32 +301,42 @@ fn parse_request(
         return Ok(HttpRequest::Health);
     }
 
-    if request_line.starts_with("GET /stats ") {
-        return Ok(HttpRequest::Stats);
-    }
-
     if request_line.starts_with("POST /capture ") {
+        if !valid_capture_token(&headers, capture_token) {
+            return Ok(HttpRequest::Unauthorized);
+        }
+
         let content_type = header_value(&headers, "content-type").unwrap_or_default();
-        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
+        let body_start = header_end + 4;
+        let body =
+            String::from_utf8_lossy(&buffer[body_start..body_end.min(buffer.len())]).to_string();
         return Ok(HttpRequest::Capture { content_type, body });
     }
 
-    if request_line.starts_with("POST /search ") {
-        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
-        return Ok(HttpRequest::Search { body });
-    }
-
-    if request_line.starts_with("POST /slice ") {
-        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
-        return Ok(HttpRequest::Slice { body });
-    }
-
-    if request_line.starts_with("POST /prompt-package ") {
-        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
-        return Ok(HttpRequest::PromptPackage { body });
-    }
-
     Ok(HttpRequest::Unsupported)
+}
+
+fn valid_capture_token(headers: &str, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+
+    header_value(headers, "x-identity-capture-token")
+        .map(|actual| constant_time_eq(actual.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+
+    diff == 0
 }
 
 fn clean_payload(content_type: &str, body: &str) -> String {
@@ -447,6 +344,43 @@ fn clean_payload(content_type: &str, body: &str) -> String {
         clean_html_to_text(body)
     } else {
         collapse_whitespace(body)
+    }
+}
+
+fn supported_capture_content_type(content_type: &str) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    matches!(
+        mime.as_str(),
+        "text/plain"
+            | "text/html"
+            | "text/markdown"
+            | "application/json"
+            | "application/x-ndjson"
+            | "application/xml"
+            | "application/xhtml+xml"
+    )
+}
+
+fn capture_source_for_content_type(content_type: &str) -> &'static str {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    match mime.as_str() {
+        "text/html" | "application/xhtml+xml" => "local-proxy:text/html",
+        "text/markdown" => "local-proxy:text/markdown",
+        "application/json" | "application/x-ndjson" => "local-proxy:application/json",
+        "application/xml" => "local-proxy:application/xml",
+        _ => "local-proxy:text/plain",
     }
 }
 
@@ -506,8 +440,11 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn content_length(headers: &str) -> Option<usize> {
-    header_value(headers, "content-length")?.parse().ok()
+fn content_length(headers: &str) -> Result<usize, HttpRequest> {
+    match header_value(headers, "content-length") {
+        Some(value) => value.parse().map_err(|_| HttpRequest::BadRequest),
+        None => Ok(0),
+    }
 }
 
 fn header_value(headers: &str, name: &str) -> Option<String> {
@@ -562,45 +499,90 @@ mod tests {
 
         let req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n";
         let header_end = find_header_end(req).unwrap();
-        let parsed = parse_request(req, header_end).unwrap();
+        let parsed = parse_request(req, header_end, req.len(), "abc123").unwrap();
         assert!(matches!(parsed, HttpRequest::Health));
 
-        let req = b"GET /stats HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n";
+        let req =
+            b"POST /capture HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\nrust";
         let header_end = find_header_end(req).unwrap();
-        let parsed = parse_request(req, header_end).unwrap();
-        assert!(matches!(parsed, HttpRequest::Stats));
+        let parsed = parse_request(req, header_end, req.len(), "abc123").unwrap();
+        assert!(matches!(parsed, HttpRequest::Unauthorized));
 
-        let req = b"POST /search HTTP/1.1\r\nContent-Length: 16\r\n\r\n{\"query\":\"rust\"}";
+        let req = b"POST /capture HTTP/1.1\r\nContent-Type: text/plain\r\nX-Identity-Capture-Token: abc123\r\nContent-Length: 4\r\n\r\nrust";
         let header_end = find_header_end(req).unwrap();
-        let parsed = parse_request(req, header_end).unwrap();
-        if let HttpRequest::Search { body } = parsed {
-            assert_eq!(body, "{\"query\":\"rust\"}");
+        let parsed = parse_request(req, header_end, req.len(), "abc123").unwrap();
+        if let HttpRequest::Capture { content_type, body } = parsed {
+            assert_eq!(content_type, "text/plain");
+            assert_eq!(body, "rust");
         } else {
-            panic!("expected search request");
-        }
-
-        let req = b"POST /slice HTTP/1.1\r\nContent-Length: 18\r\n\r\n{\"intent\":\"draft\"}";
-        let header_end = find_header_end(req).unwrap();
-        let parsed = parse_request(req, header_end).unwrap();
-        if let HttpRequest::Slice { body } = parsed {
-            assert_eq!(body, "{\"intent\":\"draft\"}");
-        } else {
-            panic!("expected slice request");
-        }
-
-        let req = b"POST /prompt-package HTTP/1.1\r\nContent-Length: 26\r\n\r\n{\"intent\":\"t\",\"prompt\":\"p\"}";
-        let header_end = find_header_end(req).unwrap();
-        let parsed = parse_request(req, header_end).unwrap();
-        if let HttpRequest::PromptPackage { body } = parsed {
-            assert_eq!(body, "{\"intent\":\"t\",\"prompt\":\"p\"}");
-        } else {
-            panic!("expected prompt package request");
+            panic!("expected capture request");
         }
 
         let req = b"GET /unsupported HTTP/1.1\r\n\r\n";
         let header_end = find_header_end(req).unwrap();
-        let parsed = parse_request(req, header_end).unwrap();
+        let parsed = parse_request(req, header_end, req.len(), "abc123").unwrap();
         assert!(matches!(parsed, HttpRequest::Unsupported));
     }
-}
 
+    #[test]
+    fn parses_only_declared_capture_body_bytes() {
+        use super::find_header_end;
+
+        let req = b"POST /capture HTTP/1.1\r\nContent-Type: text/plain\r\nX-Identity-Capture-Token: abc123\r\nContent-Length: 4\r\n\r\nrustEXTRA";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end, header_end + 4 + 4, "abc123").unwrap();
+
+        if let HttpRequest::Capture { body, .. } = parsed {
+            assert_eq!(body, "rust");
+        } else {
+            panic!("expected capture request");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_content_length() {
+        assert!(matches!(
+            super::content_length("Content-Length: nope"),
+            Err(HttpRequest::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn accepts_only_textual_capture_content_types() {
+        assert!(super::supported_capture_content_type(
+            "text/html; charset=utf-8"
+        ));
+        assert!(super::supported_capture_content_type("text/plain"));
+        assert!(super::supported_capture_content_type("text/markdown"));
+        assert!(super::supported_capture_content_type("application/json"));
+        assert!(super::supported_capture_content_type(
+            "application/x-ndjson"
+        ));
+        assert!(super::supported_capture_content_type("application/xml"));
+        assert!(super::supported_capture_content_type(
+            "application/xhtml+xml"
+        ));
+
+        assert!(!super::supported_capture_content_type(""));
+        assert!(!super::supported_capture_content_type("image/png"));
+        assert!(!super::supported_capture_content_type(
+            "application/octet-stream"
+        ));
+    }
+
+    #[test]
+    fn derives_capture_source_from_content_type() {
+        assert_eq!(
+            super::capture_source_for_content_type("text/html; charset=utf-8"),
+            "local-proxy:text/html"
+        );
+        assert_eq!(
+            super::capture_source_for_content_type("application/json"),
+            "local-proxy:application/json"
+        );
+        assert_eq!(
+            super::capture_source_for_content_type("text/markdown"),
+            "local-proxy:text/markdown"
+        );
+    }
+}

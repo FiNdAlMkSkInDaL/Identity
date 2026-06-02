@@ -6,6 +6,7 @@ pub mod idle;
 pub mod ingest_safety;
 pub mod processor;
 pub mod proxy;
+pub mod resource;
 pub mod slice;
 pub mod transit;
 pub mod vector_store;

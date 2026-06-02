@@ -1,12 +1,16 @@
 use identityd::activity::{
-    DEFAULT_ACTIVITY_POLL_MS, capture_active_window_once, watch_active_window_until_shutdown,
+    capture_active_window_once, watch_active_window_until_shutdown, DEFAULT_ACTIVITY_POLL_MS,
 };
+use identityd::embedding::{probe_embedding_latency, EMBEDDING_LATENCY_TARGET_MS};
 use identityd::filesystem::{FileWatcher, FileWatcherConfig, FileWatcherMode};
 use identityd::identity::IdentityStore;
 use identityd::processor::{
     pipeline_once_if_idle, process_once, process_once_if_idle, promote_once,
 };
 use identityd::proxy::LocalCaptureServer;
+use identityd::resource::{
+    current_process_resources, memory_budget_status, IDLE_MEMORY_TARGET_BYTES,
+};
 use identityd::slice::{build_prompt_package, generate_meslice};
 use identityd::transit::{TransitBuffer, DEFAULT_PROCESSING_LEASE_MS};
 use identityd::workspace::IdentityPaths;
@@ -15,11 +19,14 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
+use std::time::Instant;
 use tokio::signal;
 use tokio::time::{sleep, Duration};
+
+const BINARY_SIZE_TARGET_BYTES: u64 = 15 * 1024 * 1024;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -30,6 +37,7 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
+    let startup_started = Instant::now();
     let raw_args: Vec<String> = env::args().skip(1).collect();
     let command = command_arg(&raw_args).unwrap_or_else(|| "init".to_string());
 
@@ -39,6 +47,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         IdentityPaths::from_default_home()?
     };
     paths.ensure()?;
+    let workspace_ready_ms = startup_started.elapsed().as_millis();
 
     match command.as_str() {
         "init" => {
@@ -47,6 +56,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("identity ledger: {}", paths.identity_dir.display());
             println!("vector store root: {}", paths.vector_store_dir.display());
             println!("transit buffer: {}", paths.transit_db.display());
+            println!("capture token: {}", paths.capture_token.display());
         }
         "ingest" => {
             let source = read_flag(&raw_args, "--source").unwrap_or_else(|| "manual".to_string());
@@ -115,8 +125,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .unwrap_or(DEFAULT_PROCESSING_LEASE_MS);
             let buffer = TransitBuffer::open(&paths)?;
             let transit = buffer.health(lease_ms)?;
+            let transit_probe = buffer.probe_insert_rollback_latency()?;
             let store = IdentityStore::open(&paths)?;
             let memory = store.stats()?;
+            let embedding_probe = probe_embedding_latency("Identity local embedding budget probe.");
+            let resources = current_process_resources();
+            let working_set_bytes = resources.as_ref().map(|probe| probe.working_set_bytes);
+            let pagefile_bytes = resources.as_ref().map(|probe| probe.pagefile_bytes);
+            let binary_size_bytes = current_binary_size_bytes();
 
             println!("workspace_root={}", paths.root.display());
             println!("identity_ledger={}", paths.identity_dir.display());
@@ -132,7 +148,79 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("memory_invalid_vectors={}", memory.invalid_vector_count);
             println!("embedding_model_id={}", memory.embedding_model_id);
             println!("embedding_dim={}", memory.embedding_dim);
+            println!("embedding_probe_model_id={}", embedding_probe.model_id);
+            println!("embedding_probe_dim={}", embedding_probe.dimension);
+            println!("embedding_probe_ms={}", embedding_probe.latency_ms);
+            println!(
+                "embedding_target_ms={EMBEDDING_LATENCY_TARGET_MS} within_budget={}",
+                embedding_probe.latency_ms <= EMBEDDING_LATENCY_TARGET_MS
+            );
             println!("vector_store_backend={}", memory.vector_store_backend);
+            println!("startup_workspace_ready_ms={workspace_ready_ms}");
+            println!(
+                "transit_insert_rollback_probe_ms={}",
+                transit_probe.insert_rollback_ms
+            );
+            println!(
+                "transit_insert_target_ms=1 within_budget={}",
+                transit_probe.insert_rollback_ms <= 1
+            );
+            println!(
+                "resource_working_set_bytes={}",
+                optional_u64(working_set_bytes)
+            );
+            println!("resource_pagefile_bytes={}", optional_u64(pagefile_bytes));
+            println!("resource_idle_memory_target_bytes={IDLE_MEMORY_TARGET_BYTES}");
+            println!(
+                "resource_idle_memory_status={}",
+                memory_budget_status(working_set_bytes)
+            );
+            println!(
+                "resource_binary_size_bytes={}",
+                optional_u64(binary_size_bytes)
+            );
+            println!(
+                "resource_binary_target_bytes={BINARY_SIZE_TARGET_BYTES} within_budget={}",
+                binary_size_bytes
+                    .map(|bytes| bytes <= BINARY_SIZE_TARGET_BYTES)
+                    .unwrap_or(false)
+            );
+            println!("phase1_workspace=ready");
+            println!("phase1_transit_buffer=ready");
+            println!("phase1_capture_adapters=partial");
+            println!(
+                "phase1_transit_health={}",
+                if transit.stale_processing == 0 && transit.failed == 0 {
+                    "ready"
+                } else {
+                    "needs-repair"
+                }
+            );
+            println!(
+                "phase1_memory_vector_health={}",
+                if memory.invalid_vector_count == 0 {
+                    "ready"
+                } else {
+                    "needs-repair"
+                }
+            );
+            println!("phase1_embedding_runtime=prototype");
+            println!(
+                "phase1_vector_store_backend={}",
+                memory.vector_store_backend
+            );
+            println!(
+                "phase1_local_pipeline={}",
+                phase1_local_pipeline_status(
+                    transit.stale_processing,
+                    transit.failed,
+                    memory.invalid_vector_count,
+                    transit_probe.insert_rollback_ms,
+                )
+            );
+            println!(
+                "phase1_remaining=final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; local encryption for real captured content; fuller OS accessibility coverage"
+            );
         }
         "repair-transit" => {
             let lease_ms = read_flag(&raw_args, "--lease-ms")
@@ -383,7 +471,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .unwrap_or_else(|| "127.0.0.1:8080".to_string())
                 .parse::<SocketAddr>()?;
             ensure_loopback_addr(addr, has_flag(&raw_args, "--allow-non-loopback"))?;
-            let server = LocalCaptureServer::new(addr, paths);
+            let server = LocalCaptureServer::new(addr, paths)?;
 
             println!("press Ctrl+C to stop identityd");
             server.run().await?;
@@ -475,6 +563,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn current_binary_size_bytes() -> Option<u64> {
+    let executable = std::env::current_exe().ok()?;
+    std::fs::metadata(executable)
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
 fn read_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|window| window[0] == flag)
@@ -524,6 +625,21 @@ fn print_help() {
     );
 }
 
+fn phase1_local_pipeline_status(
+    stale_processing: i64,
+    failed_transit: i64,
+    invalid_vectors: i64,
+    transit_insert_ms: u128,
+) -> &'static str {
+    if stale_processing > 0 || failed_transit > 0 || invalid_vectors > 0 {
+        "needs-repair"
+    } else if transit_insert_ms <= 1 {
+        "ready"
+    } else {
+        "slow"
+    }
+}
+
 async fn run_pipeline_loop(
     paths: IdentityPaths,
     process_limit: u32,
@@ -568,7 +684,7 @@ async fn run_daemon(
     activity_interval_ms: u64,
     recursive: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let server = LocalCaptureServer::new(addr, paths.clone());
+    let server = LocalCaptureServer::new(addr, paths.clone())?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let pipeline = run_pipeline_loop(
         paths.clone(),
@@ -671,7 +787,7 @@ fn print_pipeline_summary(label: &str, summary: &identityd::processor::PipelineS
 
 #[cfg(test)]
 mod tests {
-    use super::{command_arg, ensure_loopback_addr};
+    use super::{command_arg, ensure_loopback_addr, optional_u64, phase1_local_pipeline_status};
     use std::net::SocketAddr;
 
     #[test]
@@ -696,5 +812,20 @@ mod tests {
         ];
 
         assert_eq!(command_arg(&args), Some("doctor".to_string()));
+    }
+
+    #[test]
+    fn phase1_pipeline_status_prioritizes_repair_then_latency() {
+        assert_eq!(phase1_local_pipeline_status(0, 0, 0, 0), "ready");
+        assert_eq!(phase1_local_pipeline_status(0, 0, 0, 3), "slow");
+        assert_eq!(phase1_local_pipeline_status(1, 0, 0, 0), "needs-repair");
+        assert_eq!(phase1_local_pipeline_status(0, 1, 0, 0), "needs-repair");
+        assert_eq!(phase1_local_pipeline_status(0, 0, 1, 0), "needs-repair");
+    }
+
+    #[test]
+    fn optional_u64_formats_unavailable_values() {
+        assert_eq!(optional_u64(Some(42)), "42");
+        assert_eq!(optional_u64(None), "unavailable");
     }
 }

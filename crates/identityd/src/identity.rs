@@ -134,9 +134,9 @@ impl IdentityStore {
         }
 
         let query_embedding = self.embedding.embed(query);
-        let candidates = self
-            .backend
-            .list_recent_with_embeddings(500, &self.embedding, &self.vector_store)?;
+        let candidates =
+            self.backend
+                .list_recent_with_embeddings(500, &self.embedding, &self.vector_store)?;
         let mut results = candidates
             .into_iter()
             .filter_map(|candidate| {
@@ -930,7 +930,8 @@ mod tests {
             id: 21,
             captured_event_id: 21,
             source: "windows-ui:foreground-window".to_string(),
-            cleaned_content: "Active application: Code.exe Active window title: Identity".to_string(),
+            cleaned_content: "Active application: Code.exe Active window title: Identity"
+                .to_string(),
             content_hash: "hash21".to_string(),
             cleaned_at_ms: 1,
             promoted_at_ms: None,
@@ -942,7 +943,10 @@ mod tests {
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].domain_context, "local.activity.window");
         assert_eq!(memories[0].entity_type, "USER_INTERFACE");
-        assert_eq!(memories[0].summary, "UI activity in Code.exe; window Identity");
+        assert_eq!(
+            memories[0].summary,
+            "UI activity in Code.exe; window Identity"
+        );
         assert_eq!(
             memories[0].structured_attributes,
             "{\"application\":\"Code.exe\",\"window_title\":\"Identity\"}"
@@ -959,7 +963,10 @@ mod tests {
             "Active application: Code.exe\nActive window title: Identity\nFocused control text: Search files",
         );
 
-        assert_eq!(summary, "UI activity in Code.exe; window Identity; focus Search files");
+        assert_eq!(
+            summary,
+            "UI activity in Code.exe; window Identity; focus Search files"
+        );
     }
 
     #[test]
@@ -1024,7 +1031,8 @@ mod tests {
             id: 31,
             captured_event_id: 31,
             source: "test".to_string(),
-            cleaned_content: "Vectors should also land in the reserved vector-store root.".to_string(),
+            cleaned_content: "Vectors should also land in the reserved vector-store root."
+                .to_string(),
             content_hash: "hash31".to_string(),
             cleaned_at_ms: 1,
             promoted_at_ms: None,
@@ -1056,7 +1064,8 @@ mod tests {
             id: 32,
             captured_event_id: 32,
             source: "test".to_string(),
-            cleaned_content: "Existing SQLite vectors should backfill the mirror on reopen.".to_string(),
+            cleaned_content: "Existing SQLite vectors should backfill the mirror on reopen."
+                .to_string(),
             content_hash: "hash32".to_string(),
             cleaned_at_ms: 1,
             promoted_at_ms: None,
@@ -1116,7 +1125,10 @@ mod tests {
             crate::embedding::EMBEDDING_MODEL_ID
         );
         assert_eq!(stats.embedding_dim, crate::embedding::EMBEDDING_DIM);
+        #[cfg(feature = "lancedb-backend")]
         assert_eq!(stats.vector_store_backend, "lancedb+filesystem+sqlite");
+        #[cfg(not(feature = "lancedb-backend"))]
+        assert_eq!(stats.vector_store_backend, "filesystem+sqlite");
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
