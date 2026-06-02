@@ -41,7 +41,13 @@ Current responsibility:
 - Capture bounded local inputs through manual CLI, token-protected loopback HTTP, Windows foreground-window capture, and filesystem watching.
 - Process queued captures through an idle-gated local pipeline.
 - Promote cleaned captures into the prototype local `.me` memory store with fixed-width local embeddings, vector blob mirroring, and prototype weighted graph edges.
+- Verify and restore the primary local vector mirror instead of relying on SQLite fallback reads to mask missing vector files.
+- Keep the embedding runtime boundary explicit through `embedding.rs` metadata; the current default is a prototype hash runtime, not final ONNX/`ort`.
 - Assign every prototype `.me` memory node a UUIDv4-style `node_uid` for protocol-facing identity, while retaining compact SQLite row ids for local joins.
+- Persist UTC ISO8601 creation and last-access protocol timestamps for prototype `.me` memory nodes, while retaining millisecond epochs for efficient local ordering.
+- Export recent prototype `.me` nodes through a local protocol-shaped JSON command for inspection, using protocol-facing node ids rather than internal SQLite row ids.
+- Validate protocol-facing `.me` node shape through `doctor` and `memory-protocol-health` before expanding Phase 2 context streaming.
+- Repair bounded protocol-facing `.me` drift locally through `repair-protocol-schema`, including malformed UUIDs, timestamps, structured attributes, and vector dimensions.
 - Protect captured text, source labels, cleaned staging text, and prototype `.me` semantic text fields before SQLite persistence, while preserving legacy plaintext reads for development data.
 - Report and repair legacy plaintext development rows through `doctor` and `protect-at-rest`.
 - Redact duplicate transit content after successful local `.me` promotion.

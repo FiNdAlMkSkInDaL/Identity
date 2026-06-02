@@ -76,6 +76,9 @@ cargo run -p identityd -- promote-once --limit 10
 cargo run -p identityd -- redact-transit-content --limit 100
 cargo run -p identityd -- memory-list --limit 10
 cargo run -p identityd -- memory-stats
+cargo run -p identityd -- memory-export --limit 3
+cargo run -p identityd -- memory-protocol-health
+cargo run -p identityd -- repair-protocol-schema --limit 100
 cargo run -p identityd -- repair-memory-vectors --limit 100
 cargo run -p identityd -- memory-search --query "local-first systems"
 cargo run -p identityd -- memory-graph-health
@@ -101,10 +104,20 @@ current Rust LanceDB stack requires a heavier native build toolchain, including
 cargo build -p identityd --features lancedb-backend
 ```
 
-Prototype `.me` memory nodes include a stable UUIDv4-style `node_uid` alongside
-the compact internal SQLite row id. The row id remains the local graph join key
-for now; `node_uid` is the protocol-facing identifier for future schema and
-interoperability work.
+The current embedding runtime is explicit but still intentionally marked as a
+prototype: `embedding.rs` exposes runtime metadata through `doctor` and
+`memory-stats`, while the final ONNX/`ort` backend remains the main Phase 1
+runtime blocker.
+
+Prototype `.me` memory nodes include a stable UUIDv4-style `node_uid`, UTC
+ISO8601 `created_at_utc` and `last_accessed_utc` timestamps alongside compact
+internal SQLite row ids and millisecond timestamps. The row id remains the local
+graph join key for now; `node_uid` and ISO timestamps are the protocol-facing
+fields for future schema and interoperability work. `memory-export` renders a
+local JSON inspection view that follows the documented protocol shape without
+exposing compact internal SQLite row ids; `memory-protocol-health` validates
+that this protocol-facing shape is ready. `repair-protocol-schema` repairs
+bounded local protocol-field drift without leaving the device.
 
 The initial local workspace is created at:
 
@@ -144,13 +157,14 @@ capture content is capped at 1MB, source labels are capped at 2048 bytes, and
 deterministic secret, credential, payment-card, routing, and precise-location
 markers are rejected.
 
-Use `doctor` as the Phase 1 readiness check. It reports raw queue/vector health
-plus explicit Phase 1 markers, including the local pipeline status and the
-remaining blockers before Phase 1 can be considered complete. On Windows it
-also reports current process memory usage, idle-memory budget status, binary
-size, and binary-size budget status without pulling in a heavy measurement
-dependency. It also probes the current local embedding path against the
-200ms map-stage target and reports whether any legacy plaintext fields still
-need `protect-at-rest`.
+Use `doctor` as the Phase 1 readiness check. It reports raw queue/vector health,
+primary vector mirror health, explicit Phase 1 markers, and a
+`phase1_foundation_completion_percent` score for the local-first foundation
+already implemented. It also lists the remaining blockers before Phase 1 can be
+considered complete. On Windows it reports current process memory usage,
+idle-memory budget status, binary size, and binary-size budget status without
+pulling in a heavy measurement dependency. It also probes the current local
+embedding path against the 200ms map-stage target and reports whether any legacy
+plaintext fields still need `protect-at-rest`.
 
 `daemon` is the phase 1 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. On Windows the filesystem watcher stays on the native event path.

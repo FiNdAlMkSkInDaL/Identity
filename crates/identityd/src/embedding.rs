@@ -1,12 +1,91 @@
 pub const EMBEDDING_DIM: usize = 384;
 pub const EMBEDDING_MODEL_ID: &str = "identity-hash-embedding-v1";
 pub const EMBEDDING_LATENCY_TARGET_MS: u128 = 200;
+pub const EMBEDDING_RUNTIME_KIND: &str = "prototype-hash";
+pub const EMBEDDING_RUNTIME_STATUS: &str = "prototype";
+pub const EMBEDDING_ACCELERATION: &str = "cpu-deterministic";
+pub const EMBEDDING_QUANTIZATION: &str = "none";
+pub const EMBEDDING_ONNX_MODEL_PATH_ENV: &str = "IDENTITY_EMBEDDING_MODEL_PATH";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingProbe {
     pub model_id: &'static str,
     pub dimension: usize,
     pub latency_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRuntimeInfo {
+    pub model_id: &'static str,
+    pub dimension: usize,
+    pub runtime_kind: &'static str,
+    pub runtime_status: &'static str,
+    pub acceleration: &'static str,
+    pub quantization: &'static str,
+    pub onnx_model_path_configured: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct EmbeddingEngine;
+
+impl Default for EmbeddingEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmbeddingEngine {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn model_id(&self) -> &'static str {
+        EMBEDDING_MODEL_ID
+    }
+
+    pub fn dimension(&self) -> usize {
+        EMBEDDING_DIM
+    }
+
+    pub fn blob_len(&self) -> usize {
+        self.dimension() * std::mem::size_of::<f32>()
+    }
+
+    pub fn runtime_info(&self) -> EmbeddingRuntimeInfo {
+        EmbeddingRuntimeInfo {
+            model_id: self.model_id(),
+            dimension: self.dimension(),
+            runtime_kind: EMBEDDING_RUNTIME_KIND,
+            runtime_status: EMBEDDING_RUNTIME_STATUS,
+            acceleration: EMBEDDING_ACCELERATION,
+            quantization: EMBEDDING_QUANTIZATION,
+            onnx_model_path_configured: std::env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV).is_some(),
+        }
+    }
+
+    pub fn embed(&self, text: &str) -> [f32; EMBEDDING_DIM] {
+        embed_text(text)
+    }
+
+    pub fn encode_bytes(&self, text: &str) -> Vec<u8> {
+        to_le_bytes(&self.embed(text))
+    }
+
+    pub fn resolve_bytes(
+        &self,
+        primary: Option<&[u8]>,
+        secondary: Option<&[u8]>,
+        text: &str,
+    ) -> [f32; EMBEDDING_DIM] {
+        primary
+            .and_then(from_le_bytes)
+            .or_else(|| secondary.and_then(from_le_bytes))
+            .unwrap_or_else(|| self.embed(text))
+    }
+
+    pub fn similarity(&self, left: &[f32; EMBEDDING_DIM], right: &[f32; EMBEDDING_DIM]) -> f32 {
+        cosine_similarity(left, right)
+    }
 }
 
 pub fn embed_text(input: &str) -> [f32; EMBEDDING_DIM] {
@@ -101,7 +180,9 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 mod tests {
     use super::{
         cosine_similarity, embed_text, from_le_bytes, probe_embedding_latency, to_le_bytes,
-        EMBEDDING_DIM, EMBEDDING_LATENCY_TARGET_MS, EMBEDDING_MODEL_ID,
+        EmbeddingEngine, EMBEDDING_ACCELERATION, EMBEDDING_DIM, EMBEDDING_LATENCY_TARGET_MS,
+        EMBEDDING_MODEL_ID, EMBEDDING_QUANTIZATION, EMBEDDING_RUNTIME_KIND,
+        EMBEDDING_RUNTIME_STATUS,
     };
 
     #[test]
@@ -130,5 +211,19 @@ mod tests {
         assert_eq!(probe.model_id, EMBEDDING_MODEL_ID);
         assert_eq!(probe.dimension, EMBEDDING_DIM);
         assert!(probe.latency_ms < EMBEDDING_LATENCY_TARGET_MS);
+    }
+
+    #[test]
+    fn embedding_engine_reports_runtime_boundary_metadata() {
+        let engine = EmbeddingEngine::new();
+        let info = engine.runtime_info();
+
+        assert_eq!(info.model_id, EMBEDDING_MODEL_ID);
+        assert_eq!(info.dimension, EMBEDDING_DIM);
+        assert_eq!(info.runtime_kind, EMBEDDING_RUNTIME_KIND);
+        assert_eq!(info.runtime_status, EMBEDDING_RUNTIME_STATUS);
+        assert_eq!(info.acceleration, EMBEDDING_ACCELERATION);
+        assert_eq!(info.quantization, EMBEDDING_QUANTIZATION);
+        assert_eq!(engine.blob_len(), EMBEDDING_DIM * 4);
     }
 }

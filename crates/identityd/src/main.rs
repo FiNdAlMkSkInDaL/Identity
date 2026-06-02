@@ -130,12 +130,54 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let transit_probe = buffer.probe_insert_rollback_latency()?;
             let store = IdentityStore::open(&paths)?;
             let memory = store.stats()?;
+            let embedding_runtime = store.embedding_runtime_info();
+            let protocol = store.protocol_schema_health()?;
+            let vector_mirror = store.vector_mirror_health()?;
             let memory_protection = store.protection_health()?;
             let embedding_probe = probe_embedding_latency("Identity local embedding budget probe.");
             let resources = current_process_resources();
             let working_set_bytes = resources.as_ref().map(|probe| probe.working_set_bytes);
             let pagefile_bytes = resources.as_ref().map(|probe| probe.pagefile_bytes);
             let binary_size_bytes = current_binary_size_bytes();
+            let content_protection_ready = transit_protection.unprotected_captured_fields == 0
+                && transit_protection.unprotected_cleaned_fields == 0
+                && memory_protection.unprotected_semantic_fields == 0;
+            let transit_ready = transit.stale_processing == 0 && transit.failed == 0;
+            let memory_vector_ready = memory.invalid_vector_count == 0 && vector_mirror.is_ready();
+            let memory_schema_ready = memory.node_count == memory.node_uid_count
+                && memory.node_count == memory.timestamp_utc_count
+                && memory.node_count == memory.last_accessed_count;
+            let protocol_schema_ready = protocol.is_ready();
+            let local_pipeline_status = phase1_local_pipeline_status(
+                transit.stale_processing,
+                transit.failed,
+                memory.invalid_vector_count,
+                transit_probe.insert_rollback_ms,
+            );
+            let resource_budget_ready = embedding_probe.latency_ms <= EMBEDDING_LATENCY_TARGET_MS
+                && transit_probe.insert_rollback_ms <= 1
+                && memory_budget_status(working_set_bytes) == "within-budget"
+                && binary_size_bytes
+                    .map(|bytes| bytes <= BINARY_SIZE_TARGET_BYTES)
+                    .unwrap_or(false);
+            let phase1_ready_markers = count_ready([
+                true,
+                true,
+                content_protection_ready,
+                transit_ready,
+                memory_vector_ready,
+                memory_schema_ready,
+                protocol_schema_ready,
+                local_pipeline_status == "ready",
+                resource_budget_ready,
+            ]);
+            let phase1_partial_markers = 3;
+            let phase1_total_markers = 12;
+            let phase1_completion_percent = completion_percent(
+                phase1_ready_markers,
+                phase1_partial_markers,
+                phase1_total_markers,
+            );
 
             println!("workspace_root={}", paths.root.display());
             println!("identity_ledger={}", paths.identity_dir.display());
@@ -148,10 +190,42 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("transit_failed={}", transit.failed);
             println!("memory_nodes={}", memory.node_count);
             println!("memory_node_uids={}", memory.node_uid_count);
+            println!("memory_created_at_utc={}", memory.timestamp_utc_count);
+            println!("memory_last_accessed={}", memory.last_accessed_count);
             println!("memory_vectorized_nodes={}", memory.vectorized_count);
             println!("memory_invalid_vectors={}", memory.invalid_vector_count);
+            println!(
+                "vector_primary_mirrored={}",
+                vector_mirror.primary_mirrored_count
+            );
+            println!(
+                "vector_primary_missing={}",
+                vector_mirror.primary_missing_count
+            );
+            println!("protocol_nodes={}", protocol.node_count);
+            println!("protocol_valid_node_ids={}", protocol.valid_node_ids);
+            println!("protocol_valid_timestamps={}", protocol.valid_timestamps);
+            println!(
+                "protocol_valid_structured_attributes={}",
+                protocol.valid_structured_attributes
+            );
+            println!(
+                "protocol_valid_vector_dimensions={}",
+                protocol.valid_vector_dimensions
+            );
             println!("embedding_model_id={}", memory.embedding_model_id);
             println!("embedding_dim={}", memory.embedding_dim);
+            println!("embedding_runtime_kind={}", embedding_runtime.runtime_kind);
+            println!(
+                "embedding_runtime_status={}",
+                embedding_runtime.runtime_status
+            );
+            println!("embedding_acceleration={}", embedding_runtime.acceleration);
+            println!("embedding_quantization={}", embedding_runtime.quantization);
+            println!(
+                "embedding_onnx_model_path_configured={}",
+                embedding_runtime.onnx_model_path_configured
+            );
             println!("embedding_probe_model_id={}", embedding_probe.model_id);
             println!("embedding_probe_dim={}", embedding_probe.dimension);
             println!("embedding_probe_ms={}", embedding_probe.latency_ms);
@@ -207,10 +281,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("phase1_content_protection={}", protection_backend());
             println!(
                 "phase1_content_protection_health={}",
-                if transit_protection.unprotected_captured_fields == 0
-                    && transit_protection.unprotected_cleaned_fields == 0
-                    && memory_protection.unprotected_semantic_fields == 0
-                {
+                if content_protection_ready {
                     "ready"
                 } else {
                     "needs-repair"
@@ -219,7 +290,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("phase1_capture_adapters=partial");
             println!(
                 "phase1_transit_health={}",
-                if transit.stale_processing == 0 && transit.failed == 0 {
+                if transit_ready {
                     "ready"
                 } else {
                     "needs-repair"
@@ -227,7 +298,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
             println!(
                 "phase1_memory_vector_health={}",
-                if memory.invalid_vector_count == 0 {
+                if memory_vector_ready {
                     "ready"
                 } else {
                     "needs-repair"
@@ -235,7 +306,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
             println!(
                 "phase1_memory_schema_health={}",
-                if memory.node_count == memory.node_uid_count {
+                if memory_schema_ready {
+                    "ready"
+                } else {
+                    "needs-repair"
+                }
+            );
+            println!(
+                "phase1_protocol_schema_health={}",
+                if protocol_schema_ready {
                     "ready"
                 } else {
                     "needs-repair"
@@ -246,15 +325,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "phase1_vector_store_backend={}",
                 memory.vector_store_backend
             );
-            println!(
-                "phase1_local_pipeline={}",
-                phase1_local_pipeline_status(
-                    transit.stale_processing,
-                    transit.failed,
-                    memory.invalid_vector_count,
-                    transit_probe.insert_rollback_ms,
-                )
-            );
+            println!("phase1_local_pipeline={}", local_pipeline_status);
+            println!("phase1_ready_markers={phase1_ready_markers}");
+            println!("phase1_partial_markers={phase1_partial_markers}");
+            println!("phase1_total_markers={phase1_total_markers}");
+            println!("phase1_foundation_completion_percent={phase1_completion_percent}");
             println!(
                 "phase1_remaining=final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
             );
@@ -341,7 +416,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
             for memory in memories {
                 println!(
-                    "#{id} uid={node_uid} cleaned=#{cleaned_id} {domain}/{entity} {source} hash={hash} @ {created_at_ms}: {summary}",
+                    "#{id} uid={node_uid} cleaned=#{cleaned_id} {domain}/{entity} {source} hash={hash} created={created_at_utc} accessed={last_accessed_utc}: {summary}",
                     id = memory.id,
                     node_uid = memory.node_uid,
                     cleaned_id = memory.cleaned_event_id,
@@ -349,7 +424,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     entity = memory.entity_type,
                     source = memory.source,
                     hash = memory.content_hash,
-                    created_at_ms = memory.created_at_ms,
+                    created_at_utc = memory.created_at_utc,
+                    last_accessed_utc = memory.last_accessed_utc,
                     summary = memory.summary.replace('\n', " ")
                 );
             }
@@ -357,14 +433,85 @@ async fn run() -> Result<(), Box<dyn Error>> {
         "memory-stats" => {
             let store = IdentityStore::open(&paths)?;
             let stats = store.stats()?;
+            let embedding_runtime = store.embedding_runtime_info();
+            let vector_mirror = store.vector_mirror_health()?;
 
             println!("memory_nodes={}", stats.node_count);
             println!("memory_node_uids={}", stats.node_uid_count);
+            println!("memory_created_at_utc={}", stats.timestamp_utc_count);
+            println!("memory_last_accessed={}", stats.last_accessed_count);
             println!("vectorized_nodes={}", stats.vectorized_count);
             println!("invalid_vectors={}", stats.invalid_vector_count);
+            println!(
+                "vector_primary_mirrored={}",
+                vector_mirror.primary_mirrored_count
+            );
+            println!(
+                "vector_primary_missing={}",
+                vector_mirror.primary_missing_count
+            );
             println!("embedding_model_id={}", stats.embedding_model_id);
             println!("embedding_dim={}", stats.embedding_dim);
+            println!("embedding_runtime_kind={}", embedding_runtime.runtime_kind);
+            println!(
+                "embedding_runtime_status={}",
+                embedding_runtime.runtime_status
+            );
+            println!("embedding_acceleration={}", embedding_runtime.acceleration);
+            println!("embedding_quantization={}", embedding_runtime.quantization);
+            println!(
+                "embedding_onnx_model_path_configured={}",
+                embedding_runtime.onnx_model_path_configured
+            );
             println!("vector_store_backend={}", stats.vector_store_backend);
+        }
+        "memory-export" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let store = IdentityStore::open(&paths)?;
+            println!("{}", store.export_recent_protocol_json(limit)?);
+        }
+        "memory-protocol-health" => {
+            let store = IdentityStore::open(&paths)?;
+            let health = store.protocol_schema_health()?;
+
+            println!("protocol_nodes={}", health.node_count);
+            println!("protocol_valid_node_ids={}", health.valid_node_ids);
+            println!("protocol_valid_timestamps={}", health.valid_timestamps);
+            println!(
+                "protocol_valid_structured_attributes={}",
+                health.valid_structured_attributes
+            );
+            println!(
+                "protocol_valid_vector_dimensions={}",
+                health.valid_vector_dimensions
+            );
+            println!(
+                "protocol_schema_health={}",
+                if health.is_ready() {
+                    "ready"
+                } else {
+                    "needs-repair"
+                }
+            );
+        }
+        "repair-protocol-schema" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(100);
+            let store = IdentityStore::open(&paths)?;
+            let summary = store.repair_protocol_schema(limit)?;
+
+            println!(
+                "repaired protocol schema: node_ids={} timestamps={} structured_attributes={} vectors={}",
+                summary.repaired_node_ids,
+                summary.repaired_timestamps,
+                summary.repaired_structured_attributes,
+                summary.repaired_vectors
+            );
         }
         "repair-memory-vectors" => {
             let limit = read_flag(&raw_args, "--limit")
@@ -750,7 +897,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback]"
     );
 }
 
@@ -767,6 +914,19 @@ fn phase1_local_pipeline_status(
     } else {
         "slow"
     }
+}
+
+fn count_ready<const N: usize>(markers: [bool; N]) -> u32 {
+    markers.into_iter().filter(|marker| *marker).count() as u32
+}
+
+fn completion_percent(ready_markers: u32, partial_markers: u32, total_markers: u32) -> u32 {
+    if total_markers == 0 {
+        return 0;
+    }
+
+    let numerator = ready_markers.saturating_mul(100) + partial_markers.saturating_mul(50);
+    ((numerator + (total_markers / 2)) / total_markers).min(100)
 }
 
 async fn run_pipeline_loop(
@@ -921,7 +1081,10 @@ fn print_pipeline_summary(label: &str, summary: &identityd::processor::PipelineS
 
 #[cfg(test)]
 mod tests {
-    use super::{command_arg, ensure_loopback_addr, optional_u64, phase1_local_pipeline_status};
+    use super::{
+        command_arg, completion_percent, count_ready, ensure_loopback_addr, optional_u64,
+        phase1_local_pipeline_status,
+    };
     use std::net::SocketAddr;
 
     #[test]
@@ -955,6 +1118,14 @@ mod tests {
         assert_eq!(phase1_local_pipeline_status(1, 0, 0, 0), "needs-repair");
         assert_eq!(phase1_local_pipeline_status(0, 1, 0, 0), "needs-repair");
         assert_eq!(phase1_local_pipeline_status(0, 0, 1, 0), "needs-repair");
+    }
+
+    #[test]
+    fn phase1_completion_score_counts_ready_and_partial_markers() {
+        assert_eq!(count_ready([true, false, true, true]), 3);
+        assert_eq!(completion_percent(9, 3, 12), 88);
+        assert_eq!(completion_percent(0, 0, 0), 0);
+        assert_eq!(completion_percent(12, 12, 12), 100);
     }
 
     #[test]

@@ -190,6 +190,10 @@ impl VectorStore {
 
         self.fallback.read(node_id)
     }
+
+    pub fn read_primary(&self, node_id: i64) -> Result<Option<Vec<u8>>, VectorStoreError> {
+        self.primary.read(node_id)
+    }
 }
 
 #[cfg(feature = "lancedb-backend")]

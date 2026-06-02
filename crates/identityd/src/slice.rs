@@ -372,6 +372,9 @@ mod tests {
                     raw_text: long_summary.clone(),
                     content_hash: "hash".to_string(),
                     created_at_ms: id,
+                    created_at_utc: "1970-01-01T00:00:00.000Z".to_string(),
+                    last_accessed_ms: id,
+                    last_accessed_utc: "1970-01-01T00:00:00.000Z".to_string(),
                 },
             })
             .collect::<Vec<_>>();

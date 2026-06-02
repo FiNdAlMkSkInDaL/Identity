@@ -1,9 +1,7 @@
 use crate::crypto::{
     is_protected_text, protect_text, unprotect_text, CryptoError, PROTECTED_PREFIX,
 };
-use crate::embedding::{
-    cosine_similarity, embed_text, from_le_bytes, to_le_bytes, EMBEDDING_DIM, EMBEDDING_MODEL_ID,
-};
+use crate::embedding::{from_le_bytes, EmbeddingEngine, EmbeddingRuntimeInfo, EMBEDDING_DIM};
 use crate::transit::CleanedEvent;
 use crate::vector_store::{VectorStore, VectorStoreError};
 use crate::workspace::IdentityPaths;
@@ -24,6 +22,9 @@ pub struct MemoryNode {
     pub raw_text: String,
     pub content_hash: String,
     pub created_at_ms: i64,
+    pub created_at_utc: String,
+    pub last_accessed_ms: i64,
+    pub last_accessed_utc: String,
 }
 
 #[derive(Debug)]
@@ -32,10 +33,75 @@ pub struct MemorySearchResult {
     pub score: u32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolGraphEdge {
+    pub target_node_id: String,
+    pub relationship_type: String,
+    pub edge_weight: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolMemoryNode {
+    pub node_id: String,
+    pub timestamp_created: String,
+    pub timestamp_last_accessed: String,
+    pub domain_context: String,
+    pub entity_type: String,
+    pub raw_text: String,
+    pub summary_tokens: String,
+    pub structured_attributes: String,
+    pub vector_embedding: Vec<f32>,
+    pub graph_edges: Vec<ProtocolGraphEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolSchemaHealth {
+    pub node_count: i64,
+    pub valid_node_ids: i64,
+    pub valid_timestamps: i64,
+    pub valid_structured_attributes: i64,
+    pub valid_vector_dimensions: i64,
+}
+
+impl ProtocolSchemaHealth {
+    pub fn is_ready(&self) -> bool {
+        self.node_count == self.valid_node_ids
+            && self.node_count == self.valid_timestamps
+            && self.node_count == self.valid_structured_attributes
+            && self.node_count == self.valid_vector_dimensions
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolSchemaRepairSummary {
+    pub repaired_node_ids: usize,
+    pub repaired_timestamps: usize,
+    pub repaired_structured_attributes: usize,
+    pub repaired_vectors: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorMirrorHealth {
+    pub node_count: i64,
+    pub sqlite_vectorized_count: i64,
+    pub primary_mirrored_count: i64,
+    pub primary_missing_count: i64,
+}
+
+impl VectorMirrorHealth {
+    pub fn is_ready(&self) -> bool {
+        self.sqlite_vectorized_count == self.node_count
+            && self.primary_mirrored_count == self.node_count
+            && self.primary_missing_count == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryStats {
     pub node_count: i64,
     pub node_uid_count: i64,
+    pub timestamp_utc_count: i64,
+    pub last_accessed_count: i64,
     pub vectorized_count: i64,
     pub invalid_vector_count: i64,
     pub embedding_model_id: String,
@@ -187,6 +253,43 @@ impl IdentityStore {
         self.backend.list_recent(limit)
     }
 
+    pub fn export_recent_protocol_json(&self, limit: u32) -> Result<String, IdentityError> {
+        let candidates =
+            self.backend
+                .list_recent_with_embeddings(limit, &self.embedding, &self.vector_store)?;
+        let mut nodes = Vec::with_capacity(candidates.len());
+
+        for candidate in candidates {
+            let graph_edges = self.backend.protocol_edges_for_node(candidate.node.id)?;
+            nodes.push(ProtocolMemoryNode {
+                node_id: candidate.node.node_uid,
+                timestamp_created: candidate.node.created_at_utc,
+                timestamp_last_accessed: candidate.node.last_accessed_utc,
+                domain_context: candidate.node.domain_context,
+                entity_type: candidate.node.entity_type,
+                raw_text: candidate.node.raw_text,
+                summary_tokens: candidate.node.summary,
+                structured_attributes: candidate.node.structured_attributes,
+                vector_embedding: candidate.embedding.to_vec(),
+                graph_edges,
+            });
+        }
+
+        Ok(protocol_nodes_json(&nodes))
+    }
+
+    pub fn protocol_schema_health(&self) -> Result<ProtocolSchemaHealth, IdentityError> {
+        self.backend.protocol_schema_health(&self.embedding)
+    }
+
+    pub fn repair_protocol_schema(
+        &self,
+        limit: u32,
+    ) -> Result<ProtocolSchemaRepairSummary, IdentityError> {
+        self.backend
+            .repair_protocol_schema(limit, &self.embedding, &self.vector_store)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -229,12 +332,23 @@ impl IdentityStore {
                 .then_with(|| right.node.id.cmp(&left.node.id))
         });
         results.truncate(limit as usize);
+        self.backend
+            .mark_nodes_accessed(results.iter().map(|result| result.node.id))?;
 
         Ok(results)
     }
 
     pub fn stats(&self) -> Result<MemoryStats, IdentityError> {
         self.backend.stats(&self.embedding, &self.vector_store)
+    }
+
+    pub fn embedding_runtime_info(&self) -> EmbeddingRuntimeInfo {
+        self.embedding.runtime_info()
+    }
+
+    pub fn vector_mirror_health(&self) -> Result<VectorMirrorHealth, IdentityError> {
+        self.backend
+            .vector_mirror_health(&self.embedding, &self.vector_store)
     }
 
     pub fn repair_vectors(&self, limit: u32) -> Result<MemoryRepairSummary, IdentityError> {
@@ -322,11 +436,12 @@ impl SqliteMemoryBackend {
         let protected_summary = protect_text(&record.summary)?;
         let protected_structured_attributes = protect_text(&record.structured_attributes)?;
         let protected_raw_text = protect_text(&record.raw_text)?;
+        let created_at_utc = iso8601_utc_from_ms(record.created_at_ms);
 
         self.conn.execute(
             "INSERT OR IGNORE INTO memory_nodes
-                (node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, vector_embedding, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                (node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, vector_embedding, created_at_ms, created_at_utc, last_accessed_ms, last_accessed_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 generate_node_uid()?,
                 record.cleaned_event_id,
@@ -338,7 +453,10 @@ impl SqliteMemoryBackend {
                 &protected_raw_text,
                 &record.content_hash,
                 &record.vector_embedding,
-                record.created_at_ms
+                record.created_at_ms,
+                &created_at_utc,
+                record.created_at_ms,
+                created_at_utc
             ],
         )?;
 
@@ -372,7 +490,11 @@ impl SqliteMemoryBackend {
         let vectors = rows.collect::<Result<Vec<_>, _>>()?;
 
         for (id, bytes) in vectors {
-            if vector_store.read(id)?.is_none() {
+            let primary_ready = vector_store
+                .read_primary(id)?
+                .map(|primary| primary.len() == bytes.len())
+                .unwrap_or(false);
+            if !primary_ready {
                 vector_store.upsert(id, &bytes)?;
             }
         }
@@ -382,7 +504,7 @@ impl SqliteMemoryBackend {
 
     fn list_recent(&self, limit: u32) -> Result<Vec<MemoryNode>, IdentityError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, created_at_ms
+            "SELECT id, node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, created_at_ms, created_at_utc, last_accessed_ms, last_accessed_utc
              FROM memory_nodes
              ORDER BY created_at_ms DESC, id DESC
              LIMIT ?1",
@@ -402,7 +524,7 @@ impl SqliteMemoryBackend {
         vector_store: &VectorStore,
     ) -> Result<Vec<MemoryCandidate>, IdentityError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, created_at_ms
+            "SELECT id, node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, created_at_ms, created_at_utc, last_accessed_ms, last_accessed_utc
              FROM memory_nodes
              ORDER BY created_at_ms DESC, id DESC
              LIMIT ?1",
@@ -440,6 +562,19 @@ impl SqliteMemoryBackend {
             [],
             |row| row.get(0),
         )?;
+        let timestamp_utc_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_nodes WHERE created_at_utc IS NOT NULL AND created_at_utc != ''",
+            [],
+            |row| row.get(0),
+        )?;
+        let last_accessed_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_nodes
+             WHERE last_accessed_ms IS NOT NULL
+               AND last_accessed_utc IS NOT NULL
+               AND last_accessed_utc != ''",
+            [],
+            |row| row.get(0),
+        )?;
         let invalid_vector_count = node_count - vectorized_count;
         let embedding_model_id = self.meta_value("embedding_model_id")?.unwrap_or_default();
         let embedding_dim = self
@@ -450,12 +585,62 @@ impl SqliteMemoryBackend {
         Ok(MemoryStats {
             node_count,
             node_uid_count,
+            timestamp_utc_count,
+            last_accessed_count,
             vectorized_count,
             invalid_vector_count,
             embedding_model_id,
             embedding_dim,
             vector_store_backend: vector_store.backend_name().to_string(),
         })
+    }
+
+    fn vector_mirror_health(
+        &self,
+        embedding: &EmbeddingEngine,
+        vector_store: &VectorStore,
+    ) -> Result<VectorMirrorHealth, IdentityError> {
+        let expected_len = embedding.blob_len() as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT id, length(vector_embedding)
+             FROM memory_nodes
+             ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            ))
+        })?;
+
+        let mut health = VectorMirrorHealth {
+            node_count: 0,
+            sqlite_vectorized_count: 0,
+            primary_mirrored_count: 0,
+            primary_missing_count: 0,
+        };
+
+        for row in rows {
+            let (id, sqlite_len) = row?;
+            health.node_count += 1;
+
+            if sqlite_len == expected_len {
+                health.sqlite_vectorized_count += 1;
+            }
+
+            let primary_ready = vector_store
+                .read_primary(id)?
+                .map(|bytes| bytes.len() as i64 == expected_len)
+                .unwrap_or(false);
+
+            if primary_ready {
+                health.primary_mirrored_count += 1;
+            } else {
+                health.primary_missing_count += 1;
+            }
+        }
+
+        Ok(health)
     }
 
     fn repair_vectors(
@@ -492,6 +677,163 @@ impl SqliteMemoryBackend {
         Ok(MemoryRepairSummary {
             repaired_vectors: repairs.len(),
         })
+    }
+
+    fn protocol_schema_health(
+        &self,
+        embedding: &EmbeddingEngine,
+    ) -> Result<ProtocolSchemaHealth, IdentityError> {
+        let mut statement = self.conn.prepare(
+            "SELECT node_uid,
+                    created_at_utc,
+                    last_accessed_utc,
+                    structured_attributes,
+                    length(vector_embedding)
+             FROM memory_nodes
+             ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            ))
+        })?;
+
+        let mut health = ProtocolSchemaHealth {
+            node_count: 0,
+            valid_node_ids: 0,
+            valid_timestamps: 0,
+            valid_structured_attributes: 0,
+            valid_vector_dimensions: 0,
+        };
+        let expected_vector_bytes = embedding.blob_len() as i64;
+
+        for row in rows {
+            let (node_uid, created_at, last_accessed, structured_attributes, vector_bytes) = row?;
+            let structured_attributes = unprotect_text(&structured_attributes)?;
+
+            health.node_count += 1;
+            if is_uuid_v4_like(&node_uid) {
+                health.valid_node_ids += 1;
+            }
+            if is_iso8601_utc_timestamp(&created_at) && is_iso8601_utc_timestamp(&last_accessed) {
+                health.valid_timestamps += 1;
+            }
+            if is_json_object_like(&structured_attributes) {
+                health.valid_structured_attributes += 1;
+            }
+            if vector_bytes == expected_vector_bytes {
+                health.valid_vector_dimensions += 1;
+            }
+        }
+
+        Ok(health)
+    }
+
+    fn repair_protocol_schema(
+        &self,
+        limit: u32,
+        embedding: &EmbeddingEngine,
+        vector_store: &VectorStore,
+    ) -> Result<ProtocolSchemaRepairSummary, IdentityError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,
+                    node_uid,
+                    created_at_ms,
+                    created_at_utc,
+                    last_accessed_ms,
+                    last_accessed_utc,
+                    structured_attributes,
+                    raw_text,
+                    length(vector_embedding)
+             FROM memory_nodes
+             ORDER BY id ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+            ))
+        })?;
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
+        let expected_vector_bytes = embedding.blob_len() as i64;
+        let mut summary = ProtocolSchemaRepairSummary {
+            repaired_node_ids: 0,
+            repaired_timestamps: 0,
+            repaired_structured_attributes: 0,
+            repaired_vectors: 0,
+        };
+
+        for (
+            id,
+            node_uid,
+            created_at_ms,
+            created_at_utc,
+            last_accessed_ms,
+            last_accessed_utc,
+            structured_attributes,
+            raw_text,
+            vector_bytes,
+        ) in rows
+        {
+            if !is_uuid_v4_like(&node_uid) {
+                self.conn.execute(
+                    "UPDATE memory_nodes SET node_uid = ?1 WHERE id = ?2",
+                    params![generate_node_uid()?, id],
+                )?;
+                summary.repaired_node_ids += 1;
+            }
+
+            if !is_iso8601_utc_timestamp(&created_at_utc)
+                || !is_iso8601_utc_timestamp(&last_accessed_utc)
+            {
+                self.conn.execute(
+                    "UPDATE memory_nodes
+                     SET created_at_utc = ?1,
+                         last_accessed_utc = ?2
+                     WHERE id = ?3",
+                    params![
+                        iso8601_utc_from_ms(created_at_ms),
+                        iso8601_utc_from_ms(last_accessed_ms),
+                        id
+                    ],
+                )?;
+                summary.repaired_timestamps += 1;
+            }
+
+            let structured_attributes_plaintext = unprotect_text(&structured_attributes)?;
+            if !is_json_object_like(&structured_attributes_plaintext) {
+                self.conn.execute(
+                    "UPDATE memory_nodes SET structured_attributes = ?1 WHERE id = ?2",
+                    params![protect_text("{}")?, id],
+                )?;
+                summary.repaired_structured_attributes += 1;
+            }
+
+            if vector_bytes != expected_vector_bytes {
+                let raw_text = unprotect_text(&raw_text)?;
+                let vector_embedding = embedding.encode_bytes(&raw_text);
+                self.conn.execute(
+                    "UPDATE memory_nodes SET vector_embedding = ?1 WHERE id = ?2",
+                    params![&vector_embedding, id],
+                )?;
+                vector_store.upsert(id, &vector_embedding)?;
+                summary.repaired_vectors += 1;
+            }
+        }
+
+        Ok(summary)
     }
 
     fn protection_health(&self) -> Result<MemoryProtectionHealth, IdentityError> {
@@ -658,6 +1000,31 @@ impl SqliteMemoryBackend {
             .map_err(IdentityError::from)
     }
 
+    fn protocol_edges_for_node(
+        &self,
+        node_id: i64,
+    ) -> Result<Vec<ProtocolGraphEdge>, IdentityError> {
+        let mut statement = self.conn.prepare(
+            "SELECT target.node_uid, edge.relationship_type, edge.edge_weight
+             FROM graph_edges edge
+             JOIN memory_nodes target ON target.id = edge.target_node_id
+             WHERE edge.source_node_id = ?1
+             ORDER BY edge.edge_weight DESC, edge.updated_at_ms DESC
+             LIMIT 32",
+        )?;
+
+        let rows = statement.query_map([node_id], |row| {
+            Ok(ProtocolGraphEdge {
+                target_node_id: row.get(0)?,
+                relationship_type: row.get(1)?,
+                edge_weight: row.get(2)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(IdentityError::from)
+    }
+
     fn decay_edges(&self, limit: u32) -> Result<EdgeDecaySummary, IdentityError> {
         let now = now_ms()?;
         let edges = self.list_edges(limit)?;
@@ -745,7 +1112,10 @@ impl SqliteMemoryBackend {
                 raw_text TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
                 vector_embedding BLOB NOT NULL,
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                created_at_utc TEXT NOT NULL,
+                last_accessed_ms INTEGER NOT NULL,
+                last_accessed_utc TEXT NOT NULL
              );
 
              CREATE INDEX IF NOT EXISTS idx_memory_nodes_content_hash
@@ -807,6 +1177,28 @@ impl SqliteMemoryBackend {
              ON memory_nodes(node_uid)",
             [],
         )?;
+
+        if !self.has_column("memory_nodes", "created_at_utc")? {
+            self.conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN created_at_utc TEXT",
+                [],
+            )?;
+        }
+        self.backfill_missing_created_at_utc()?;
+
+        if !self.has_column("memory_nodes", "last_accessed_ms")? {
+            self.conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN last_accessed_ms INTEGER",
+                [],
+            )?;
+        }
+        if !self.has_column("memory_nodes", "last_accessed_utc")? {
+            self.conn.execute(
+                "ALTER TABLE memory_nodes ADD COLUMN last_accessed_utc TEXT",
+                [],
+            )?;
+        }
+        self.backfill_missing_last_accessed()?;
 
         self.set_meta_value("embedding_model_id", embedding.model_id())?;
         self.set_meta_value("embedding_dim", &embedding.dimension().to_string())?;
@@ -894,56 +1286,89 @@ impl SqliteMemoryBackend {
 
         Ok(())
     }
+
+    fn backfill_missing_created_at_utc(&self) -> Result<(), IdentityError> {
+        let rows = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, created_at_ms
+                 FROM memory_nodes
+                 WHERE created_at_utc IS NULL OR created_at_utc = ''
+                 ORDER BY id ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        for (id, created_at_ms) in rows {
+            self.conn.execute(
+                "UPDATE memory_nodes SET created_at_utc = ?1 WHERE id = ?2",
+                params![iso8601_utc_from_ms(created_at_ms), id],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn backfill_missing_last_accessed(&self) -> Result<(), IdentityError> {
+        let rows = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, created_at_ms
+                 FROM memory_nodes
+                 WHERE last_accessed_ms IS NULL
+                    OR last_accessed_utc IS NULL
+                    OR last_accessed_utc = ''
+                 ORDER BY id ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        for (id, created_at_ms) in rows {
+            self.conn.execute(
+                "UPDATE memory_nodes
+                 SET last_accessed_ms = ?1,
+                     last_accessed_utc = ?2
+                 WHERE id = ?3",
+                params![created_at_ms, iso8601_utc_from_ms(created_at_ms), id],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn mark_nodes_accessed<I>(&self, node_ids: I) -> Result<(), IdentityError>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let node_ids = node_ids.into_iter().collect::<Vec<_>>();
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+
+        let now = now_ms()?;
+        let now_utc = iso8601_utc_from_ms(now);
+        let tx = self.conn.unchecked_transaction()?;
+
+        for node_id in node_ids {
+            tx.execute(
+                "UPDATE memory_nodes
+                 SET last_accessed_ms = ?1,
+                     last_accessed_utc = ?2
+                 WHERE id = ?3",
+                params![now, &now_utc, node_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 struct MemoryCandidate {
     node: MemoryNode,
     embedding: [f32; EMBEDDING_DIM],
-}
-
-#[derive(Clone, Copy)]
-struct EmbeddingEngine;
-
-impl EmbeddingEngine {
-    fn new() -> Self {
-        Self
-    }
-
-    fn model_id(&self) -> &'static str {
-        EMBEDDING_MODEL_ID
-    }
-
-    fn dimension(&self) -> usize {
-        EMBEDDING_DIM
-    }
-
-    fn blob_len(&self) -> usize {
-        self.dimension() * std::mem::size_of::<f32>()
-    }
-
-    fn embed(&self, text: &str) -> [f32; EMBEDDING_DIM] {
-        embed_text(text)
-    }
-
-    fn encode_bytes(&self, text: &str) -> Vec<u8> {
-        to_le_bytes(&self.embed(text))
-    }
-
-    fn resolve_bytes(
-        &self,
-        primary: Option<&[u8]>,
-        secondary: Option<&[u8]>,
-        text: &str,
-    ) -> [f32; EMBEDDING_DIM] {
-        primary
-            .and_then(from_le_bytes)
-            .or_else(|| secondary.and_then(from_le_bytes))
-            .unwrap_or_else(|| self.embed(text))
-    }
-
-    fn similarity(&self, left: &[f32; EMBEDDING_DIM], right: &[f32; EMBEDDING_DIM]) -> f32 {
-        cosine_similarity(left, right)
-    }
 }
 
 struct MemoryRecord {
@@ -972,6 +1397,9 @@ fn map_memory_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryNode> {
         raw_text: row.get(8)?,
         content_hash: row.get(9)?,
         created_at_ms: row.get(10)?,
+        created_at_utc: row.get(11)?,
+        last_accessed_ms: row.get(12)?,
+        last_accessed_utc: row.get(13)?,
     })
 }
 
@@ -1123,11 +1551,166 @@ fn json_escape(value: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", character as u32));
+            }
             _ => escaped.push(character),
         }
     }
 
     escaped
+}
+
+fn protocol_nodes_json(nodes: &[ProtocolMemoryNode]) -> String {
+    let mut output = String::from("[");
+
+    for (index, node) in nodes.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&protocol_node_json(node));
+    }
+
+    output.push(']');
+    output
+}
+
+fn protocol_node_json(node: &ProtocolMemoryNode) -> String {
+    let mut output = String::from("{");
+    push_json_string_field(&mut output, "node_id", &node.node_id, false);
+    push_json_string_field(
+        &mut output,
+        "timestamp_created",
+        &node.timestamp_created,
+        true,
+    );
+    push_json_string_field(
+        &mut output,
+        "timestamp_last_accessed",
+        &node.timestamp_last_accessed,
+        true,
+    );
+    push_json_string_field(&mut output, "domain_context", &node.domain_context, true);
+    push_json_string_field(&mut output, "entity_type", &node.entity_type, true);
+    output.push_str(",\"semantic_payload\":{");
+    push_json_string_field(&mut output, "raw_text", &node.raw_text, false);
+    push_json_string_field(&mut output, "summary_tokens", &node.summary_tokens, true);
+    output.push_str(",\"structured_attributes\":");
+    output.push_str(normalized_json_object(&node.structured_attributes));
+    output.push('}');
+    output.push_str(",\"vector_embedding\":");
+    push_vector_json(&mut output, &node.vector_embedding);
+    output.push_str(",\"graph_edges\":");
+    push_protocol_edges_json(&mut output, &node.graph_edges);
+    output.push('}');
+    output
+}
+
+fn push_json_string_field(output: &mut String, key: &str, value: &str, needs_comma: bool) {
+    if needs_comma {
+        output.push(',');
+    }
+    output.push('"');
+    output.push_str(key);
+    output.push_str("\":\"");
+    output.push_str(&json_escape(value));
+    output.push('"');
+}
+
+fn normalized_json_object(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        trimmed
+    } else {
+        "{}"
+    }
+}
+
+fn push_vector_json(output: &mut String, vector: &[f32]) {
+    output.push('[');
+    for (index, value) in vector.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&format!("{value:.6}"));
+    }
+    output.push(']');
+}
+
+fn push_protocol_edges_json(output: &mut String, edges: &[ProtocolGraphEdge]) {
+    output.push('[');
+    for (index, edge) in edges.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_string_field(output, "target_node_id", &edge.target_node_id, false);
+        push_json_string_field(output, "relationship_type", &edge.relationship_type, true);
+        output.push_str(",\"edge_weight\":");
+        output.push_str(&format!("{:.6}", edge.edge_weight.clamp(0.0, 1.0)));
+        output.push('}');
+    }
+    output.push(']');
+}
+
+fn is_uuid_v4_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            14 => {
+                if *byte != b'4' {
+                    return false;
+                }
+            }
+            19 => {
+                if !matches!(*byte, b'8' | b'9' | b'a' | b'b') {
+                    return false;
+                }
+            }
+            _ => {
+                if !byte.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn is_iso8601_utc_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[14..16].iter().all(u8::is_ascii_digit)
+        && bytes[17..19].iter().all(u8::is_ascii_digit)
+        && bytes[20..23].iter().all(u8::is_ascii_digit)
+}
+
+fn is_json_object_like(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}')
 }
 
 fn summarize_capture(source: &str, content: &str) -> String {
@@ -1305,6 +1888,36 @@ fn format_uuid_bytes(bytes: &[u8; 16]) -> String {
     )
 }
 
+fn iso8601_utc_from_ms(timestamp_ms: i64) -> String {
+    let seconds = timestamp_ms.div_euclid(1000);
+    let millis = timestamp_ms.rem_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+
+    (year, month, day)
+}
+
 #[cfg(windows)]
 fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
     #[link(name = "advapi32")]
@@ -1339,9 +1952,11 @@ fn fill_random_bytes(_bytes: &mut [u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_attributes, classify_capture, format_uuid_bytes, labelled_value, query_tokens,
-        summarize, summarize_capture, summarize_windows_activity, windows_activity_attributes,
-        IdentityStore,
+        capture_attributes, classify_capture, format_uuid_bytes, is_iso8601_utc_timestamp,
+        is_json_object_like, is_uuid_v4_like, iso8601_utc_from_ms, labelled_value,
+        protocol_nodes_json, query_tokens, summarize, summarize_capture,
+        summarize_windows_activity, windows_activity_attributes, IdentityStore, ProtocolGraphEdge,
+        ProtocolMemoryNode,
     };
     use crate::crypto::is_protected_text;
     use crate::transit::CleanedEvent;
@@ -1385,6 +2000,7 @@ mod tests {
             memories[0].node_uid.as_bytes()[19],
             b'8' | b'9' | b'a' | b'b'
         ));
+        assert!(memories[0].created_at_utc.ends_with('Z'));
         assert_eq!(memories[0].summary, "Identity stores local memory.");
 
         drop(store);
@@ -1399,6 +2015,51 @@ mod tests {
         ]);
 
         assert_eq!(uuid, "12345678-9abc-4def-8012-3456789abcde");
+    }
+
+    #[test]
+    fn utc_timestamp_formatter_handles_epoch_and_milliseconds() {
+        assert_eq!(iso8601_utc_from_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            iso8601_utc_from_ms(1_735_689_599_123),
+            "2024-12-31T23:59:59.123Z"
+        );
+    }
+
+    #[test]
+    fn protocol_schema_validators_are_strict_but_lightweight() {
+        assert!(is_uuid_v4_like("12345678-9abc-4def-8012-3456789abcde"));
+        assert!(!is_uuid_v4_like("12345678-9abc-5def-8012-3456789abcde"));
+        assert!(is_iso8601_utc_timestamp("2024-12-31T23:59:59.123Z"));
+        assert!(!is_iso8601_utc_timestamp("2024-12-31 23:59:59"));
+        assert!(is_json_object_like("{\"ok\":\"yes\"}"));
+        assert!(!is_json_object_like("[\"not-object\"]"));
+    }
+
+    #[test]
+    fn protocol_json_escapes_text_and_falls_back_from_malformed_attributes() {
+        let json = protocol_nodes_json(&[ProtocolMemoryNode {
+            node_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            timestamp_created: "1970-01-01T00:00:00.000Z".to_string(),
+            timestamp_last_accessed: "1970-01-01T00:00:00.000Z".to_string(),
+            domain_context: "local.capture".to_string(),
+            entity_type: "DOCUMENT".to_string(),
+            raw_text: "Line one\n\"line two\"".to_string(),
+            summary_tokens: "Summary with tab\tmarker".to_string(),
+            structured_attributes: "not-json".to_string(),
+            vector_embedding: vec![0.25, -0.5],
+            graph_edges: vec![ProtocolGraphEdge {
+                target_node_id: "00000000-0000-4000-8000-000000000002".to_string(),
+                relationship_type: "RELATED_TO".to_string(),
+                edge_weight: 1.5,
+            }],
+        }]);
+
+        assert!(json.contains("\"raw_text\":\"Line one\\n\\\"line two\\\"\""));
+        assert!(json.contains("\"summary_tokens\":\"Summary with tab\\tmarker\""));
+        assert!(json.contains("\"structured_attributes\":{}"));
+        assert!(json.contains("\"vector_embedding\":[0.250000,-0.500000]"));
+        assert!(json.contains("\"edge_weight\":1.000000"));
     }
 
     #[test]
@@ -1507,6 +2168,248 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].node.summary.contains("private memory"));
         assert!(results[0].score > 0);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_marks_returned_memory_nodes_accessed() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-last-access-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let cleaned = CleanedEvent {
+            id: 14,
+            captured_event_id: 14,
+            source: "test".to_string(),
+            cleaned_content: "Search access should advance dynamic memory timestamps.".to_string(),
+            content_hash: "hash14".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+
+        store.insert_memory_from_cleaned(&cleaned).unwrap();
+        let before = store.list_recent(1).unwrap()[0].last_accessed_ms;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let results = store.search("dynamic memory", 1).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let after = store.list_recent(1).unwrap()[0].last_accessed_ms;
+        assert!(after > before);
+        assert!(store.list_recent(1).unwrap()[0]
+            .last_accessed_utc
+            .ends_with('Z'));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exports_recent_memory_in_protocol_shape_without_local_row_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-protocol-export-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let first = CleanedEvent {
+            id: 21,
+            captured_event_id: 21,
+            source: "test".to_string(),
+            cleaned_content: "Protocol export keeps local ids private.".to_string(),
+            content_hash: "hash21".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        let second = CleanedEvent {
+            id: 22,
+            captured_event_id: 22,
+            source: "test".to_string(),
+            cleaned_content: "Related protocol export target.".to_string(),
+            content_hash: "hash22".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+
+        let first_id = store.insert_memory_from_cleaned(&first).unwrap();
+        let second_id = store.insert_memory_from_cleaned(&second).unwrap();
+        store
+            .link_nodes(first_id, second_id, "RELATED_TO", 0.75)
+            .unwrap();
+
+        let exported = store.export_recent_protocol_json(10).unwrap();
+
+        assert!(exported.starts_with('['));
+        assert!(exported.contains("\"node_id\":\""));
+        assert!(exported.contains("\"timestamp_created\":\""));
+        assert!(exported.contains("\"timestamp_last_accessed\":\""));
+        assert!(exported.contains("\"semantic_payload\":{"));
+        assert!(exported.contains("\"vector_embedding\":["));
+        assert!(exported.contains("\"graph_edges\":["));
+        assert!(exported.contains("\"target_node_id\":\""));
+        assert!(exported.contains("\"edge_weight\":0.750000"));
+        assert!(!exported.contains("cleaned_event_id"));
+        assert!(!exported.contains("\"id\":"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protocol_schema_health_reports_ready_for_valid_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-protocol-health-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let cleaned = CleanedEvent {
+            id: 23,
+            captured_event_id: 23,
+            source: "test".to_string(),
+            cleaned_content: "Protocol health validates local memory shape.".to_string(),
+            content_hash: "hash23".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+
+        store.insert_memory_from_cleaned(&cleaned).unwrap();
+        let health = store.protocol_schema_health().unwrap();
+
+        assert_eq!(health.node_count, 1);
+        assert_eq!(health.valid_node_ids, 1);
+        assert_eq!(health.valid_timestamps, 1);
+        assert_eq!(health.valid_structured_attributes, 1);
+        assert_eq!(health.valid_vector_dimensions, 1);
+        assert!(health.is_ready());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protocol_schema_health_flags_malformed_protocol_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-protocol-health-corrupt-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let cleaned = CleanedEvent {
+            id: 24,
+            captured_event_id: 24,
+            source: "test".to_string(),
+            cleaned_content: "Protocol health should flag malformed rows.".to_string(),
+            content_hash: "hash24".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+
+        store.insert_memory_from_cleaned(&cleaned).unwrap();
+        store
+            .backend
+            .conn
+            .execute(
+                "UPDATE memory_nodes
+                 SET node_uid = 'bad',
+                     created_at_utc = 'bad',
+                     last_accessed_utc = 'bad',
+                     structured_attributes = 'bad',
+                     vector_embedding = ?1
+                 WHERE cleaned_event_id = ?2",
+                params![vec![1_u8, 2, 3], cleaned.id],
+            )
+            .unwrap();
+
+        let health = store.protocol_schema_health().unwrap();
+
+        assert_eq!(health.node_count, 1);
+        assert_eq!(health.valid_node_ids, 0);
+        assert_eq!(health.valid_timestamps, 0);
+        assert_eq!(health.valid_structured_attributes, 0);
+        assert_eq!(health.valid_vector_dimensions, 0);
+        assert!(!health.is_ready());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_protocol_schema_restores_malformed_protocol_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-protocol-repair-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let cleaned = CleanedEvent {
+            id: 25,
+            captured_event_id: 25,
+            source: "test".to_string(),
+            cleaned_content: "Protocol repair should restore local state shape.".to_string(),
+            content_hash: "hash25".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+
+        store.insert_memory_from_cleaned(&cleaned).unwrap();
+        store
+            .backend
+            .conn
+            .execute(
+                "UPDATE memory_nodes
+                 SET node_uid = 'bad',
+                     created_at_utc = 'bad',
+                     last_accessed_utc = 'bad',
+                     structured_attributes = 'bad',
+                     vector_embedding = ?1
+                 WHERE cleaned_event_id = ?2",
+                params![vec![1_u8, 2, 3], cleaned.id],
+            )
+            .unwrap();
+
+        assert!(!store.protocol_schema_health().unwrap().is_ready());
+
+        let summary = store.repair_protocol_schema(100).unwrap();
+        assert_eq!(summary.repaired_node_ids, 1);
+        assert_eq!(summary.repaired_timestamps, 1);
+        assert_eq!(summary.repaired_structured_attributes, 1);
+        assert_eq!(summary.repaired_vectors, 1);
+
+        let health = store.protocol_schema_health().unwrap();
+        assert!(health.is_ready());
+        let exported = store.export_recent_protocol_json(1).unwrap();
+        assert!(exported.contains("\"structured_attributes\":{}"));
+        assert!(!exported.contains("\"node_id\":\"bad\""));
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -1684,8 +2587,8 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO memory_nodes
-                    (node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, vector_embedding, created_at_ms)
-                 VALUES (?1, ?2, 'legacy:source', 'local.capture', 'DOCUMENT', 'legacy summary', '{\"legacy\":\"yes\"}', 'legacy raw text', 'hash', ?3, 1)",
+                    (node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, vector_embedding, created_at_ms, created_at_utc, last_accessed_ms, last_accessed_utc)
+                 VALUES (?1, ?2, 'legacy:source', 'local.capture', 'DOCUMENT', 'legacy summary', '{\"legacy\":\"yes\"}', 'legacy raw text', 'hash', ?3, 1, '1970-01-01T00:00:00.001Z', 1, '1970-01-01T00:00:00.001Z')",
                 params![
                     "00000000-0000-4000-8000-000000000077",
                     77_i64,
@@ -1741,7 +2644,12 @@ mod tests {
             .backend
             .conn
             .execute(
-                "UPDATE memory_nodes SET node_uid = '' WHERE cleaned_event_id = ?1",
+                "UPDATE memory_nodes
+                 SET node_uid = '',
+                     created_at_utc = '',
+                     last_accessed_ms = 0,
+                     last_accessed_utc = ''
+                 WHERE cleaned_event_id = ?1",
                 [cleaned.id],
             )
             .unwrap();
@@ -1753,7 +2661,11 @@ mod tests {
 
         assert_eq!(stats.node_count, 1);
         assert_eq!(stats.node_uid_count, 1);
+        assert_eq!(stats.timestamp_utc_count, 1);
+        assert_eq!(stats.last_accessed_count, 1);
         assert_eq!(memories[0].node_uid.len(), 36);
+        assert!(memories[0].created_at_utc.ends_with('Z'));
+        assert!(memories[0].last_accessed_utc.ends_with('Z'));
 
         drop(reopened);
         fs::remove_dir_all(root).unwrap();
@@ -1785,8 +2697,14 @@ mod tests {
 
         let node_id = store.insert_memory_from_cleaned(&cleaned).unwrap();
         let stored = store.vector_store.read(node_id).unwrap().unwrap();
+        let mirror = store.vector_mirror_health().unwrap();
 
         assert_eq!(stored.len(), crate::embedding::EMBEDDING_DIM * 4);
+        assert_eq!(mirror.node_count, 1);
+        assert_eq!(mirror.sqlite_vectorized_count, 1);
+        assert_eq!(mirror.primary_mirrored_count, 1);
+        assert_eq!(mirror.primary_missing_count, 0);
+        assert!(mirror.is_ready());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -1828,9 +2746,21 @@ mod tests {
 
         let reopened = IdentityStore::open(&paths).unwrap();
         let restored = reopened.vector_store.read(node_id).unwrap();
+        let mirror_path = paths
+            .vector_store_dir
+            .join(format!("node-{node_id:020}.f32le"));
+        let mirror = reopened.vector_mirror_health().unwrap();
 
         assert!(restored.is_some());
         assert_eq!(restored.unwrap().len(), crate::embedding::EMBEDDING_DIM * 4);
+        assert!(mirror_path.exists());
+        assert_eq!(
+            fs::metadata(mirror_path).unwrap().len(),
+            (crate::embedding::EMBEDDING_DIM * 4) as u64
+        );
+        assert_eq!(mirror.primary_mirrored_count, 1);
+        assert_eq!(mirror.primary_missing_count, 0);
+        assert!(mirror.is_ready());
 
         drop(reopened);
         fs::remove_dir_all(root).unwrap();
@@ -1864,6 +2794,8 @@ mod tests {
 
         assert_eq!(stats.node_count, 1);
         assert_eq!(stats.node_uid_count, 1);
+        assert_eq!(stats.timestamp_utc_count, 1);
+        assert_eq!(stats.last_accessed_count, 1);
         assert_eq!(stats.vectorized_count, 1);
         assert_eq!(stats.invalid_vector_count, 0);
         assert_eq!(
