@@ -3,7 +3,15 @@ use identityd::activity::{
 };
 use identityd::capture::capture_adapter_health;
 use identityd::crypto::protection_backend;
-use identityd::embedding::{probe_embedding_latency, EMBEDDING_LATENCY_TARGET_MS};
+use identityd::embedding::{
+    active_embedding_health, embedding_artifact_health_for_model_path,
+    onnx_runtime_health_for_artifact, probe_embedding_latency, run_onnx_embedding_file,
+    tokenize_wordpiece_file, tokenizer_health, tokenizer_health_for_vocab_path,
+    write_embedding_manifest, ActiveEmbeddingHealth, OnnxRuntimeHealth, TokenizerHealth,
+    EMBEDDING_DIM, EMBEDDING_LATENCY_TARGET_MS, EMBEDDING_ONNX_MODEL_PATH_ENV,
+    EMBEDDING_RUNTIME_ENV, EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
+    EMBEDDING_TOKENIZER_VOCAB_PATH_ENV,
+};
 use identityd::filesystem::{
     ensure_safe_watch_root, FileWatcher, FileWatcherConfig, FileWatcherMode, WATCH_UNSAFE_ROOT_FLAG,
 };
@@ -16,7 +24,7 @@ use identityd::resource::{
     current_process_resources, memory_budget_status, IDLE_MEMORY_TARGET_BYTES,
 };
 use identityd::slice::{build_prompt_package, generate_meslice};
-use identityd::transit::{TransitBuffer, DEFAULT_PROCESSING_LEASE_MS};
+use identityd::transit::{TransitBuffer, TransitSourceFamilyCounts, DEFAULT_PROCESSING_LEASE_MS};
 use identityd::workspace::IdentityPaths;
 use std::env;
 use std::error::Error;
@@ -122,6 +130,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 println!("{}={}", count.status, count.count);
             }
         }
+        "capture-sources" => {
+            let buffer = TransitBuffer::open(&paths)?;
+            let sources = buffer.source_family_counts()?;
+            print_source_family_counts(&sources);
+        }
         "doctor" => {
             let lease_ms = read_flag(&raw_args, "--lease-ms")
                 .map(|value| value.parse::<i64>())
@@ -136,6 +149,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let memory = store.stats()?;
             let embedding_runtime = store.embedding_runtime_info();
             let embedding_artifact = store.embedding_artifact_health();
+            let onnx_runtime = onnx_runtime_health_for_artifact(&embedding_artifact);
+            let tokenizer = tokenizer_health();
+            let active_embedding = active_embedding_health();
             let protocol = store.protocol_schema_health()?;
             let vector_mirror = store.vector_mirror_health()?;
             let memory_protection = store.protection_health()?;
@@ -269,6 +285,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "embedding_artifact_manifest_embedding_dim={}",
                 optional_usize(embedding_artifact.manifest_embedding_dim)
             );
+            print_onnx_runtime_health(&onnx_runtime);
+            print_tokenizer_health(&tokenizer);
+            print_active_embedding_health(&active_embedding);
             println!("embedding_probe_model_id={}", embedding_probe.model_id);
             println!("embedding_probe_dim={}", embedding_probe.dimension);
             println!("embedding_probe_ms={}", embedding_probe.latency_ms);
@@ -322,7 +341,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("phase1_workspace=ready");
             println!("phase1_transit_buffer=ready");
             println!("capture_manual_adapter={}", capture_health.manual_adapter);
-            println!("capture_source_manual_count={}", transit_sources.manual);
             println!(
                 "capture_loopback_adapter={}",
                 capture_health.loopback_adapter
@@ -331,24 +349,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "capture_loopback_token_exists={}",
                 capture_health.loopback_token_exists
             );
-            println!("capture_source_loopback_count={}", transit_sources.loopback);
             println!(
                 "capture_filesystem_adapter={}",
                 capture_health.filesystem_adapter
             );
             println!(
-                "capture_source_filesystem_count={}",
-                transit_sources.filesystem
-            );
-            println!(
                 "capture_active_window_adapter={}",
                 capture_health.active_window_adapter
             );
-            println!(
-                "capture_source_active_window_count={}",
-                transit_sources.active_window
-            );
-            println!("capture_source_other_count={}", transit_sources.other);
+            print_source_family_counts(&transit_sources);
             println!(
                 "filesystem_watch_safe_root_enforced={}",
                 capture_health.filesystem_policy.safe_root_enforced
@@ -415,7 +424,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     "needs-repair"
                 }
             );
-            println!("phase1_embedding_runtime=prototype");
+            println!(
+                "phase1_embedding_runtime={}",
+                active_embedding.active_runtime
+            );
             println!(
                 "phase1_embedding_artifact={}",
                 phase1_embedding_artifact_status(
@@ -432,6 +444,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("phase1_partial_markers={phase1_partial_markers}");
             println!("phase1_total_markers={phase1_total_markers}");
             println!("phase1_foundation_completion_percent={phase1_completion_percent}");
+            println!(
+                "phase1_next_milestone={}",
+                phase1_next_milestone(embedding_artifact_ready)
+            );
             println!(
                 "phase1_remaining={}",
                 phase1_remaining_summary(embedding_artifact_ready)
@@ -590,6 +606,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let store = IdentityStore::open(&paths)?;
             let runtime = store.embedding_runtime_info();
             let artifact = store.embedding_artifact_health();
+            let onnx_runtime = onnx_runtime_health_for_artifact(&artifact);
+            let active_embedding = active_embedding_health();
 
             println!("embedding_model_id={}", runtime.model_id);
             println!("embedding_dim={}", runtime.dimension);
@@ -632,6 +650,130 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!(
                 "embedding_artifact_manifest_model_id={}",
                 optional_string(artifact.manifest_model_id.as_deref())
+            );
+            println!(
+                "embedding_artifact_manifest_embedding_dim={}",
+                optional_usize(artifact.manifest_embedding_dim)
+            );
+            print_onnx_runtime_health(&onnx_runtime);
+            print_active_embedding_health(&active_embedding);
+        }
+        "embedding-active-health" => {
+            let health = active_embedding_health();
+
+            print_active_embedding_health(&health);
+        }
+        "onnx-runtime-health" => {
+            let store = IdentityStore::open(&paths)?;
+            let artifact = store.embedding_artifact_health();
+            let onnx_runtime = onnx_runtime_health_for_artifact(&artifact);
+
+            println!("embedding_artifact_status={}", artifact.status);
+            println!(
+                "embedding_artifact_path={}",
+                optional_string(artifact.path.as_deref())
+            );
+            print_onnx_runtime_health(&onnx_runtime);
+        }
+        "embedding-tokenizer-health" => {
+            let health = if let Some(vocab_path) = read_flag(&raw_args, "--vocab-path") {
+                tokenizer_health_for_vocab_path(&PathBuf::from(vocab_path))
+            } else {
+                tokenizer_health()
+            };
+
+            print_tokenizer_health(&health);
+        }
+        "embedding-tokenize" => {
+            let vocab_path = read_flag(&raw_args, "--vocab-path")
+                .map(PathBuf::from)
+                .or_else(|| env::var_os(EMBEDDING_TOKENIZER_VOCAB_PATH_ENV).map(PathBuf::from))
+                .ok_or(
+                    "missing --vocab-path or IDENTITY_TOKENIZER_VOCAB_PATH for embedding-tokenize",
+                )?;
+            let text = read_flag(&raw_args, "--text")
+                .ok_or("missing required --text value for embedding-tokenize")?;
+            let max_tokens = read_flag(&raw_args, "--max-tokens")
+                .map(|value| value.parse::<usize>())
+                .transpose()?
+                .unwrap_or(EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS);
+            let tokenized = tokenize_wordpiece_file(&vocab_path, &text, max_tokens)?;
+
+            println!("tokenizer_vocab_path={}", vocab_path.display());
+            println!("tokenizer_max_tokens={max_tokens}");
+            println!("tokenizer_truncated={}", tokenized.truncated);
+            println!("tokenizer_token_count={}", tokenized.tokens.len());
+            println!("tokenizer_tokens={}", tokenized.tokens.join("|"));
+            println!("tokenizer_input_ids={}", join_i64(&tokenized.input_ids));
+            println!(
+                "tokenizer_attention_mask={}",
+                join_i64(&tokenized.attention_mask)
+            );
+            println!(
+                "tokenizer_token_type_ids={}",
+                join_i64(&tokenized.token_type_ids)
+            );
+        }
+        "embedding-onnx-run" => {
+            let model_path = read_flag(&raw_args, "--model-path")
+                .map(PathBuf::from)
+                .or_else(|| env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV).map(PathBuf::from))
+                .ok_or(
+                    "missing --model-path or IDENTITY_EMBEDDING_MODEL_PATH for embedding-onnx-run",
+                )?;
+            let vocab_path = read_flag(&raw_args, "--vocab-path")
+                .map(PathBuf::from)
+                .or_else(|| env::var_os(EMBEDDING_TOKENIZER_VOCAB_PATH_ENV).map(PathBuf::from))
+                .ok_or(
+                    "missing --vocab-path or IDENTITY_TOKENIZER_VOCAB_PATH for embedding-onnx-run",
+                )?;
+            let text = read_flag(&raw_args, "--text")
+                .ok_or("missing required --text value for embedding-onnx-run")?;
+            let max_tokens = read_flag(&raw_args, "--max-tokens")
+                .map(|value| value.parse::<usize>())
+                .transpose()?
+                .unwrap_or(EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS);
+            let run = run_onnx_embedding_file(&model_path, &vocab_path, &text, max_tokens)?;
+
+            println!("onnx_embedding_model_path={}", run.model_path);
+            println!("onnx_embedding_vocab_path={}", run.vocab_path);
+            println!("onnx_embedding_token_count={}", run.token_count);
+            println!("onnx_embedding_truncated={}", run.truncated);
+            println!("onnx_embedding_output_floats={}", run.output_floats);
+            println!("onnx_embedding_pooled_rows={}", run.pooled_rows);
+            println!("onnx_embedding_dim={EMBEDDING_DIM}");
+            println!(
+                "onnx_embedding_prefix={}",
+                join_f32_prefix(&run.embedding, 8)
+            );
+        }
+        "embedding-manifest-write" => {
+            let model_path = read_flag(&raw_args, "--model-path")
+                .map(PathBuf::from)
+                .ok_or("missing required --model-path value for embedding-manifest-write")?;
+            let model_id = read_flag(&raw_args, "--model-id")
+                .ok_or("missing required --model-id value for embedding-manifest-write")?;
+            let overwrite = has_flag(&raw_args, "--force");
+            let manifest_path = write_embedding_manifest(&model_path, &model_id, overwrite)?;
+            let artifact = embedding_artifact_health_for_model_path(&model_path);
+
+            println!("embedding_manifest_path={}", manifest_path.display());
+            println!("embedding_manifest_model_id={model_id}");
+            println!("embedding_manifest_embedding_dim={EMBEDDING_DIM}");
+            println!("embedding_artifact_status={}", artifact.status);
+            println!("embedding_artifact_exists={}", artifact.exists);
+            println!("embedding_artifact_is_file={}", artifact.is_file);
+            println!(
+                "embedding_artifact_has_onnx_extension={}",
+                artifact.has_onnx_extension
+            );
+            println!(
+                "embedding_artifact_size_bytes={}",
+                optional_u64(artifact.size_bytes)
+            );
+            println!(
+                "embedding_artifact_manifest_exists={}",
+                artifact.manifest_exists
             );
             println!(
                 "embedding_artifact_manifest_embedding_dim={}",
@@ -1039,6 +1181,12 @@ fn optional_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
+fn optional_u128(value: Option<u128>) -> String {
+    value
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
 fn optional_usize(value: Option<usize>) -> String {
     value
         .map(|number| number.to_string())
@@ -1094,7 +1242,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
     );
 }
 
@@ -1129,6 +1277,14 @@ fn phase1_remaining_summary(embedding_artifact_ready: bool) -> &'static str {
         "final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
     } else {
         "valid local ONNX embedding artifact; final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+    }
+}
+
+fn phase1_next_milestone(embedding_artifact_ready: bool) -> &'static str {
+    if embedding_artifact_ready {
+        "wire final local ONNX/ort embedding runtime behind embedding.rs"
+    } else {
+        "configure valid local ONNX embedding artifact and .identity.json manifest"
     }
 }
 
@@ -1295,12 +1451,98 @@ fn print_pipeline_summary(label: &str, summary: &identityd::processor::PipelineS
     );
 }
 
+fn print_source_family_counts(sources: &TransitSourceFamilyCounts) {
+    println!("capture_source_manual_count={}", sources.manual);
+    println!("capture_source_loopback_count={}", sources.loopback);
+    println!("capture_source_filesystem_count={}", sources.filesystem);
+    println!(
+        "capture_source_active_window_count={}",
+        sources.active_window
+    );
+    println!("capture_source_other_count={}", sources.other);
+}
+
+fn print_onnx_runtime_health(health: &OnnxRuntimeHealth) {
+    println!("onnx_runtime_feature_enabled={}", health.feature_enabled);
+    println!("onnx_runtime_dylib_env={}", health.dylib_env_var);
+    println!(
+        "onnx_runtime_dylib_path_configured={}",
+        health.dylib_path_configured
+    );
+    println!("onnx_runtime_artifact_status={}", health.artifact_status);
+    println!("onnx_runtime_session_status={}", health.session_status);
+    println!("onnx_runtime_load_ms={}", optional_u128(health.load_ms));
+    println!(
+        "onnx_runtime_input_count={}",
+        optional_usize(health.input_count)
+    );
+    println!(
+        "onnx_runtime_output_count={}",
+        optional_usize(health.output_count)
+    );
+    println!(
+        "onnx_runtime_first_input={}",
+        optional_string(health.first_input.as_deref())
+    );
+    println!(
+        "onnx_runtime_first_output={}",
+        optional_string(health.first_output.as_deref())
+    );
+}
+
+fn print_tokenizer_health(health: &TokenizerHealth) {
+    println!("tokenizer_vocab_env={}", health.env_var);
+    println!("tokenizer_vocab_configured={}", health.configured);
+    println!(
+        "tokenizer_vocab_path={}",
+        optional_string(health.path.as_deref())
+    );
+    println!("tokenizer_vocab_exists={}", health.exists);
+    println!("tokenizer_vocab_is_file={}", health.is_file);
+    println!(
+        "tokenizer_vocab_size_bytes={}",
+        optional_u64(health.size_bytes)
+    );
+    println!(
+        "tokenizer_vocab_token_count={}",
+        optional_usize(health.token_count)
+    );
+    println!("tokenizer_vocab_status={}", health.status);
+}
+
+fn print_active_embedding_health(health: &ActiveEmbeddingHealth) {
+    println!("embedding_runtime_env={}", EMBEDDING_RUNTIME_ENV);
+    println!("embedding_requested_runtime={}", health.requested_runtime);
+    println!("embedding_active_runtime={}", health.active_runtime);
+    println!(
+        "embedding_fallback_reason={}",
+        optional_string(health.fallback_reason.as_deref())
+    );
+}
+
+fn join_i64(values: &[i64]) -> String {
+    values
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn join_f32_prefix(values: &[f32], limit: usize) -> String {
+    values
+        .iter()
+        .take(limit)
+        .map(|value| format!("{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         command_arg, completion_percent, count_ready, ensure_loopback_addr, optional_string,
         optional_u64, optional_usize, phase1_embedding_artifact_status,
-        phase1_local_pipeline_status, phase1_remaining_summary,
+        phase1_local_pipeline_status, phase1_next_milestone, phase1_remaining_summary,
     };
     use std::net::SocketAddr;
 
@@ -1357,6 +1599,8 @@ mod tests {
         assert_eq!(phase1_embedding_artifact_status(true, "ready"), "ready");
         assert!(phase1_remaining_summary(false).starts_with("valid local ONNX"));
         assert!(phase1_remaining_summary(true).starts_with("final ONNX"));
+        assert!(phase1_next_milestone(false).starts_with("configure valid local ONNX"));
+        assert!(phase1_next_milestone(true).starts_with("wire final local ONNX"));
     }
 
     #[test]

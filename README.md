@@ -61,6 +61,7 @@ cargo run -p identityd -- capture-active-window
 cargo run -p identityd -- watch-active-window --interval-ms 1000
 cargo run -p identityd -- list
 cargo run -p identityd -- stats
+cargo run -p identityd -- capture-sources
 cargo run -p identityd -- doctor
 cargo run -p identityd -- repair-transit
 cargo run -p identityd -- protect-at-rest --limit 100
@@ -77,6 +78,11 @@ cargo run -p identityd -- redact-transit-content --limit 100
 cargo run -p identityd -- memory-list --limit 10
 cargo run -p identityd -- memory-stats
 cargo run -p identityd -- embedding-runtime-health
+cargo run -p identityd -- onnx-runtime-health
+cargo run -p identityd -- embedding-tokenizer-health --vocab-path C:\Models\vocab.txt
+cargo run -p identityd -- embedding-tokenize --vocab-path C:\Models\vocab.txt --text "local private context"
+cargo run -p identityd --features onnx-runtime -- embedding-onnx-run --model-path C:\Models\minilm.onnx --vocab-path C:\Models\vocab.txt --text "local private context"
+cargo run -p identityd -- embedding-manifest-write --model-path C:\Models\minilm.onnx --model-id minilm-l6-v2-local
 cargo run -p identityd -- memory-export --limit 3
 cargo run -p identityd -- memory-protocol-health
 cargo run -p identityd -- repair-protocol-schema --limit 100
@@ -110,8 +116,9 @@ cargo build -p identityd --features lancedb-backend
 
 The current embedding runtime is explicit but still intentionally marked as a
 prototype: `embedding.rs` exposes runtime and ONNX artifact preflight metadata
-through `doctor`, `memory-stats`, and `embedding-runtime-health`, while the
-final ONNX/`ort` backend remains the main Phase 1 runtime blocker. Set
+through `doctor`, `memory-stats`, `embedding-runtime-health`, and
+`onnx-runtime-health`, while the final ONNX/`ort` embedding path remains the
+main Phase 1 runtime blocker. Set
 `IDENTITY_EMBEDDING_MODEL_PATH` to preflight a local `.onnx` model artifact
 without loading it. The preflight also expects a small adjacent manifest named
 `<model>.onnx.identity.json` with at least the current persisted vector shape:
@@ -122,6 +129,44 @@ without loading it. The preflight also expects a small adjacent manifest named
   "embedding_dim": 384
 }
 ```
+
+Use `embedding-manifest-write --model-path <file.onnx> --model-id <id>` to
+generate that sidecar locally. Existing sidecars are left untouched unless
+`--force` is passed, and the command prints the same artifact readiness fields
+used by `doctor`.
+
+The real ONNX Runtime dependency is feature-gated so the default daemon remains
+lean and does not download or copy native binaries. Build with
+`--features onnx-runtime` and configure the native ONNX Runtime dynamic library
+for `ort` to let `onnx-runtime-health` attempt a read-only session load with
+single-threaded, low-optimization settings. Successful session loading proves
+the local runtime boundary; model-specific tokenization and tensor extraction
+are the next embedding implementation step.
+
+The local tokenizer boundary is explicit too. `embedding-tokenizer-health`
+validates a local WordPiece `vocab.txt`, either from `--vocab-path` or
+`IDENTITY_TOKENIZER_VOCAB_PATH`, and `embedding-tokenize` emits padded
+`input_ids`, `attention_mask`, and `token_type_ids` tensors for BERT/MiniLM-style
+embedding models. This remains local-only and dependency-free; it is the tensor
+preparation step that lets the next pass connect tokenized text to ONNX Runtime
+session execution.
+
+When built with `--features onnx-runtime`, `embedding-onnx-run` performs that
+connection as an explicit smoke path: it tokenizes local text, feeds
+`input_ids` and `attention_mask` into the ONNX session, includes `token_type_ids`
+when the model declares that input, extracts the first `f32` output tensor, pools
+it into the persisted 384-dimensional vector contract, and normalizes the result.
+The default daemon still uses the prototype hash embedding runtime until this
+path is validated with a real local model and runtime library.
+
+Set `IDENTITY_EMBEDDING_RUNTIME=onnx` to let the live `EmbeddingEngine` attempt
+the same local ONNX path during promotion and search. If ONNX is unavailable or
+misconfigured, the engine falls back to the hash runtime instead of breaking the
+local pipeline. `embedding-active-health` and `doctor` report the requested
+runtime, active runtime, and fallback reason. For vector-family safety, an
+existing non-empty hash-backed `.me` store remains hash-backed until an explicit
+local re-embedding migration exists; empty stores may adopt the healthy ONNX
+manifest model id.
 
 Prototype `.me` memory nodes include a stable UUIDv4-style `node_uid`, UTC
 ISO8601 `created_at_utc` and `last_accessed_utc` timestamps alongside compact

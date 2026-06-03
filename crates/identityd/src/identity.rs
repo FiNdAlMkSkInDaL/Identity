@@ -160,6 +160,7 @@ pub struct GraphHealth {
 pub enum IdentityError {
     ClockBeforeUnixEpoch,
     Crypto(CryptoError),
+    EmbeddingModelMismatch(String),
     InvalidGraphEdge(String),
     Random(std::io::Error),
     Sqlite(rusqlite::Error),
@@ -171,6 +172,7 @@ impl fmt::Display for IdentityError {
         match self {
             Self::ClockBeforeUnixEpoch => write!(f, "system clock is before the Unix epoch"),
             Self::Crypto(error) => write!(f, "{error}"),
+            Self::EmbeddingModelMismatch(message) => write!(f, "{message}"),
             Self::InvalidGraphEdge(reason) => write!(f, "invalid graph edge: {reason}"),
             Self::Random(error) => write!(f, "failed to generate local node UUID: {error}"),
             Self::Sqlite(error) => write!(f, "{error}"),
@@ -207,9 +209,11 @@ pub struct IdentityStore {
 
 impl IdentityStore {
     pub fn open(paths: &IdentityPaths) -> Result<Self, IdentityError> {
-        let embedding = EmbeddingEngine::new();
+        let requested_embedding = EmbeddingEngine::new();
+        let backend = SqliteMemoryBackend::open(paths)?;
+        let embedding = backend.select_embedding_engine(requested_embedding)?;
+        backend.migrate_embedding_metadata(&embedding)?;
         let vector_store = VectorStore::open(paths, embedding.model_id(), embedding.dimension())?;
-        let backend = SqliteMemoryBackend::open(paths, &embedding)?;
         backend.sync_vector_store(&vector_store, &embedding)?;
         Ok(Self {
             backend,
@@ -429,12 +433,46 @@ struct SqliteMemoryBackend {
 }
 
 impl SqliteMemoryBackend {
-    fn open(paths: &IdentityPaths, embedding: &EmbeddingEngine) -> Result<Self, IdentityError> {
+    fn open(paths: &IdentityPaths) -> Result<Self, IdentityError> {
         let conn = Connection::open(&paths.identity_db)?;
         let backend = Self { conn };
         backend.initialize_schema()?;
-        backend.migrate_schema(embedding)?;
+        backend.migrate_schema()?;
         Ok(backend)
+    }
+
+    fn select_embedding_engine(
+        &self,
+        requested: EmbeddingEngine,
+    ) -> Result<EmbeddingEngine, IdentityError> {
+        let Some(stored_model_id) = self.meta_value("embedding_model_id")? else {
+            return Ok(requested);
+        };
+
+        if stored_model_id == requested.model_id() {
+            return Ok(requested);
+        }
+
+        let node_count = self.node_count()?;
+
+        if node_count == 0 {
+            return Ok(requested);
+        }
+
+        if stored_model_id == crate::embedding::EMBEDDING_MODEL_ID {
+            return Ok(EmbeddingEngine::hash());
+        }
+
+        Err(IdentityError::EmbeddingModelMismatch(format!(
+            "identity.me was embedded with model '{stored_model_id}', but active model '{}' was requested; explicit local re-embedding is required before switching runtimes",
+            requested.model_id()
+        )))
+    }
+
+    fn migrate_embedding_metadata(&self, embedding: &EmbeddingEngine) -> Result<(), IdentityError> {
+        self.set_meta_value("embedding_model_id", embedding.model_id())?;
+        self.set_meta_value("embedding_runtime", embedding.runtime())?;
+        self.set_meta_value("embedding_dim", &embedding.dimension().to_string())
     }
 
     fn insert_memory_record(&self, record: &MemoryRecord) -> Result<i64, IdentityError> {
@@ -1158,7 +1196,7 @@ impl SqliteMemoryBackend {
         Ok(())
     }
 
-    fn migrate_schema(&self, embedding: &EmbeddingEngine) -> Result<(), IdentityError> {
+    fn migrate_schema(&self) -> Result<(), IdentityError> {
         if !self.has_column("memory_nodes", "vector_embedding")? {
             self.conn.execute(
                 "ALTER TABLE memory_nodes ADD COLUMN vector_embedding BLOB",
@@ -1206,10 +1244,13 @@ impl SqliteMemoryBackend {
         }
         self.backfill_missing_last_accessed()?;
 
-        self.set_meta_value("embedding_model_id", embedding.model_id())?;
-        self.set_meta_value("embedding_dim", &embedding.dimension().to_string())?;
-
         Ok(())
+    }
+
+    fn node_count(&self) -> Result<i64, IdentityError> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM memory_nodes", [], |row| row.get(0))
+            .map_err(IdentityError::from)
     }
 
     fn has_column(&self, table: &str, column: &str) -> Result<bool, IdentityError> {
@@ -1962,9 +2003,14 @@ mod tests {
         is_json_object_like, is_uuid_v4_like, iso8601_utc_from_ms, labelled_value,
         protocol_nodes_json, query_tokens, summarize, summarize_capture,
         summarize_windows_activity, windows_activity_attributes, IdentityStore, ProtocolGraphEdge,
-        ProtocolMemoryNode,
+        ProtocolMemoryNode, SqliteMemoryBackend,
     };
     use crate::crypto::is_protected_text;
+    use crate::embedding::{
+        ActiveEmbeddingHealth, EmbeddingArtifactHealth, EmbeddingEngine, EMBEDDING_DIM,
+        EMBEDDING_MODEL_ID, EMBEDDING_ONNX_MODEL_PATH_ENV, EMBEDDING_RUNTIME_ENV,
+        EMBEDDING_RUNTIME_HASH, EMBEDDING_RUNTIME_ONNX,
+    };
     use crate::transit::CleanedEvent;
     use crate::workspace::IdentityPaths;
     use rusqlite::params;
@@ -2815,6 +2861,65 @@ mod tests {
         assert_eq!(stats.vector_store_backend, "filesystem+sqlite");
 
         drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_hash_store_keeps_hash_engine_when_onnx_is_requested() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-memory-engine-selection-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 400,
+                captured_event_id: 400,
+                source: "test".to_string(),
+                cleaned_content: "Existing local vectors must keep their model family.".to_string(),
+                content_hash: "hash400".to_string(),
+                cleaned_at_ms: 1,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+        drop(store);
+
+        let backend = SqliteMemoryBackend::open(&paths).unwrap();
+        let requested = EmbeddingEngine::from_active_health(
+            &ActiveEmbeddingHealth {
+                env_var: EMBEDDING_RUNTIME_ENV,
+                requested_runtime: EMBEDDING_RUNTIME_ONNX.to_string(),
+                active_runtime: EMBEDDING_RUNTIME_ONNX,
+                fallback_reason: None,
+            },
+            &EmbeddingArtifactHealth {
+                env_var: EMBEDDING_ONNX_MODEL_PATH_ENV,
+                configured: true,
+                path: Some("local-model.onnx".to_string()),
+                exists: true,
+                is_file: true,
+                has_onnx_extension: true,
+                size_bytes: Some(1),
+                manifest_path: Some("local-model.onnx.identity.json".to_string()),
+                manifest_exists: true,
+                manifest_size_bytes: Some(1),
+                manifest_model_id: Some("identity-test-onnx".to_string()),
+                manifest_embedding_dim: Some(EMBEDDING_DIM),
+                status: "ready",
+            },
+        );
+        let selected = backend.select_embedding_engine(requested).unwrap();
+
+        assert_eq!(selected.model_id(), EMBEDDING_MODEL_ID);
+        assert_eq!(selected.runtime(), EMBEDDING_RUNTIME_HASH);
+
+        drop(backend);
         fs::remove_dir_all(root).unwrap();
     }
 
