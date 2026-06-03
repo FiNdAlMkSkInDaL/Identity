@@ -76,6 +76,7 @@ cargo run -p identityd -- promote-once --limit 10
 cargo run -p identityd -- redact-transit-content --limit 100
 cargo run -p identityd -- memory-list --limit 10
 cargo run -p identityd -- memory-stats
+cargo run -p identityd -- embedding-runtime-health
 cargo run -p identityd -- memory-export --limit 3
 cargo run -p identityd -- memory-protocol-health
 cargo run -p identityd -- repair-protocol-schema --limit 100
@@ -93,7 +94,10 @@ cargo run -p identityd -- watch --path C:\Users\finph\Documents --poll
 ```
 
 `watch` uses Windows filesystem events by default on Windows. Use `--poll` only as
-the conservative fallback.
+the conservative fallback. Filesystem capture refuses broad or sensitive roots
+such as the home directory, drive root, Identity workspace, `.ssh`, `.aws`,
+`.azure`, `.gnupg`, AppData, Windows, and Program Files unless
+`--allow-unsafe-watch-root` is passed for explicit local development.
 
 The default daemon build uses the lean filesystem-backed vector blob store with
 SQLite fallback. The experimental LanceDB backend is feature-gated because the
@@ -105,9 +109,19 @@ cargo build -p identityd --features lancedb-backend
 ```
 
 The current embedding runtime is explicit but still intentionally marked as a
-prototype: `embedding.rs` exposes runtime metadata through `doctor` and
-`memory-stats`, while the final ONNX/`ort` backend remains the main Phase 1
-runtime blocker.
+prototype: `embedding.rs` exposes runtime and ONNX artifact preflight metadata
+through `doctor`, `memory-stats`, and `embedding-runtime-health`, while the
+final ONNX/`ort` backend remains the main Phase 1 runtime blocker. Set
+`IDENTITY_EMBEDDING_MODEL_PATH` to preflight a local `.onnx` model artifact
+without loading it. The preflight also expects a small adjacent manifest named
+`<model>.onnx.identity.json` with at least the current persisted vector shape:
+
+```json
+{
+  "model_id": "minilm-l6-v2-local",
+  "embedding_dim": 384
+}
+```
 
 Prototype `.me` memory nodes include a stable UUIDv4-style `node_uid`, UTC
 ISO8601 `created_at_utc` and `last_accessed_utc` timestamps alongside compact
@@ -164,7 +178,10 @@ already implemented. It also lists the remaining blockers before Phase 1 can be
 considered complete. On Windows it reports current process memory usage,
 idle-memory budget status, binary size, and binary-size budget status without
 pulling in a heavy measurement dependency. It also probes the current local
-embedding path against the 200ms map-stage target and reports whether any legacy
-plaintext fields still need `protect-at-rest`.
+embedding path against the 200ms map-stage target, reports the configured ONNX
+artifact as its own Phase 1 readiness marker, reports filesystem watch-root
+policy enforcement, reports each local capture adapter status plus protected
+source-family counts, and reports whether any legacy plaintext fields still need
+`protect-at-rest`.
 
-`daemon` is the phase 1 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. On Windows the filesystem watcher stays on the native event path.
+`daemon` is the phase 1 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. On Windows the filesystem watcher stays on the native event path. `--watch-path` uses the same safe-root policy as `watch`.

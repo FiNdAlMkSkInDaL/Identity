@@ -15,6 +15,19 @@ use tokio::time::{sleep, Duration};
 
 const MAX_TEXT_FILE_BYTES: u64 = 1024 * 1024;
 const WATCH_POLL_INTERVAL_MS: u64 = 2000;
+pub const WATCH_UNSAFE_ROOT_FLAG: &str = "--allow-unsafe-watch-root";
+const SENSITIVE_WATCH_SEGMENTS: &[(&str, &str)] = &[
+    (".identity", ".identity"),
+    (".ssh", ".ssh"),
+    (".aws", ".aws"),
+    (".azure", ".azure"),
+    (".gnupg", ".gnupg"),
+    ("appdata", "AppData"),
+    ("application data", "Application Data"),
+    ("program files", "Program Files"),
+    ("program files (x86)", "Program Files (x86)"),
+    ("windows", "Windows"),
+];
 #[cfg(windows)]
 const WINDOWS_WATCH_SHUTDOWN_POLL_MS: u32 = 250;
 
@@ -79,6 +92,91 @@ pub struct FileWatcherConfig {
 pub enum FileWatcherMode {
     NativePreferred,
     PollOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWatchPolicyHealth {
+    pub safe_root_enforced: bool,
+    pub unsafe_override_flag: &'static str,
+    pub native_watcher: &'static str,
+    pub poll_fallback: bool,
+    pub max_text_file_bytes: u64,
+    pub blocked_segments: &'static [&'static str],
+}
+
+pub fn filesystem_watch_policy_health() -> FileWatchPolicyHealth {
+    FileWatchPolicyHealth {
+        safe_root_enforced: true,
+        unsafe_override_flag: WATCH_UNSAFE_ROOT_FLAG,
+        native_watcher: native_watcher_status(),
+        poll_fallback: true,
+        max_text_file_bytes: MAX_TEXT_FILE_BYTES,
+        blocked_segments: &[
+            ".identity",
+            ".ssh",
+            ".aws",
+            ".azure",
+            ".gnupg",
+            "AppData",
+            "Application Data",
+            "Program Files",
+            "Program Files (x86)",
+            "Windows",
+        ],
+    }
+}
+
+pub fn ensure_safe_watch_root(
+    root: &Path,
+    workspace_root: &Path,
+    allow_unsafe: bool,
+) -> Result<(), String> {
+    if allow_unsafe {
+        return Ok(());
+    }
+
+    let root = fs::canonicalize(root).map_err(|error| {
+        format!(
+            "watch root cannot be resolved: {} ({error})",
+            root.display()
+        )
+    })?;
+
+    if !root.is_dir() {
+        return Err(format!("watch root is not a directory: {}", root.display()));
+    }
+
+    if root.parent().is_none() {
+        return Err(format!(
+            "refusing to watch filesystem root {}; choose a narrower project or notes folder, or pass {WATCH_UNSAFE_ROOT_FLAG} for explicit local development",
+            root.display()
+        ));
+    }
+
+    if is_home_root(&root) {
+        return Err(format!(
+            "refusing to watch the whole home directory {}; choose a narrower project or notes folder, or pass {WATCH_UNSAFE_ROOT_FLAG} for explicit local development",
+            root.display()
+        ));
+    }
+
+    if let Ok(workspace_root) = fs::canonicalize(workspace_root) {
+        if root.starts_with(&workspace_root) {
+            return Err(format!(
+                "refusing to watch the Identity workspace {}; choose a non-ledger source folder",
+                root.display()
+            ));
+        }
+    }
+
+    if let Some(segment) = sensitive_path_segment(&root) {
+        return Err(format!(
+            "refusing to watch sensitive path segment '{segment}' in {}; choose a narrower project or notes folder, or pass {WATCH_UNSAFE_ROOT_FLAG} for explicit local development",
+            root.display()
+        ));
+    }
+
+    Ok(())
 }
 
 pub struct FileWatcher {
@@ -545,6 +643,40 @@ pub fn is_supported_text_path(path: &Path) -> bool {
     )
 }
 
+fn is_home_root(root: &Path) -> bool {
+    ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .any(|home| home == root)
+}
+
+fn sensitive_path_segment(path: &Path) -> Option<&'static str> {
+    path.components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find_map(|segment| {
+            let segment = segment.to_ascii_lowercase();
+            SENSITIVE_WATCH_SEGMENTS
+                .iter()
+                .find(|(blocked, _)| segment == *blocked)
+                .map(|(_, label)| *label)
+        })
+}
+
+#[inline]
+fn native_watcher_status() -> &'static str {
+    if cfg!(windows) {
+        "windows-read-directory-changes"
+    } else if cfg!(target_os = "macos") {
+        "planned-fsevents"
+    } else if cfg!(target_os = "linux") {
+        "planned-inotify"
+    } else {
+        "unsupported"
+    }
+}
+
 #[inline]
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -569,8 +701,10 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_supported_text_path;
-    use std::path::Path;
+    use super::{ensure_safe_watch_root, filesystem_watch_policy_health, is_supported_text_path};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn recognizes_supported_text_extensions_case_insensitively() {
@@ -582,5 +716,60 @@ mod tests {
         assert!(!is_supported_text_path(Path::new("events.log")));
         assert!(!is_supported_text_path(Path::new("photo.png")));
         assert!(!is_supported_text_path(Path::new("no-extension")));
+    }
+
+    #[test]
+    fn watch_root_policy_rejects_identity_workspace_and_sensitive_segments() {
+        let root = temp_root();
+        let workspace = root.join(".identity");
+        let ssh = root.join(".ssh");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&ssh).unwrap();
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        assert!(ensure_safe_watch_root(&project_root, &workspace, false).is_ok());
+        assert!(ensure_safe_watch_root(&workspace, &workspace, false).is_err());
+        assert!(ensure_safe_watch_root(&ssh, &workspace, false).is_err());
+        assert!(ensure_safe_watch_root(&ssh, &workspace, true).is_ok());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watch_root_policy_rejects_files() {
+        let root = temp_root();
+        let workspace = root.join(".identity");
+        let file = root.join("notes.md");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&file, "local notes").unwrap();
+
+        let error = ensure_safe_watch_root(&file, &workspace, false).unwrap_err();
+        assert!(error.contains("not a directory"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_watch_policy_health_reports_enforced_boundaries() {
+        let health = filesystem_watch_policy_health();
+
+        assert!(health.safe_root_enforced);
+        assert_eq!(health.unsafe_override_flag, "--allow-unsafe-watch-root");
+        assert!(health.poll_fallback);
+        assert_eq!(health.max_text_file_bytes, 1024 * 1024);
+        assert!(health.blocked_segments.contains(&".ssh"));
+        assert!(health.blocked_segments.contains(&"AppData"));
+    }
+
+    fn temp_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "identity-watch-policy-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }

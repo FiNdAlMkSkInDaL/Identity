@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod capture;
 pub mod crypto;
 pub mod embedding;
 pub mod filesystem;

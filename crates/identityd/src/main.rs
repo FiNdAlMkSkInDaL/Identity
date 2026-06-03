@@ -1,9 +1,12 @@
 use identityd::activity::{
     capture_active_window_once, watch_active_window_until_shutdown, DEFAULT_ACTIVITY_POLL_MS,
 };
+use identityd::capture::capture_adapter_health;
 use identityd::crypto::protection_backend;
 use identityd::embedding::{probe_embedding_latency, EMBEDDING_LATENCY_TARGET_MS};
-use identityd::filesystem::{FileWatcher, FileWatcherConfig, FileWatcherMode};
+use identityd::filesystem::{
+    ensure_safe_watch_root, FileWatcher, FileWatcherConfig, FileWatcherMode, WATCH_UNSAFE_ROOT_FLAG,
+};
 use identityd::identity::IdentityStore;
 use identityd::processor::{
     pipeline_once_if_idle, process_once, process_once_if_idle, promote_once,
@@ -126,14 +129,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .unwrap_or(DEFAULT_PROCESSING_LEASE_MS);
             let buffer = TransitBuffer::open(&paths)?;
             let transit = buffer.health(lease_ms)?;
+            let transit_sources = buffer.source_family_counts()?;
             let transit_protection = buffer.protection_health()?;
             let transit_probe = buffer.probe_insert_rollback_latency()?;
             let store = IdentityStore::open(&paths)?;
             let memory = store.stats()?;
             let embedding_runtime = store.embedding_runtime_info();
+            let embedding_artifact = store.embedding_artifact_health();
             let protocol = store.protocol_schema_health()?;
             let vector_mirror = store.vector_mirror_health()?;
             let memory_protection = store.protection_health()?;
+            let capture_health = capture_adapter_health(&paths);
             let embedding_probe = probe_embedding_latency("Identity local embedding budget probe.");
             let resources = current_process_resources();
             let working_set_bytes = resources.as_ref().map(|probe| probe.working_set_bytes);
@@ -148,6 +154,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 && memory.node_count == memory.timestamp_utc_count
                 && memory.node_count == memory.last_accessed_count;
             let protocol_schema_ready = protocol.is_ready();
+            let embedding_artifact_ready = embedding_artifact.is_ready();
             let local_pipeline_status = phase1_local_pipeline_status(
                 transit.stale_processing,
                 transit.failed,
@@ -168,11 +175,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 memory_vector_ready,
                 memory_schema_ready,
                 protocol_schema_ready,
+                embedding_artifact_ready,
                 local_pipeline_status == "ready",
                 resource_budget_ready,
             ]);
-            let phase1_partial_markers = 3;
-            let phase1_total_markers = 12;
+            let phase1_partial_markers = 3 + u32::from(!embedding_artifact_ready);
+            let phase1_total_markers = 13;
             let phase1_completion_percent = completion_percent(
                 phase1_ready_markers,
                 phase1_partial_markers,
@@ -226,6 +234,41 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "embedding_onnx_model_path_configured={}",
                 embedding_runtime.onnx_model_path_configured
             );
+            println!("embedding_artifact_status={}", embedding_artifact.status);
+            println!(
+                "embedding_artifact_path={}",
+                optional_string(embedding_artifact.path.as_deref())
+            );
+            println!("embedding_artifact_exists={}", embedding_artifact.exists);
+            println!("embedding_artifact_is_file={}", embedding_artifact.is_file);
+            println!(
+                "embedding_artifact_has_onnx_extension={}",
+                embedding_artifact.has_onnx_extension
+            );
+            println!(
+                "embedding_artifact_size_bytes={}",
+                optional_u64(embedding_artifact.size_bytes)
+            );
+            println!(
+                "embedding_artifact_manifest_path={}",
+                optional_string(embedding_artifact.manifest_path.as_deref())
+            );
+            println!(
+                "embedding_artifact_manifest_exists={}",
+                embedding_artifact.manifest_exists
+            );
+            println!(
+                "embedding_artifact_manifest_size_bytes={}",
+                optional_u64(embedding_artifact.manifest_size_bytes)
+            );
+            println!(
+                "embedding_artifact_manifest_model_id={}",
+                optional_string(embedding_artifact.manifest_model_id.as_deref())
+            );
+            println!(
+                "embedding_artifact_manifest_embedding_dim={}",
+                optional_usize(embedding_artifact.manifest_embedding_dim)
+            );
             println!("embedding_probe_model_id={}", embedding_probe.model_id);
             println!("embedding_probe_dim={}", embedding_probe.dimension);
             println!("embedding_probe_ms={}", embedding_probe.latency_ms);
@@ -278,6 +321,58 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
             println!("phase1_workspace=ready");
             println!("phase1_transit_buffer=ready");
+            println!("capture_manual_adapter={}", capture_health.manual_adapter);
+            println!("capture_source_manual_count={}", transit_sources.manual);
+            println!(
+                "capture_loopback_adapter={}",
+                capture_health.loopback_adapter
+            );
+            println!(
+                "capture_loopback_token_exists={}",
+                capture_health.loopback_token_exists
+            );
+            println!("capture_source_loopback_count={}", transit_sources.loopback);
+            println!(
+                "capture_filesystem_adapter={}",
+                capture_health.filesystem_adapter
+            );
+            println!(
+                "capture_source_filesystem_count={}",
+                transit_sources.filesystem
+            );
+            println!(
+                "capture_active_window_adapter={}",
+                capture_health.active_window_adapter
+            );
+            println!(
+                "capture_source_active_window_count={}",
+                transit_sources.active_window
+            );
+            println!("capture_source_other_count={}", transit_sources.other);
+            println!(
+                "filesystem_watch_safe_root_enforced={}",
+                capture_health.filesystem_policy.safe_root_enforced
+            );
+            println!(
+                "filesystem_watch_unsafe_override_flag={}",
+                capture_health.filesystem_policy.unsafe_override_flag
+            );
+            println!(
+                "filesystem_watch_native_watcher={}",
+                capture_health.filesystem_policy.native_watcher
+            );
+            println!(
+                "filesystem_watch_poll_fallback={}",
+                capture_health.filesystem_policy.poll_fallback
+            );
+            println!(
+                "filesystem_watch_max_text_file_bytes={}",
+                capture_health.filesystem_policy.max_text_file_bytes
+            );
+            println!(
+                "filesystem_watch_blocked_segments={}",
+                capture_health.filesystem_policy.blocked_segments.join(",")
+            );
             println!("phase1_content_protection={}", protection_backend());
             println!(
                 "phase1_content_protection_health={}",
@@ -287,7 +382,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     "needs-repair"
                 }
             );
-            println!("phase1_capture_adapters=partial");
+            println!("phase1_capture_adapters={}", capture_health.phase1_status);
             println!(
                 "phase1_transit_health={}",
                 if transit_ready {
@@ -322,6 +417,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
             println!("phase1_embedding_runtime=prototype");
             println!(
+                "phase1_embedding_artifact={}",
+                phase1_embedding_artifact_status(
+                    embedding_artifact_ready,
+                    embedding_artifact.status
+                )
+            );
+            println!(
                 "phase1_vector_store_backend={}",
                 memory.vector_store_backend
             );
@@ -331,7 +433,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("phase1_total_markers={phase1_total_markers}");
             println!("phase1_foundation_completion_percent={phase1_completion_percent}");
             println!(
-                "phase1_remaining=final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+                "phase1_remaining={}",
+                phase1_remaining_summary(embedding_artifact_ready)
             );
         }
         "repair-transit" => {
@@ -434,6 +537,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let store = IdentityStore::open(&paths)?;
             let stats = store.stats()?;
             let embedding_runtime = store.embedding_runtime_info();
+            let embedding_artifact = store.embedding_artifact_health();
             let vector_mirror = store.vector_mirror_health()?;
 
             println!("memory_nodes={}", stats.node_count);
@@ -463,7 +567,76 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "embedding_onnx_model_path_configured={}",
                 embedding_runtime.onnx_model_path_configured
             );
+            println!("embedding_artifact_status={}", embedding_artifact.status);
+            println!(
+                "embedding_artifact_path={}",
+                optional_string(embedding_artifact.path.as_deref())
+            );
+            println!(
+                "embedding_artifact_size_bytes={}",
+                optional_u64(embedding_artifact.size_bytes)
+            );
+            println!(
+                "embedding_artifact_manifest_model_id={}",
+                optional_string(embedding_artifact.manifest_model_id.as_deref())
+            );
+            println!(
+                "embedding_artifact_manifest_embedding_dim={}",
+                optional_usize(embedding_artifact.manifest_embedding_dim)
+            );
             println!("vector_store_backend={}", stats.vector_store_backend);
+        }
+        "embedding-runtime-health" => {
+            let store = IdentityStore::open(&paths)?;
+            let runtime = store.embedding_runtime_info();
+            let artifact = store.embedding_artifact_health();
+
+            println!("embedding_model_id={}", runtime.model_id);
+            println!("embedding_dim={}", runtime.dimension);
+            println!("embedding_runtime_kind={}", runtime.runtime_kind);
+            println!("embedding_runtime_status={}", runtime.runtime_status);
+            println!("embedding_acceleration={}", runtime.acceleration);
+            println!("embedding_quantization={}", runtime.quantization);
+            println!(
+                "embedding_onnx_model_path_configured={}",
+                runtime.onnx_model_path_configured
+            );
+            println!("embedding_artifact_env={}", artifact.env_var);
+            println!("embedding_artifact_status={}", artifact.status);
+            println!(
+                "embedding_artifact_path={}",
+                optional_string(artifact.path.as_deref())
+            );
+            println!("embedding_artifact_exists={}", artifact.exists);
+            println!("embedding_artifact_is_file={}", artifact.is_file);
+            println!(
+                "embedding_artifact_has_onnx_extension={}",
+                artifact.has_onnx_extension
+            );
+            println!(
+                "embedding_artifact_size_bytes={}",
+                optional_u64(artifact.size_bytes)
+            );
+            println!(
+                "embedding_artifact_manifest_path={}",
+                optional_string(artifact.manifest_path.as_deref())
+            );
+            println!(
+                "embedding_artifact_manifest_exists={}",
+                artifact.manifest_exists
+            );
+            println!(
+                "embedding_artifact_manifest_size_bytes={}",
+                optional_u64(artifact.manifest_size_bytes)
+            );
+            println!(
+                "embedding_artifact_manifest_model_id={}",
+                optional_string(artifact.manifest_model_id.as_deref())
+            );
+            println!(
+                "embedding_artifact_manifest_embedding_dim={}",
+                optional_usize(artifact.manifest_embedding_dim)
+            );
         }
         "memory-export" => {
             let limit = read_flag(&raw_args, "--limit")
@@ -764,6 +937,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             if !watch_path.exists() {
                 return Err(format!("watch path does not exist: {}", watch_path.display()).into());
             }
+            ensure_safe_watch_root(
+                &watch_path,
+                &paths.root,
+                has_flag(&raw_args, WATCH_UNSAFE_ROOT_FLAG),
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
 
             let watcher = FileWatcher::new(
                 paths,
@@ -811,6 +990,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 if !path.exists() {
                     return Err(format!("watch path does not exist: {}", path.display()).into());
                 }
+                ensure_safe_watch_root(
+                    path,
+                    &paths.root,
+                    has_flag(&raw_args, WATCH_UNSAFE_ROOT_FLAG),
+                )
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
+                })?;
             }
 
             println!("press Ctrl+C to stop identityd daemon");
@@ -850,6 +1037,16 @@ fn optional_u64(value: Option<u64>) -> String {
     value
         .map(|number| number.to_string())
         .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn optional_string(value: Option<&str>) -> String {
+    value.unwrap_or("unavailable").to_string()
 }
 
 fn read_flag(args: &[String], flag: &str) -> Option<String> {
@@ -897,7 +1094,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
     );
 }
 
@@ -913,6 +1110,25 @@ fn phase1_local_pipeline_status(
         "ready"
     } else {
         "slow"
+    }
+}
+
+fn phase1_embedding_artifact_status(
+    artifact_ready: bool,
+    artifact_status: &'static str,
+) -> &'static str {
+    if artifact_ready {
+        "ready"
+    } else {
+        artifact_status
+    }
+}
+
+fn phase1_remaining_summary(embedding_artifact_ready: bool) -> &'static str {
+    if embedding_artifact_ready {
+        "final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+    } else {
+        "valid local ONNX embedding artifact; final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
     }
 }
 
@@ -1082,8 +1298,9 @@ fn print_pipeline_summary(label: &str, summary: &identityd::processor::PipelineS
 #[cfg(test)]
 mod tests {
     use super::{
-        command_arg, completion_percent, count_ready, ensure_loopback_addr, optional_u64,
-        phase1_local_pipeline_status,
+        command_arg, completion_percent, count_ready, ensure_loopback_addr, optional_string,
+        optional_u64, optional_usize, phase1_embedding_artifact_status,
+        phase1_local_pipeline_status, phase1_remaining_summary,
     };
     use std::net::SocketAddr;
 
@@ -1124,13 +1341,31 @@ mod tests {
     fn phase1_completion_score_counts_ready_and_partial_markers() {
         assert_eq!(count_ready([true, false, true, true]), 3);
         assert_eq!(completion_percent(9, 3, 12), 88);
+        assert_eq!(completion_percent(9, 4, 13), 85);
+        assert_eq!(completion_percent(10, 3, 13), 88);
         assert_eq!(completion_percent(0, 0, 0), 0);
         assert_eq!(completion_percent(12, 12, 12), 100);
+    }
+
+    #[test]
+    fn phase1_embedding_artifact_status_tracks_model_artifact_readiness() {
+        assert_eq!(
+            phase1_embedding_artifact_status(false, "not-configured"),
+            "not-configured"
+        );
+        assert_eq!(phase1_embedding_artifact_status(false, "empty"), "empty");
+        assert_eq!(phase1_embedding_artifact_status(true, "ready"), "ready");
+        assert!(phase1_remaining_summary(false).starts_with("valid local ONNX"));
+        assert!(phase1_remaining_summary(true).starts_with("final ONNX"));
     }
 
     #[test]
     fn optional_u64_formats_unavailable_values() {
         assert_eq!(optional_u64(Some(42)), "42");
         assert_eq!(optional_u64(None), "unavailable");
+        assert_eq!(optional_usize(Some(384)), "384");
+        assert_eq!(optional_usize(None), "unavailable");
+        assert_eq!(optional_string(Some("ready")), "ready");
+        assert_eq!(optional_string(None), "unavailable");
     }
 }

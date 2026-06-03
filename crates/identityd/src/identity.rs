@@ -1,7 +1,9 @@
 use crate::crypto::{
     is_protected_text, protect_text, unprotect_text, CryptoError, PROTECTED_PREFIX,
 };
-use crate::embedding::{from_le_bytes, EmbeddingEngine, EmbeddingRuntimeInfo, EMBEDDING_DIM};
+use crate::embedding::{
+    from_le_bytes, EmbeddingArtifactHealth, EmbeddingEngine, EmbeddingRuntimeInfo, EMBEDDING_DIM,
+};
 use crate::transit::CleanedEvent;
 use crate::vector_store::{VectorStore, VectorStoreError};
 use crate::workspace::IdentityPaths;
@@ -344,6 +346,10 @@ impl IdentityStore {
 
     pub fn embedding_runtime_info(&self) -> EmbeddingRuntimeInfo {
         self.embedding.runtime_info()
+    }
+
+    pub fn embedding_artifact_health(&self) -> EmbeddingArtifactHealth {
+        self.embedding.artifact_health()
     }
 
     pub fn vector_mirror_health(&self) -> Result<VectorMirrorHealth, IdentityError> {

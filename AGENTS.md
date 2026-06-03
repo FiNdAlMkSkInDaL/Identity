@@ -39,10 +39,12 @@ Current responsibility:
 - Create `~/.identity/transit.db`.
 - Store captured raw text events in a local SQLite transit buffer.
 - Capture bounded local inputs through manual CLI, token-protected loopback HTTP, Windows foreground-window capture, and filesystem watching.
+- Report capture-adapter readiness through the centralized `capture.rs` health boundary rather than duplicating status logic in CLI code.
+- Refuse broad or sensitive filesystem watch roots by default; require an explicit unsafe development flag before watching the home directory, ledger workspace, credentials directories, AppData, Windows, or Program Files.
 - Process queued captures through an idle-gated local pipeline.
 - Promote cleaned captures into the prototype local `.me` memory store with fixed-width local embeddings, vector blob mirroring, and prototype weighted graph edges.
 - Verify and restore the primary local vector mirror instead of relying on SQLite fallback reads to mask missing vector files.
-- Keep the embedding runtime boundary explicit through `embedding.rs` metadata; the current default is a prototype hash runtime, not final ONNX/`ort`.
+- Keep the embedding runtime boundary explicit through `embedding.rs` metadata and local ONNX artifact preflight; `doctor` scores the configured artifact separately from the final runtime, expects an adjacent `<model>.onnx.identity.json` manifest declaring the persisted embedding dimension, and the current default is a prototype hash runtime, not final ONNX/`ort`.
 - Assign every prototype `.me` memory node a UUIDv4-style `node_uid` for protocol-facing identity, while retaining compact SQLite row ids for local joins.
 - Persist UTC ISO8601 creation and last-access protocol timestamps for prototype `.me` memory nodes, while retaining millisecond epochs for efficient local ordering.
 - Export recent prototype `.me` nodes through a local protocol-shaped JSON command for inspection, using protocol-facing node ids rather than internal SQLite row ids.

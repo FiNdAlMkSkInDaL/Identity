@@ -26,6 +26,15 @@ pub struct TransitStatusCount {
     pub count: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitSourceFamilyCounts {
+    pub manual: i64,
+    pub loopback: i64,
+    pub filesystem: i64,
+    pub active_window: i64,
+    pub other: i64,
+}
+
 #[derive(Debug)]
 pub struct TransitRepairSummary {
     pub stale_processing_requeued: usize,
@@ -362,6 +371,33 @@ impl TransitBuffer {
             .map_err(TransitError::from)
     }
 
+    pub fn source_family_counts(&self) -> Result<TransitSourceFamilyCounts, TransitError> {
+        let mut counts = TransitSourceFamilyCounts {
+            manual: 0,
+            loopback: 0,
+            filesystem: 0,
+            active_window: 0,
+            other: 0,
+        };
+        let mut statement = self
+            .conn
+            .prepare("SELECT source FROM captured_events ORDER BY id ASC")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+
+        for row in rows {
+            let source = unprotect_text(&row?)?;
+            match source_family(&source) {
+                SourceFamily::Manual => counts.manual += 1,
+                SourceFamily::Loopback => counts.loopback += 1,
+                SourceFamily::Filesystem => counts.filesystem += 1,
+                SourceFamily::ActiveWindow => counts.active_window += 1,
+                SourceFamily::Other => counts.other += 1,
+            }
+        }
+
+        Ok(counts)
+    }
+
     pub fn health(&self, lease_timeout_ms: i64) -> Result<TransitHealth, TransitError> {
         let mut health = TransitHealth {
             queued: 0,
@@ -661,6 +697,28 @@ impl TransitBuffer {
         }
 
         Ok(events)
+    }
+}
+
+enum SourceFamily {
+    Manual,
+    Loopback,
+    Filesystem,
+    ActiveWindow,
+    Other,
+}
+
+fn source_family(source: &str) -> SourceFamily {
+    if source == "manual" || source.starts_with("manual:") || source.starts_with("cli:") {
+        SourceFamily::Manual
+    } else if source.starts_with("local-proxy:") {
+        SourceFamily::Loopback
+    } else if source.starts_with("filesystem:") {
+        SourceFamily::Filesystem
+    } else if source.starts_with("windows-ui:") {
+        SourceFamily::ActiveWindow
+    } else {
+        SourceFamily::Other
     }
 }
 
@@ -1103,6 +1161,42 @@ mod tests {
         let health = buffer.health(0).unwrap();
         assert_eq!(health.processing, 1);
         assert_eq!(health.stale_processing, 1);
+
+        drop(buffer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn counts_capture_sources_by_local_family() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-transit-source-family-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let buffer = TransitBuffer::open(&paths).unwrap();
+        buffer.ingest_text("manual", "manual text").unwrap();
+        buffer
+            .ingest_text("local-proxy:text/html", "loopback text")
+            .unwrap();
+        buffer
+            .ingest_text("filesystem:C:/project/notes.md", "filesystem text")
+            .unwrap();
+        buffer
+            .ingest_text("windows-ui:foreground-window", "window text")
+            .unwrap();
+        buffer.ingest_text("unknown-source", "other text").unwrap();
+
+        let counts = buffer.source_family_counts().unwrap();
+        assert_eq!(counts.manual, 1);
+        assert_eq!(counts.loopback, 1);
+        assert_eq!(counts.filesystem, 1);
+        assert_eq!(counts.active_window, 1);
+        assert_eq!(counts.other, 1);
 
         drop(buffer);
         fs::remove_dir_all(root).unwrap();
