@@ -1,0 +1,1787 @@
+﻿commit 69ddbd7267f12f48f8f42d35d6d9e4e34bb6eb3c
+Author: Finlay Phillips <finlayp32@gmail.com>
+Date:   Wed Jun 3 20:41:34 2026 +0100
+
+    Enhance file ingestion and processing capabilities
+    
+    - Implemented a check for null bytes in the first 512 bytes of files to identify binary content in `ingest_file_if_text`.
+    - Updated `read_text_with_short_retry` to handle `ErrorKind::InvalidData` gracefully.
+    - Expanded the list of supported text file extensions in `is_supported_text_path` to include additional formats such as JSON, CSV, SQL, and more.
+    - Added a new function `has_null_bytes` to detect binary files based on null byte presence.
+    - Introduced `bootstrap` module and integrated ONNX artifact bootstrap functionality in the main application.
+    - Enhanced command-line help to include new `embedding-bootstrap` command.
+    - Improved text cleaning in the processing pipeline to normalize Unicode and strip control characters.
+    - Updated documentation to reflect changes in the system map and added details about the new ONNX artifact bootstrap feature.
+    - Added new test workspace files for capture token and vector store metadata.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 7eb4565..c65626f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2356,6 +2356,7 @@ dependencies = [
+  "ort",
+  "rusqlite",
+  "tokio",
++ "unicode-normalization",
+ ]
+ 
+ [[package]]
+diff --git a/crates/identityd/Cargo.toml b/crates/identityd/Cargo.toml
+index 2c4fe39..1c217db 100644
+--- a/crates/identityd/Cargo.toml
++++ b/crates/identityd/Cargo.toml
+@@ -18,3 +18,4 @@ lol_html = "2.7"
+ ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "load-dynamic", "std"], optional = true }
+ rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+ tokio = { version = "1.48", features = ["macros", "net", "rt", "signal", "time"] }
++unicode-normalization = "0.1"
+diff --git a/crates/identityd/src/activity.rs b/crates/identityd/src/activity.rs
+index 2cfe131..b6722f6 100644
+--- a/crates/identityd/src/activity.rs
++++ b/crates/identityd/src/activity.rs
+@@ -255,6 +255,272 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
+ }
+ 
+ #[cfg(windows)]
++#[cfg(windows)]
++fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
++    use std::ffi::c_void;
++
++    type Hresult = i32;
++    type Bstr = *mut u16;
++
++    #[repr(C)]
++    struct Guid {
++        data1: u32,
++        data2: u16,
++        data3: u16,
++        data4: [u8; 8],
++    }
++
++    #[derive(Clone, Copy)]
++    #[repr(C)]
++    union VariantData {
++        bstr_val: Bstr,
++        _pad: usize,
++    }
++
++    #[derive(Clone, Copy)]
++    #[repr(C)]
++    struct Variant {
++        vt: u16,
++        _reserved1: u16,
++        _reserved2: u16,
++        _reserved3: u16,
++        data: VariantData,
++    }
++
++    const VT_BSTR: u16 = 8;
++
++    impl Default for Variant {
++        fn default() -> Self {
++            Self {
++                vt: 0,
++                _reserved1: 0,
++                _reserved2: 0,
++                _reserved3: 0,
++                data: VariantData { _pad: 0 },
++            }
++        }
++    }
++
++    #[repr(C)]
++    struct IUnknown {
++        lp_vtbl: *const IUnknownVtbl,
++    }
++
++    #[repr(C)]
++    struct IUnknownVtbl {
++        query_interface: unsafe extern "system" fn(
++            *mut IUnknown,
++            *const Guid,
++            *mut *mut c_void,
++        ) -> Hresult,
++        add_ref: unsafe extern "system" fn(*mut IUnknown) -> u32,
++        release: unsafe extern "system" fn(*mut IUnknown) -> u32,
++    }
++
++    #[repr(C)]
++    struct Automation {
++        lp_vtbl: *const AutomationVtbl,
++    }
++
++    #[repr(C)]
++    struct AutomationVtbl {
++        parent: IUnknownVtbl,
++        _pad0: [usize; 4], // indices 3-6: CompareElements, CompareRuntimeIds, GetRootElement, ElementFromPoint
++        get_focused_element:
++            unsafe extern "system" fn(*mut Automation, *mut *mut c_void) -> Hresult,
++    }
++
++    #[repr(C)]
++    struct Element {
++        lp_vtbl: *const ElementVtbl,
++    }
++
++    #[repr(C)]
++    struct ElementVtbl {
++        parent: IUnknownVtbl,
++        _pad0: [usize; 7], // indices 3-9: SetFocus .. BuildUpdatedCache
++        get_current_property_value: unsafe extern "system" fn(
++            *mut Element,
++            i32,       // propertyId
++            *mut Variant, // retVal
++        ) -> Hresult,
++    }
++
++    // CLSID_CUIAutomation: {FF48DBA4-60EF-4201-AA87-54103EEF594E}
++    const CLSID_CUIAUTOMATION: Guid = Guid {
++        data1: 0xFF48_DBA4,
++        data2: 0x60EF,
++        data3: 0x4201,
++        data4: [0xAA, 0x87, 0x54, 0x10, 0x3E, 0xEF, 0x59, 0x4E],
++    };
++    // IID_IUIAutomation: {30CBE57D-D9D0-452A-AB13-7AC5AC4825EE}
++    const IID_IUIAUTOMATION: Guid = Guid {
++        data1: 0x30CB_E57D,
++        data2: 0xD9D0,
++        data3: 0x452A,
++        data4: [0xAB, 0x13, 0x7A, 0xC5, 0xAC, 0x48, 0x25, 0xEE],
++    };
++
++    #[link(name = "ole32")]
++    extern "system" {
++        fn CoInitializeEx(pv_reserved: *mut c_void, coinit: u32) -> Hresult;
++        fn CoUninitialize();
++        fn CoCreateInstance(
++            rclsid: *const Guid,
++            pUnkOuter: *mut c_void,
++            dwClsContext: u32,
++            riid: *const Guid,
++            ppv: *mut *mut c_void,
++        ) -> Hresult;
++    }
++
++    #[link(name = "oleaut32")]
++    extern "system" {
++        fn SysFreeString(bstr: Bstr);
++        fn SysStringLen(bstr: Bstr) -> u32;
++    }
++
++    const CLSCTX_INPROC_SERVER: u32 = 1;
++    const UIA_NAME_PROPERTY_ID: i32 = 30005;
++    const UIA_VALUE_VALUE_PROPERTY_ID: i32 = 30045;
++
++    #[link(name = "user32")]
++    extern "system" {
++        fn IsChild(hWndParent: *mut c_void, hWnd: *mut c_void) -> i32;
++    }
++
++    struct ComInitGuard(bool);
++
++    impl Drop for ComInitGuard {
++        fn drop(&mut self) {
++            if self.0 {
++                unsafe {
++                    CoUninitialize();
++                }
++            }
++        }
++    }
++
++    struct AutoRelease<T> {
++        ptr: *mut T,
++    }
++
++    impl<T> AutoRelease<T> {
++        unsafe fn release(&self) {
++            if !self.ptr.is_null() {
++                let unk = self.ptr.cast::<IUnknown>();
++                unsafe {
++                    ((*(*unk).lp_vtbl).release)(unk);
++                }
++            }
++        }
++    }
++
++    impl<T> Drop for AutoRelease<T> {
++        fn drop(&mut self) {
++            unsafe {
++                self.release();
++            }
++        }
++    }
++
++    fn take_bstr(value: Bstr) -> String {
++        if value.is_null() {
++            return String::new();
++        }
++        let len = unsafe { SysStringLen(value) as usize };
++        let text = normalize_capture_text(&String::from_utf16_lossy(unsafe {
++            std::slice::from_raw_parts(value, len)
++        }));
++        unsafe {
++            SysFreeString(value);
++        }
++        text
++    }
++
++    let init = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
++    let _com_guard = if init >= 0 {
++        ComInitGuard(true)
++    } else if init == RPC_E_CHANGED_MODE {
++        ComInitGuard(false)
++    } else {
++        return None;
++    };
++
++    // Create CUIAutomation
++    let mut raw_automation = std::ptr::null_mut();
++    let hr = unsafe {
++        CoCreateInstance(
++            &CLSID_CUIAUTOMATION,
++            std::ptr::null_mut(),
++            CLSCTX_INPROC_SERVER,
++            &IID_IUIAUTOMATION,
++            &mut raw_automation,
++        )
++    };
++    if hr < 0 || raw_automation.is_null() {
++        return None;
++    }
++    let auto = AutoRelease::<Automation> {
++        ptr: raw_automation.cast::<Automation>(),
++    };
++
++    // Get focused element
++    let mut raw_element = std::ptr::null_mut::<c_void>();
++    let hr = unsafe {
++        ((*(*auto.ptr).lp_vtbl).get_focused_element)(auto.ptr, &mut raw_element)
++    };
++    if hr < 0 || raw_element.is_null() {
++        return None;
++    }
++
++    // Verify the focused element belongs to our window tree
++    if hwnd != raw_element && unsafe { IsChild(hwnd, raw_element.cast()) } == 0 {
++        return None;
++    }
++
++    let element = AutoRelease::<Element> {
++        ptr: raw_element.cast::<Element>(),
++    };
++
++    // Try Value property first (edit controls, text boxes)
++    let mut value_variant = Variant::default();
++    let value_hr = unsafe {
++        ((*(*element.ptr).lp_vtbl).get_current_property_value)(
++            element.ptr,
++            UIA_VALUE_VALUE_PROPERTY_ID,
++            &mut value_variant,
++        )
++    };
++    let value_text = if value_hr >= 0 && value_variant.vt == VT_BSTR {
++        take_bstr(unsafe { value_variant.data.bstr_val })
++    } else {
++        String::new()
++    };
++
++    // Try Name property as fallback
++    let mut name_variant = Variant::default();
++    let name_hr = unsafe {
++        ((*(*element.ptr).lp_vtbl).get_current_property_value)(
++            element.ptr,
++            UIA_NAME_PROPERTY_ID,
++            &mut name_variant,
++        )
++    };
++    let name_text = if name_hr >= 0 && name_variant.vt == VT_BSTR {
++        take_bstr(unsafe { name_variant.data.bstr_val })
++    } else {
++        String::new()
++    };
++
++    let result = prefer_text(value_text, name_text);
++    if result.is_empty() {
++        None
++    } else {
++        Some(result)
++    }
++}
++
+ fn focused_control_text(root_hwnd: *mut std::ffi::c_void, title: &str) -> Option<String> {
+     use std::ffi::c_void;
+ 
+@@ -307,9 +573,15 @@ fn focused_control_text(root_hwnd: *mut std::ffi::c_void, title: &str) -> Option
+         return None;
+     }
+ 
++    let uia_text = read_uia_text(gui.hwnd_focus).unwrap_or_default();
++    let msaa_text = if uia_text.is_empty() {
++        read_accessible_text(gui.hwnd_focus)
++    } else {
++        String::new()
++    };
+     let focused_text = prefer_text(
++        prefer_text(uia_text, msaa_text),
+         read_window_text(gui.hwnd_focus),
+-        read_accessible_text(gui.hwnd_focus),
+     );
+     if focused_text.is_empty() || focused_text == title {
+         None
+diff --git a/crates/identityd/src/bootstrap.rs b/crates/identityd/src/bootstrap.rs
+new file mode 100644
+index 0000000..d917940
+--- /dev/null
++++ b/crates/identityd/src/bootstrap.rs
+@@ -0,0 +1,184 @@
++// ONNX artifact bootstrap -- downloads all-MiniLM-L6-v2 model + vocab.
++//
++// Uses the system `curl.exe` (shipped with Windows 10+) for zero-dependency HTTPS
++// downloads. Existing files are not re-downloaded.
++
++use crate::embedding::{
++    embedding_artifact_health_for_model_path, embedding_manifest_path, tokenizer_health_for_vocab_path,
++    write_embedding_manifest, EMBEDDING_ONNX_DYLIB_PATH_ENV, EMBEDDING_ONNX_MODEL_PATH_ENV,
++    EMBEDDING_RUNTIME_ENV, EMBEDDING_RUNTIME_ONNX, EMBEDDING_TOKENIZER_VOCAB_PATH_ENV,
++};
++
++const BOOTSTRAP_MODEL_URL: &str =
++    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx";
++const BOOTSTRAP_VOCAB_URL: &str =
++    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt";
++const BOOTSTRAP_MODEL_ID: &str = "all-MiniLM-L6-v2";
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct BootstrapResult {
++    pub model_path: std::path::PathBuf,
++    pub vocab_path: std::path::PathBuf,
++    pub manifest_path: std::path::PathBuf,
++    pub model_size_bytes: u64,
++    pub vocab_size_bytes: u64,
++    pub vocab_token_count: usize,
++}
++
++/// Downloads the all-MiniLM-L6-v2 ONNX model and tokenizer vocabulary from Hugging Face,
++/// writes the `.identity.json` manifest, and returns the resulting paths.
++///
++/// Uses the system `curl.exe` for downloads. Existing files are not re-downloaded.
++pub fn bootstrap_onnx_artifact(
++    model_dir: &std::path::Path,
++) -> Result<BootstrapResult, std::io::Error> {
++    std::fs::create_dir_all(model_dir)?;
++
++    let model_path = model_dir.join("model.onnx");
++    let vocab_path = model_dir.join("vocab.txt");
++
++    // Download model if it doesn't already exist
++    if !model_path.exists() {
++        let temp_model = model_dir.join("model.onnx.tmp");
++        download_file(BOOTSTRAP_MODEL_URL, &temp_model)?;
++        std::fs::rename(&temp_model, &model_path)?;
++    }
++
++    // Download vocab if it doesn't already exist
++    if !vocab_path.exists() {
++        let temp_vocab = model_dir.join("vocab.txt.tmp");
++        download_file(BOOTSTRAP_VOCAB_URL, &temp_vocab)?;
++        std::fs::rename(&temp_vocab, &vocab_path)?;
++    }
++
++    // Validate the downloaded model and write manifest if needed
++    let artifact = embedding_artifact_health_for_model_path(&model_path);
++
++    if artifact.exists && artifact.is_file && artifact.has_onnx_extension {
++        let manifest_path = embedding_manifest_path(&model_path);
++        if !manifest_path.exists() {
++            write_embedding_manifest(&model_path, BOOTSTRAP_MODEL_ID, false)?;
++        }
++    }
++
++    // Re-check after manifest write
++    let artifact = embedding_artifact_health_for_model_path(&model_path);
++    if !artifact.is_ready() {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidData,
++            format!(
++                "downloaded ONNX artifact is not ready: status={} path={}",
++                artifact.status,
++                artifact.path.as_deref().unwrap_or("unknown")
++            ),
++        ));
++    }
++
++    let model_size_bytes = std::fs::metadata(&model_path)?.len();
++    let vocab_size_bytes = std::fs::metadata(&vocab_path)?.len();
++    let tokenizer = tokenizer_health_for_vocab_path(&vocab_path);
++    let vocab_token_count = tokenizer.token_count.unwrap_or(0);
++
++    if tokenizer.status != "ready" {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidData,
++            format!(
++                "downloaded tokenizer vocab is not healthy: status={}",
++                tokenizer.status
++            ),
++        ));
++    }
++
++    Ok(BootstrapResult {
++        model_path,
++        vocab_path,
++        manifest_path: embedding_manifest_path(&model_dir.join("model.onnx")),
++        model_size_bytes,
++        vocab_size_bytes,
++        vocab_token_count,
++    })
++}
++
++/// Print environment variable instructions for enabling the ONNX runtime.
++pub fn print_bootstrap_guidance(result: &BootstrapResult) {
++    println!("ONNX embedding artifact bootstrapped successfully.");
++    println!();
++    println!("  model  : {}", result.model_path.display());
++    println!("  vocab  : {}", result.vocab_path.display());
++    println!("  manifest: {}", result.manifest_path.display());
++    println!(
++        "  model size : {} bytes",
++        result.model_size_bytes
++    );
++    println!(
++        "  vocab size : {} bytes ({} tokens)",
++        result.vocab_size_bytes, result.vocab_token_count
++    );
++    println!();
++    println!("To enable the ONNX embedding runtime, complete these steps:");
++    println!();
++    println!("1. Download onnxruntime.dll (Windows x64):");
++    println!("   https://github.com/microsoft/onnxruntime/releases");
++    println!("   (Download the DirectML or CPU package, extract onnxruntime.dll)");
++    println!();
++    println!("2. Set these environment variables:");
++    println!();
++    println!(
++        "   set {}=\"{}\"",
++        EMBEDDING_ONNX_MODEL_PATH_ENV,
++        result.model_path.display()
++    );
++    println!(
++        "   set {}=\"{}\"",
++        EMBEDDING_TOKENIZER_VOCAB_PATH_ENV,
++        result.vocab_path.display()
++    );
++    println!(
++        "   set {}=<path-to-onnxruntime.dll>",
++        EMBEDDING_ONNX_DYLIB_PATH_ENV
++    );
++    println!("   set {EMBEDDING_RUNTIME_ENV}={EMBEDDING_RUNTIME_ONNX}");
++    println!();
++    println!("3. Build with the ONNX feature flag:");
++    println!("   cargo build --release -p identityd --features onnx-runtime");
++    println!();
++    println!("4. Verify with:");
++    println!("   identityd doctor");
++    println!();
++    println!("  Expected output: phase1_embedding_runtime=onnx");
++}
++
++fn download_file(url: &str, dest: &std::path::Path) -> Result<(), std::io::Error> {
++    let status = std::process::Command::new("curl.exe")
++        .args([
++            "-L",
++            "-f",
++            "--retry",
++            "3",
++            "--connect-timeout",
++            "30",
++            "--max-time",
++            "600",
++            "-o",
++        ])
++        .arg(dest)
++        .arg(url)
++        .status()
++        .map_err(|error| {
++            std::io::Error::new(
++                std::io::ErrorKind::NotFound,
++                format!("failed to run curl.exe for model download: {error}"),
++            )
++        })?;
++
++    if !status.success() {
++        let code = status.code().unwrap_or(-1);
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::Other,
++            format!("curl.exe exited with code {code}; download may have failed"),
++        ));
++    }
++
++    Ok(())
++}
++
+diff --git a/crates/identityd/src/embedding.rs b/crates/identityd/src/embedding.rs
+index 44d37f4..0774c19 100644
+--- a/crates/identityd/src/embedding.rs
++++ b/crates/identityd/src/embedding.rs
+@@ -186,7 +186,8 @@ impl EmbeddingEngine {
+             quantization: EMBEDDING_QUANTIZATION,
+             onnx_model_path_configured: std::env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV)
+                 .map(|path| !path.is_empty())
+-                .unwrap_or(false),
++                .unwrap_or(false)
++                || default_model_path().is_some(),
+         }
+     }
+ 
+@@ -208,9 +209,7 @@ impl EmbeddingEngine {
+ 
+     pub fn embed(&self, text: &str) -> [f32; EMBEDDING_DIM] {
+         if self.runtime == EMBEDDING_RUNTIME_ONNX {
+-            if let Ok(run) =
+-                run_onnx_embedding_from_env(text, EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS)
+-            {
++            if let Ok(run) = try_onnx_embed(text) {
+                 return run.embedding;
+             }
+         }
+@@ -240,10 +239,23 @@ impl EmbeddingEngine {
+ }
+ 
+ pub fn embedding_artifact_health() -> EmbeddingArtifactHealth {
++    // Env-var path first
+     let path = std::env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV)
+         .filter(|path| !path.is_empty())
+         .map(std::path::PathBuf::from);
+-    embedding_artifact_health_for_path(path)
++
++    if path.is_some() {
++        return embedding_artifact_health_for_path(path);
++    }
++
++    // Fall back to default bootstrap directory
++    if let Some(default) = default_model_path() {
++        if default.exists() {
++            return embedding_artifact_health_for_path(Some(default));
++        }
++    }
++
++    embedding_artifact_health_for_path(None)
+ }
+ 
+ pub fn onnx_runtime_health() -> OnnxRuntimeHealth {
+@@ -252,28 +264,42 @@ pub fn onnx_runtime_health() -> OnnxRuntimeHealth {
+ }
+ 
+ pub fn tokenizer_health() -> TokenizerHealth {
++    // Env-var path first
+     let path = std::env::var_os(EMBEDDING_TOKENIZER_VOCAB_PATH_ENV)
+         .filter(|path| !path.is_empty())
+         .map(std::path::PathBuf::from);
+-    tokenizer_health_for_path(path)
++
++    if path.is_some() {
++        return tokenizer_health_for_path(path);
++    }
++
++    // Fall back to default bootstrap directory
++    if let Some(home) = home_dir() {
++        let default_vocab = home.join(".identity").join("identity.me").join("models").join("vocab.txt");
++        if default_vocab.exists() {
++            return tokenizer_health_for_path(Some(default_vocab));
++        }
++    }
++
++    tokenizer_health_for_path(None)
+ }
+ 
+ pub fn active_embedding_health() -> ActiveEmbeddingHealth {
+     let requested_runtime = requested_embedding_runtime();
++    let explicit = is_embedding_runtime_explicitly_set();
+ 
+-    if requested_runtime != EMBEDDING_RUNTIME_ONNX {
++    // Explicit hash override: the user asked for hash, honor it.
++    if explicit && requested_runtime == EMBEDDING_RUNTIME_HASH {
+         return ActiveEmbeddingHealth {
+             env_var: EMBEDDING_RUNTIME_ENV,
+             requested_runtime,
+             active_runtime: EMBEDDING_RUNTIME_HASH,
+-            fallback_reason: None,
++            fallback_reason: Some("explicitly set to hash".to_string()),
+         };
+     }
+ 
+-    match run_onnx_embedding_from_env(
+-        "Identity local embedding runtime health probe.",
+-        EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
+-    ) {
++    // Try ONNX: either explicit request or auto-detect
++    match try_onnx_probe() {
+         Ok(_) => ActiveEmbeddingHealth {
+             env_var: EMBEDDING_RUNTIME_ENV,
+             requested_runtime,
+@@ -289,6 +315,12 @@ pub fn active_embedding_health() -> ActiveEmbeddingHealth {
+     }
+ }
+ 
++fn is_embedding_runtime_explicitly_set() -> bool {
++    std::env::var_os(EMBEDDING_RUNTIME_ENV)
++        .map(|val| !val.is_empty())
++        .unwrap_or(false)
++}
++
+ fn requested_embedding_runtime() -> String {
+     std::env::var(EMBEDDING_RUNTIME_ENV)
+         .map(|value| value.trim().to_ascii_lowercase())
+@@ -297,6 +329,108 @@ fn requested_embedding_runtime() -> String {
+         .unwrap_or_else(|| EMBEDDING_RUNTIME_HASH.to_string())
+ }
+ 
++fn default_model_path() -> Option<std::path::PathBuf> {
++    home_dir().map(|h| h.join(".identity").join("identity.me").join("models").join("model.onnx"))
++}
++
++/// Attempts an ONNX embedding probe using configured env vars or default model paths.
++fn try_onnx_probe() -> Result<OnnxEmbeddingRun, std::io::Error> {
++    // 1. Try configured env-var paths
++    let model_path = std::env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV)
++        .filter(|path| !path.is_empty())
++        .map(std::path::PathBuf::from);
++    let vocab_path = std::env::var_os(EMBEDDING_TOKENIZER_VOCAB_PATH_ENV)
++        .filter(|path| !path.is_empty())
++        .map(std::path::PathBuf::from);
++
++    match (model_path, vocab_path) {
++        (Some(model), Some(vocab)) => {
++            return run_onnx_embedding_file(
++                &model, &vocab,
++                "Identity local embedding runtime health probe.",
++                EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
++            );
++        }
++        (Some(_), None) => {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::NotFound,
++                format!("{EMBEDDING_ONNX_MODEL_PATH_ENV} is set but {EMBEDDING_TOKENIZER_VOCAB_PATH_ENV} is not configured"),
++            ));
++        }
++        (None, Some(_)) => {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::NotFound,
++                format!("{EMBEDDING_TOKENIZER_VOCAB_PATH_ENV} is set but {EMBEDDING_ONNX_MODEL_PATH_ENV} is not configured"),
++            ));
++        }
++        (None, None) => {}
++    }
++
++    // 2. No env vars: try default bootstrap model directory
++    let home = home_dir().ok_or_else(|| {
++        std::io::Error::new(std::io::ErrorKind::NotFound,
++            "home directory unavailable; set IDENTITY_EMBEDDING_MODEL_PATH and IDENTITY_TOKENIZER_VOCAB_PATH")
++    })?;
++    let default_model = home.join(".identity").join("identity.me").join("models").join("model.onnx");
++    let default_vocab = home.join(".identity").join("identity.me").join("models").join("vocab.txt");
++
++    if default_model.exists() && default_vocab.exists() {
++        return run_onnx_embedding_file(
++            &default_model, &default_vocab,
++            "Identity local embedding runtime health probe.",
++            EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
++        );
++    }
++
++    Err(std::io::Error::new(std::io::ErrorKind::NotFound,
++        "ONNX embedding model not configured; set IDENTITY_EMBEDDING_MODEL_PATH and IDENTITY_TOKENIZER_VOCAB_PATH, or run embedding-bootstrap"))
++}
++
++fn home_dir() -> Option<std::path::PathBuf> {
++    #[cfg(windows)]
++    {
++        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
++    }
++    #[cfg(not(windows))]
++    {
++        std::env::var_os("HOME").map(std::path::PathBuf::from)
++    }
++}
++
++/// Resolve ONNX model/vocab paths from env vars or default bootstrap directory,
++/// then run embedding. Used at promotion/search time so auto-detected ONNX
++/// engines work without env vars on every invocation.
++fn try_onnx_embed(text: &str) -> Result<OnnxEmbeddingRun, std::io::Error> {
++    // 1. Try configured env-var paths
++    let model_path = std::env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV)
++        .filter(|path| !path.is_empty())
++        .map(std::path::PathBuf::from);
++    let vocab_path = std::env::var_os(EMBEDDING_TOKENIZER_VOCAB_PATH_ENV)
++        .filter(|path| !path.is_empty())
++        .map(std::path::PathBuf::from);
++
++    match (model_path, vocab_path) {
++        (Some(model), Some(vocab)) => {
++            return run_onnx_embedding_file(&model, &vocab, text, EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS);
++        }
++        (Some(_), None) | (None, Some(_)) => { /* fall through to default */ }
++        (None, None) => {}
++    }
++
++    // 2. Try default bootstrap model directory
++    let home = home_dir().ok_or_else(|| {
++        std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
++    })?;
++    let default_model = home.join(".identity").join("identity.me").join("models").join("model.onnx");
++    let default_vocab = home.join(".identity").join("identity.me").join("models").join("vocab.txt");
++
++    if default_model.exists() && default_vocab.exists() {
++        return run_onnx_embedding_file(&default_model, &default_vocab, text, EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS);
++    }
++
++    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "ONNX embedding model not configured"))
++}
++
+ pub fn tokenizer_health_for_vocab_path(path: &std::path::Path) -> TokenizerHealth {
+     tokenizer_health_for_path(Some(path.to_path_buf()))
+ }
+@@ -317,10 +451,7 @@ fn tokenizer_health_for_path(path: Option<std::path::PathBuf>) -> TokenizerHealt
+ 
+     let metadata = std::fs::metadata(&path).ok();
+     let exists = metadata.is_some();
+-    let is_file = metadata
+-        .as_ref()
+-        .map(std::fs::Metadata::is_file)
+-        .unwrap_or(false);
++    let is_file = metadata.as_ref().map(std::fs::Metadata::is_file).unwrap_or(false);
+     let size_bytes = metadata.as_ref().map(std::fs::Metadata::len);
+     let mut token_count = None;
+     let mut status = if !exists {
+@@ -339,7 +470,6 @@ fn tokenizer_health_for_path(path: Option<std::path::PathBuf>) -> TokenizerHealt
+         match load_wordpiece_vocab(&path) {
+             Ok(vocab) => {
+                 token_count = Some(vocab.len());
+-
+                 if !vocab.contains_key("[PAD]")
+                     || !vocab.contains_key("[UNK]")
+                     || !vocab.contains_key("[CLS]")
+@@ -384,7 +514,6 @@ pub fn run_onnx_embedding_file(
+ ) -> Result<OnnxEmbeddingRun, std::io::Error> {
+     if !cfg!(feature = "onnx-runtime") {
+         let _ = (model_path, vocab_path, text, max_tokens);
+-
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::Unsupported,
+             "identityd was built without --features onnx-runtime",
+@@ -392,7 +521,6 @@ pub fn run_onnx_embedding_file(
+     }
+ 
+     let artifact = embedding_artifact_health_for_model_path(model_path);
+-
+     if !artifact.is_ready() {
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::InvalidInput,
+@@ -421,21 +549,17 @@ pub fn run_onnx_embedding_from_env(
+     let model_path = std::env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV)
+         .filter(|path| !path.is_empty())
+         .map(std::path::PathBuf::from)
+-        .ok_or_else(|| {
+-            std::io::Error::new(
+-                std::io::ErrorKind::NotFound,
+-                format!("{EMBEDDING_ONNX_MODEL_PATH_ENV} is not configured"),
+-            )
+-        })?;
++        .ok_or_else(|| std::io::Error::new(
++            std::io::ErrorKind::NotFound,
++            format!("{EMBEDDING_ONNX_MODEL_PATH_ENV} is not configured"),
++        ))?;
+     let vocab_path = std::env::var_os(EMBEDDING_TOKENIZER_VOCAB_PATH_ENV)
+         .filter(|path| !path.is_empty())
+         .map(std::path::PathBuf::from)
+-        .ok_or_else(|| {
+-            std::io::Error::new(
+-                std::io::ErrorKind::NotFound,
+-                format!("{EMBEDDING_TOKENIZER_VOCAB_PATH_ENV} is not configured"),
+-            )
+-        })?;
++        .ok_or_else(|| std::io::Error::new(
++            std::io::ErrorKind::NotFound,
++            format!("{EMBEDDING_TOKENIZER_VOCAB_PATH_ENV} is not configured"),
++        ))?;
+ 
+     run_onnx_embedding_file(&model_path, &vocab_path, text, max_tokens)
+ }
+@@ -458,17 +582,14 @@ fn tokenize_wordpiece_with_vocab(
+ 
+     for token in basic_wordpiece_tokens(text) {
+         let pieces = wordpiece_pieces(&token, vocab, unk_id);
+-
+         for (piece, piece_id) in pieces {
+             if input_ids.len() + 1 >= max_tokens {
+                 truncated = true;
+                 break;
+             }
+-
+             tokens.push(piece);
+             input_ids.push(piece_id);
+         }
+-
+         if truncated {
+             break;
+         }
+@@ -517,14 +638,12 @@ fn run_onnx_embedding_session(
+         .map_err(io_other)?;
+ 
+     let input_names: Vec<&str> = session.inputs().iter().map(|input| input.name()).collect();
+-
+     if !input_names.contains(&"input_ids") {
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::InvalidInput,
+             "ONNX embedding model is missing required input_ids input",
+         ));
+     }
+-
+     if !input_names.contains(&"attention_mask") {
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::InvalidInput,
+@@ -534,10 +653,8 @@ fn run_onnx_embedding_session(
+ 
+     let shape = [1usize, tokenized.input_ids.len()];
+     let input_ids = TensorRef::from_array_view((shape, &*tokenized.input_ids)).map_err(io_other)?;
+-    let attention_mask =
+-        TensorRef::from_array_view((shape, &*tokenized.attention_mask)).map_err(io_other)?;
+-    let token_type_ids =
+-        TensorRef::from_array_view((shape, &*tokenized.token_type_ids)).map_err(io_other)?;
++    let attention_mask = TensorRef::from_array_view((shape, &*tokenized.attention_mask)).map_err(io_other)?;
++    let token_type_ids = TensorRef::from_array_view((shape, &*tokenized.token_type_ids)).map_err(io_other)?;
+ 
+     let outputs = if input_names.contains(&"token_type_ids") {
+         session.run(inputs! {
+@@ -581,7 +698,6 @@ fn run_onnx_embedding_session(
+     tokenized: TokenizedInput,
+ ) -> Result<OnnxEmbeddingRun, std::io::Error> {
+     let _ = (model_path, vocab_path, tokenized);
+-
+     Err(std::io::Error::new(
+         std::io::ErrorKind::Unsupported,
+         "identityd was built without --features onnx-runtime",
+@@ -618,7 +734,6 @@ pub fn pool_output_to_embedding(
+     }
+ 
+     normalize(&mut embedding);
+-
+     Ok((embedding, rows))
+ }
+ 
+@@ -629,7 +744,6 @@ fn validate_token_limit(max_tokens: usize) -> Result<(), std::io::Error> {
+             "token limit must be in 4..=512",
+         ));
+     }
+-
+     Ok(())
+ }
+ 
+@@ -649,14 +763,12 @@ fn load_wordpiece_vocab(
+     path: &std::path::Path,
+ ) -> Result<std::collections::HashMap<String, i64>, std::io::Error> {
+     let metadata = std::fs::metadata(path)?;
+-
+     if !metadata.is_file() {
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::InvalidInput,
+             "tokenizer vocab path is not a file",
+         ));
+     }
+-
+     if metadata.len() == 0 || metadata.len() > EMBEDDING_TOKENIZER_VOCAB_MAX_BYTES {
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::InvalidInput,
+@@ -666,14 +778,11 @@ fn load_wordpiece_vocab(
+ 
+     let content = std::fs::read_to_string(path)?;
+     let mut vocab = std::collections::HashMap::new();
+-
+     for (index, line) in content.lines().enumerate() {
+         let token = line.trim();
+-
+         if token.is_empty() {
+             continue;
+         }
+-
+         vocab.entry(token.to_string()).or_insert(index as i64);
+     }
+ 
+@@ -683,7 +792,6 @@ fn load_wordpiece_vocab(
+             "tokenizer vocab contains no tokens",
+         ));
+     }
+-
+     Ok(vocab)
+ }
+ 
+@@ -698,17 +806,14 @@ fn basic_wordpiece_tokens(text: &str) -> Vec<String> {
+             if !current.is_empty() {
+                 tokens.push(std::mem::take(&mut current));
+             }
+-
+             if is_wordpiece_punctuation(character) {
+                 tokens.push(character.to_string());
+             }
+         }
+     }
+-
+     if !current.is_empty() {
+         tokens.push(current);
+     }
+-
+     tokens
+ }
+ 
+@@ -737,7 +842,6 @@ fn wordpiece_pieces(
+                 match_piece = Some((candidate, *piece_id));
+                 break;
+             }
+-
+             end -= 1;
+         }
+ 
+@@ -748,7 +852,6 @@ fn wordpiece_pieces(
+         pieces.push(piece);
+         start = end;
+     }
+-
+     pieces
+ }
+ 
+@@ -844,10 +947,7 @@ fn load_onnx_session(
+         let mut builder = builder
+             .with_inter_threads(1)
+             .map_err(|error| error.to_string())?;
+-
+-        builder
+-            .commit_from_file(path)
+-            .map_err(|error| error.to_string())
++        builder.commit_from_file(path).map_err(|error| error.to_string())
+     })();
+ 
+     match session {
+@@ -860,14 +960,8 @@ fn load_onnx_session(
+             load_ms: Some(started.elapsed().as_millis()),
+             input_count: Some(session.inputs().len()),
+             output_count: Some(session.outputs().len()),
+-            first_input: session
+-                .inputs()
+-                .first()
+-                .map(|input| input.name().to_string()),
+-            first_output: session
+-                .outputs()
+-                .first()
+-                .map(|output| output.name().to_string()),
++            first_input: session.inputs().first().map(|input| input.name().to_string()),
++            first_output: session.outputs().first().map(|output| output.name().to_string()),
+         },
+         Err(error) => OnnxRuntimeHealth {
+             feature_enabled: true,
+@@ -911,54 +1005,33 @@ pub fn write_embedding_manifest(
+ ) -> Result<std::path::PathBuf, std::io::Error> {
+     let model_id = model_id.trim();
+     if model_id.is_empty() {
+-        return Err(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "embedding model id must not be empty",
+-        ));
++        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model id must not be empty"));
+     }
+-
+     if model_id.len() > EMBEDDING_MANIFEST_MODEL_ID_MAX_BYTES {
+-        return Err(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "embedding model id is too long",
+-        ));
++        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model id is too long"));
+     }
+ 
+     let metadata = std::fs::metadata(model_path)?;
+-
+     if !metadata.is_file() {
+-        return Err(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "embedding model path is not a file",
+-        ));
++        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model path is not a file"));
+     }
+-
+     let has_onnx_extension = model_path
+         .extension()
+         .and_then(|extension| extension.to_str())
+         .map(|extension| extension.eq_ignore_ascii_case("onnx"))
+         .unwrap_or(false);
+-
+     if !has_onnx_extension {
+-        return Err(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "embedding model path must have .onnx extension",
+-        ));
++        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
++            "embedding model path must have .onnx extension"));
+     }
+-
+     if metadata.len() == 0 {
+-        return Err(std::io::Error::new(
+-            std::io::ErrorKind::InvalidInput,
+-            "embedding model file is empty",
+-        ));
++        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model file is empty"));
+     }
+ 
+     let manifest_path = embedding_manifest_path(model_path);
+     if manifest_path.exists() && !overwrite {
+-        return Err(std::io::Error::new(
+-            std::io::ErrorKind::AlreadyExists,
+-            "embedding manifest already exists; pass --force to overwrite it",
+-        ));
++        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists,
++            "embedding manifest already exists; pass --force to overwrite it"));
+     }
+ 
+     let manifest = format!(
+@@ -966,14 +1039,11 @@ pub fn write_embedding_manifest(
+         json_escape(model_id),
+         EMBEDDING_DIM
+     );
+-
+     std::fs::write(&manifest_path, manifest)?;
+     Ok(manifest_path)
+ }
+ 
+-pub fn embedding_artifact_health_for_model_path(
+-    model_path: &std::path::Path,
+-) -> EmbeddingArtifactHealth {
++pub fn embedding_artifact_health_for_model_path(model_path: &std::path::Path) -> EmbeddingArtifactHealth {
+     embedding_artifact_health_for_path(Some(model_path.to_path_buf()))
+ }
+ 
+@@ -998,10 +1068,7 @@ fn embedding_artifact_health_for_path(path: Option<std::path::PathBuf>) -> Embed
+ 
+     let metadata = std::fs::metadata(&path).ok();
+     let exists = metadata.is_some();
+-    let is_file = metadata
+-        .as_ref()
+-        .map(std::fs::Metadata::is_file)
+-        .unwrap_or(false);
++    let is_file = metadata.as_ref().map(std::fs::Metadata::is_file).unwrap_or(false);
+     let has_onnx_extension = path
+         .extension()
+         .and_then(|extension| extension.to_str())
+@@ -1029,7 +1096,6 @@ fn embedding_artifact_health_for_path(path: Option<std::path::PathBuf>) -> Embed
+     if status == "ready" {
+         let path = embedding_manifest_path(&path);
+         manifest_path = Some(path.to_string_lossy().into_owned());
+-
+         match read_embedding_manifest(&path) {
+             ManifestRead::Missing => {
+                 status = "manifest-missing";
+@@ -1053,7 +1119,6 @@ fn embedding_artifact_health_for_path(path: Option<std::path::PathBuf>) -> Embed
+                 manifest_size_bytes = Some(manifest.size_bytes);
+                 manifest_model_id = manifest.model_id;
+                 manifest_embedding_dim = manifest.embedding_dim;
+-
+                 if manifest_embedding_dim != Some(EMBEDDING_DIM) {
+                     status = "dimension-mismatch";
+                 }
+@@ -1092,7 +1157,7 @@ enum ManifestRead {
+     Ready(EmbeddingManifest),
+ }
+ 
+-fn embedding_manifest_path(model_path: &std::path::Path) -> std::path::PathBuf {
++pub fn embedding_manifest_path(model_path: &std::path::Path) -> std::path::PathBuf {
+     let mut path = model_path.as_os_str().to_os_string();
+     path.push(EMBEDDING_MANIFEST_SUFFIX);
+     std::path::PathBuf::from(path)
+@@ -1102,27 +1167,21 @@ fn read_embedding_manifest(path: &std::path::Path) -> ManifestRead {
+     let Ok(metadata) = std::fs::metadata(path) else {
+         return ManifestRead::Missing;
+     };
+-
+     if !metadata.is_file() {
+         return ManifestRead::Invalid(metadata.len());
+     }
+-
+     let size_bytes = metadata.len();
+     if size_bytes > EMBEDDING_MANIFEST_MAX_BYTES {
+         return ManifestRead::TooLarge(size_bytes);
+     }
+-
+     let Ok(content) = std::fs::read_to_string(path) else {
+         return ManifestRead::Unreadable;
+     };
+-
+     let model_id = json_string_field(&content, "model_id");
+     let embedding_dim = json_usize_field(&content, "embedding_dim");
+-
+     if embedding_dim.is_none() {
+         return ManifestRead::Invalid(size_bytes);
+     }
+-
+     ManifestRead::Ready(EmbeddingManifest {
+         size_bytes,
+         model_id,
+@@ -1134,7 +1193,6 @@ fn json_string_field(content: &str, key: &str) -> Option<String> {
+     let value = json_field_value(content, key)?.trim_start();
+     let mut characters = value.strip_prefix('"')?.chars();
+     let mut output = String::new();
+-
+     while let Some(character) = characters.next() {
+         match character {
+             '"' => return Some(output),
+@@ -1149,7 +1207,6 @@ fn json_string_field(content: &str, key: &str) -> Option<String> {
+             value => output.push(value),
+         }
+     }
+-
+     None
+ }
+ 
+@@ -1158,11 +1215,9 @@ fn json_usize_field(content: &str, key: &str) -> Option<usize> {
+     let end = value
+         .find(|character: char| !character.is_ascii_digit())
+         .unwrap_or(value.len());
+-
+     if end == 0 {
+         return None;
+     }
+-
+     value[..end].parse::<usize>().ok()
+ }
+ 
+@@ -1174,7 +1229,6 @@ fn json_field_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+ 
+ fn json_escape(input: &str) -> String {
+     let mut escaped = String::with_capacity(input.len());
+-
+     for character in input.chars() {
+         match character {
+             '\\' => escaped.push_str("\\\\"),
+@@ -1185,7 +1239,6 @@ fn json_escape(input: &str) -> String {
+             value => escaped.push(value),
+         }
+     }
+-
+     escaped
+ }
+ 
+@@ -1194,14 +1247,12 @@ fn bounded_status(prefix: &str, detail: &str) -> String {
+     let mut status = String::with_capacity(prefix.len() + 1 + detail.len().min(180));
+     status.push_str(prefix);
+     status.push(':');
+-
+     for character in detail.chars().take(180) {
+         match character {
+             '\r' | '\n' | '\t' => status.push(' '),
+             value => status.push(value),
+         }
+     }
+-
+     status
+ }
+ 
+@@ -1212,14 +1263,12 @@ fn io_other(error: impl std::fmt::Display) -> std::io::Error {
+ 
+ pub fn embed_text(input: &str) -> [f32; EMBEDDING_DIM] {
+     let mut vector = [0.0; EMBEDDING_DIM];
+-
+     for token in tokens(input) {
+         let hash = stable_hash(token.as_bytes());
+         let index = (hash as usize) % EMBEDDING_DIM;
+         let sign = if hash & 1 == 0 { 1.0 } else { -1.0 };
+         vector[index] += sign;
+     }
+-
+     normalize(&mut vector);
+     vector
+ }
+@@ -1227,7 +1276,6 @@ pub fn embed_text(input: &str) -> [f32; EMBEDDING_DIM] {
+ pub fn probe_embedding_latency(input: &str) -> EmbeddingProbe {
+     let started = std::time::Instant::now();
+     let _embedding = embed_text(input);
+-
+     EmbeddingProbe {
+         model_id: EMBEDDING_MODEL_ID,
+         dimension: EMBEDDING_DIM,
+@@ -1237,11 +1285,9 @@ pub fn probe_embedding_latency(input: &str) -> EmbeddingProbe {
+ 
+ pub fn to_le_bytes(vector: &[f32; EMBEDDING_DIM]) -> Vec<u8> {
+     let mut bytes = Vec::with_capacity(EMBEDDING_DIM * std::mem::size_of::<f32>());
+-
+     for value in vector {
+         bytes.extend_from_slice(&value.to_le_bytes());
+     }
+-
+     bytes
+ }
+ 
+@@ -1249,13 +1295,10 @@ pub fn from_le_bytes(bytes: &[u8]) -> Option<[f32; EMBEDDING_DIM]> {
+     if bytes.len() != EMBEDDING_DIM * std::mem::size_of::<f32>() {
+         return None;
+     }
+-
+     let mut vector = [0.0; EMBEDDING_DIM];
+-
+     for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+         vector[index] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+     }
+-
+     Some(vector)
+ }
+ 
+@@ -1276,11 +1319,9 @@ fn tokens(input: &str) -> impl Iterator<Item = &str> {
+ 
+ fn normalize(vector: &mut [f32; EMBEDDING_DIM]) {
+     let magnitude = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+-
+     if magnitude == 0.0 {
+         return;
+     }
+-
+     for value in vector {
+         *value /= magnitude;
+     }
+@@ -1289,12 +1330,10 @@ fn normalize(vector: &mut [f32; EMBEDDING_DIM]) {
+ #[inline]
+ fn stable_hash(bytes: &[u8]) -> u64 {
+     let mut hash = 0xcbf29ce484222325u64;
+-
+     for byte in bytes {
+         hash ^= u64::from(byte.to_ascii_lowercase());
+         hash = hash.wrapping_mul(0x100000001b3);
+     }
+-
+     hash
+ }
+ 
+@@ -1316,7 +1355,6 @@ mod tests {
+         let embedding = embed_text("local private memory");
+         let bytes = to_le_bytes(&embedding);
+         let decoded = from_le_bytes(&bytes).unwrap();
+-
+         assert_eq!(bytes.len(), EMBEDDING_DIM * 4);
+         assert_eq!(embedding, decoded);
+     }
+@@ -1326,14 +1364,12 @@ mod tests {
+         let query = embed_text("private memory");
+         let related = embed_text("local private memory belongs on device");
+         let unrelated = embed_text("weather forecast tomorrow");
+-
+         assert!(cosine_similarity(&query, &related) > cosine_similarity(&query, &unrelated));
+     }
+ 
+     #[test]
+     fn embedding_probe_reports_model_dimension_and_latency() {
+         let probe = probe_embedding_latency("Identity maps local context into private memory.");
+-
+         assert_eq!(probe.model_id, EMBEDDING_MODEL_ID);
+         assert_eq!(probe.dimension, EMBEDDING_DIM);
+         assert!(probe.latency_ms < EMBEDDING_LATENCY_TARGET_MS);
+@@ -1343,7 +1379,6 @@ mod tests {
+     fn embedding_engine_reports_runtime_boundary_metadata() {
+         let engine = EmbeddingEngine::new();
+         let info = engine.runtime_info();
+-
+         assert_eq!(info.model_id, EMBEDDING_MODEL_ID);
+         assert_eq!(info.dimension, EMBEDDING_DIM);
+         assert_eq!(info.runtime_kind, EMBEDDING_RUNTIME_KIND);
+@@ -1356,7 +1391,6 @@ mod tests {
+     #[test]
+     fn embedding_artifact_health_reports_not_configured() {
+         let health = embedding_artifact_health_for_path(None);
+-
+         assert_eq!(health.status, "not-configured");
+         assert!(!health.is_ready());
+         assert!(!health.configured);
+@@ -1367,7 +1401,6 @@ mod tests {
+     fn onnx_runtime_health_is_feature_gated_by_default() {
+         let artifact = embedding_artifact_health_for_path(None);
+         let health = onnx_runtime_health_for_artifact(&artifact);
+-
+         assert!(!health.feature_enabled);
+         assert_eq!(health.artifact_status, "not-configured");
+         assert_eq!(health.session_status, "feature-disabled");
+@@ -1381,7 +1414,6 @@ mod tests {
+     fn onnx_runtime_health_reports_feature_enabled_without_artifact() {
+         let artifact = embedding_artifact_health_for_path(None);
+         let health = onnx_runtime_health_for_artifact(&artifact);
+-
+         assert!(health.feature_enabled);
+         assert_eq!(health.artifact_status, "not-configured");
+         assert_eq!(health.session_status, "artifact-not-ready");
+@@ -1396,13 +1428,10 @@ mod tests {
+         fs::create_dir_all(&root).unwrap();
+         let vocab = root.join("vocab.txt");
+         fs::write(&vocab, "[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\nworld\n##s\n!\n").unwrap();
+-
+         let health = tokenizer_health_for_vocab_path(&vocab);
+-
+         assert_eq!(health.status, "ready");
+         assert_eq!(health.token_count, Some(8));
+         assert!(health.configured);
+-
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
+@@ -1411,23 +1440,13 @@ mod tests {
+         let root = temp_test_dir("identity-tokenizer-tokenize-test");
+         fs::create_dir_all(&root).unwrap();
+         let vocab = root.join("vocab.txt");
+-        fs::write(
+-            &vocab,
+-            "[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\nworld\n##s\n!\nprivate\n",
+-        )
+-        .unwrap();
+-
++        fs::write(&vocab, "[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\nworld\n##s\n!\nprivate\n").unwrap();
+         let tokenized = tokenize_wordpiece_file(&vocab, "Hello worlds! private", 10).unwrap();
+-
+-        assert_eq!(
+-            tokenized.tokens,
+-            vec!["[CLS]", "hello", "world", "##s", "!", "private", "[SEP]"]
+-        );
++        assert_eq!(tokenized.tokens, vec!["[CLS]", "hello", "world", "##s", "!", "private", "[SEP]"]);
+         assert_eq!(tokenized.input_ids, vec![2, 4, 5, 6, 7, 8, 3, 0, 0, 0]);
+         assert_eq!(tokenized.attention_mask, vec![1, 1, 1, 1, 1, 1, 1, 0, 0, 0]);
+         assert_eq!(tokenized.token_type_ids, vec![0; 10]);
+         assert!(!tokenized.truncated);
+-
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
+@@ -1437,15 +1456,12 @@ mod tests {
+         fs::create_dir_all(&root).unwrap();
+         let vocab = root.join("vocab.txt");
+         fs::write(&vocab, "[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\n").unwrap();
+-
+         let tokenized = tokenize_wordpiece_file(&vocab, "hello impossible hello", 4).unwrap();
+-
+         assert_eq!(tokenized.tokens, vec!["[CLS]", "hello", "[UNK]", "[SEP]"]);
+         assert_eq!(tokenized.input_ids, vec![2, 4, 1, 3]);
+         assert_eq!(tokenized.attention_mask, vec![1, 1, 1, 1]);
+         assert!(tokenized.truncated);
+         assert!(tokenize_wordpiece_file(&vocab, "hello", 3).is_err());
+-
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
+@@ -1454,9 +1470,7 @@ mod tests {
+         let mut output = vec![0.0; EMBEDDING_DIM * 2];
+         output[0] = 1.0;
+         output[EMBEDDING_DIM] = 1.0;
+-
+         let (embedding, rows) = super::pool_output_to_embedding(&output).unwrap();
+-
+         assert_eq!(rows, 2);
+         assert_eq!(embedding[0], 1.0);
+         assert!(embedding[1..].iter().all(|value| *value == 0.0));
+@@ -1467,23 +1481,14 @@ mod tests {
+     fn embedding_artifact_health_validates_configured_model_path() {
+         let root = std::env::temp_dir().join(format!(
+             "identity-embedding-artifact-test-{}",
+-            SystemTime::now()
+-                .duration_since(UNIX_EPOCH)
+-                .unwrap()
+-                .as_nanos()
++            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+         ));
+         fs::create_dir_all(&root).unwrap();
+         let valid = root.join("model.onnx");
+         let wrong_extension = root.join("model.bin");
+         fs::write(&valid, [1_u8, 2, 3, 4]).unwrap();
+-        fs::write(
+-            embedding_manifest_path(&valid),
+-            format!(
+-                r#"{{"model_id":"test-minilm","embedding_dim":{}}}"#,
+-                EMBEDDING_DIM
+-            ),
+-        )
+-        .unwrap();
++        fs::write(&embedding_manifest_path(&valid),
++            format!(r#"{{"model_id":"test-minilm","embedding_dim":{}}}"#, EMBEDDING_DIM)).unwrap();
+         fs::write(&wrong_extension, [1_u8]).unwrap();
+         let empty = root.join("empty.onnx");
+         fs::write(&empty, []).unwrap();
+@@ -1491,11 +1496,8 @@ mod tests {
+         fs::write(&no_manifest, [1_u8]).unwrap();
+         let wrong_dimension = root.join("wrong-dim.onnx");
+         fs::write(&wrong_dimension, [1_u8]).unwrap();
+-        fs::write(
+-            embedding_manifest_path(&wrong_dimension),
+-            r#"{"model_id":"wrong-dim","embedding_dim":768}"#,
+-        )
+-        .unwrap();
++        fs::write(&embedding_manifest_path(&wrong_dimension),
++            r#"{"model_id":"wrong-dim","embedding_dim":768}"#).unwrap();
+ 
+         let ready = embedding_artifact_health_for_path(Some(valid.clone()));
+         let wrong = embedding_artifact_health_for_path(Some(wrong_extension));
+@@ -1532,11 +1534,9 @@ mod tests {
+         fs::create_dir_all(&root).unwrap();
+         let model = root.join("model.onnx");
+         fs::write(&model, [1_u8, 2, 3, 4]).unwrap();
+-
+         let manifest_path = write_embedding_manifest(&model, "mini\"lm", false).unwrap();
+         let manifest = fs::read_to_string(&manifest_path).unwrap();
+         let health = embedding_artifact_health_for_path(Some(model));
+-
+         assert!(manifest.contains(r#""model_id": "mini\"lm""#));
+         assert!(manifest.contains(r#""embedding_dim": 384"#));
+         assert_eq!(health.status, "ready");
+@@ -1544,7 +1544,6 @@ mod tests {
+         assert_eq!(health.manifest_embedding_dim, Some(EMBEDDING_DIM));
+         assert!(write_embedding_manifest(&root.join("model.onnx"), "other", false).is_err());
+         assert!(write_embedding_manifest(&root.join("model.onnx"), "other", true).is_ok());
+-
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
+@@ -1556,22 +1555,17 @@ mod tests {
+         let wrong = root.join("model.bin");
+         fs::write(&empty, []).unwrap();
+         fs::write(&wrong, [1_u8]).unwrap();
+-
+         assert!(write_embedding_manifest(&root, "dir", false).is_err());
+         assert!(write_embedding_manifest(&empty, "empty", false).is_err());
+         assert!(write_embedding_manifest(&wrong, "wrong", false).is_err());
+         assert!(write_embedding_manifest(&wrong, "", false).is_err());
+-
+         fs::remove_dir_all(root).unwrap();
+     }
+ 
+     fn temp_test_dir(prefix: &str) -> std::path::PathBuf {
+         std::env::temp_dir().join(format!(
+             "{prefix}-{}",
+-            SystemTime::now()
+-                .duration_since(UNIX_EPOCH)
+-                .unwrap()
+-                .as_nanos()
++            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+         ))
+     }
+ }
+diff --git a/crates/identityd/src/filesystem.rs b/crates/identityd/src/filesystem.rs
+index 476af05..1f9a9a2 100644
+--- a/crates/identityd/src/filesystem.rs
++++ b/crates/identityd/src/filesystem.rs
+@@ -569,6 +569,11 @@ fn ingest_file_if_text(
+         return Ok(());
+     }
+ 
++    // Check first 512 bytes for null bytes — strong binary indicator
++    if has_null_bytes(path)? {
++        return Ok(());
++    }
++
+     let Some(content) = read_text_with_short_retry(path)? else {
+         return Ok(());
+     };
+@@ -604,7 +609,12 @@ fn read_text_with_short_retry(path: &Path) -> Result<Option<String>, FileWatchEr
+             Err(error) if is_transient_file_lock(&error) => {
+                 return Ok(None);
+             }
+-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
++            Err(error)
++                if error.kind() == ErrorKind::NotFound
++                    || error.kind() == ErrorKind::InvalidData =>
++            {
++                return Ok(None)
++            }
+             Err(error) => return Err(error.into()),
+         }
+     }
+@@ -640,6 +650,19 @@ pub fn is_supported_text_path(path: &Path) -> bool {
+             | "js"
+             | "jsx"
+             | "py"
++            | "json"
++            | "csv"
++            | "sql"
++            | "css"
++            | "xml"
++            | "yaml"
++            | "yml"
++            | "sh"
++            | "bat"
++            | "ps1"
++            | "conf"
++            | "cfg"
++            | "ini"
+     )
+ }
+ 
+@@ -699,6 +722,21 @@ fn stable_hash(bytes: &[u8]) -> u64 {
+     hash
+ }
+ 
++/// Returns `true` if the first 512 bytes of a file contain null bytes,
++/// which strongly indicates binary content that should not be ingested.
++fn has_null_bytes(path: &Path) -> Result<bool, FileWatchError> {
++    let mut file = match fs::File::open(path) {
++        Ok(f) => f,
++        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
++        Err(error) => return Err(error.into()),
++    };
++
++    let mut buf = [0u8; 512];
++    use std::io::Read;
++    let n = file.read(&mut buf).unwrap_or(0);
++    Ok(buf[..n].contains(&0))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::{ensure_safe_watch_root, filesystem_watch_policy_health, is_supported_text_path};
+@@ -711,8 +749,10 @@ mod tests {
+         assert!(is_supported_text_path(Path::new("notes.MD")));
+         assert!(is_supported_text_path(Path::new("page.HTML")));
+         assert!(is_supported_text_path(Path::new("lib.rs")));
+-        assert!(!is_supported_text_path(Path::new("data.json")));
+-        assert!(!is_supported_text_path(Path::new("query.sql")));
++        assert!(is_supported_text_path(Path::new("config.YAML")));
++        assert!(is_supported_text_path(Path::new("data.JSON")));
++        assert!(is_supported_text_path(Path::new("query.SQL")));
++        assert!(is_supported_text_path(Path::new("script.PS1")));
+         assert!(!is_supported_text_path(Path::new("events.log")));
+         assert!(!is_supported_text_path(Path::new("photo.png")));
+         assert!(!is_supported_text_path(Path::new("no-extension")));
+diff --git a/crates/identityd/src/lib.rs b/crates/identityd/src/lib.rs
+index 7aaed7e..b648aab 100644
+--- a/crates/identityd/src/lib.rs
++++ b/crates/identityd/src/lib.rs
+@@ -1,4 +1,5 @@
+ pub mod activity;
++pub mod bootstrap;
+ pub mod capture;
+ pub mod crypto;
+ pub mod embedding;
+diff --git a/crates/identityd/src/main.rs b/crates/identityd/src/main.rs
+index 9f22a6b..8f185b6 100644
+--- a/crates/identityd/src/main.rs
++++ b/crates/identityd/src/main.rs
+@@ -1,6 +1,7 @@
+ use identityd::activity::{
+     capture_active_window_once, watch_active_window_until_shutdown, DEFAULT_ACTIVITY_POLL_MS,
+ };
++use identityd::bootstrap::{bootstrap_onnx_artifact, print_bootstrap_guidance};
+ use identityd::capture::capture_adapter_health;
+ use identityd::crypto::protection_backend;
+ use identityd::embedding::{
+@@ -775,11 +776,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
+                 "embedding_artifact_manifest_exists={}",
+                 artifact.manifest_exists
+             );
+-            println!(
++                        println!(
+                 "embedding_artifact_manifest_embedding_dim={}",
+                 optional_usize(artifact.manifest_embedding_dim)
+             );
+         }
++        "embedding-bootstrap" => {
++            let model_dir = read_flag(&raw_args, "--model-dir")
++                .map(PathBuf::from)
++                .unwrap_or_else(|| paths.identity_dir.join("models"));
++            let result = bootstrap_onnx_artifact(&model_dir)?;
++
++            print_bootstrap_guidance(&result);
++        }
+         "memory-export" => {
+             let limit = read_flag(&raw_args, "--limit")
+                 .map(|value| value.parse::<u32>())
+@@ -1242,7 +1251,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
+ 
+ fn print_help() {
+     println!(
+-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
++        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
+     );
+ }
+ 
+@@ -1274,17 +1283,17 @@ fn phase1_embedding_artifact_status(
+ 
+ fn phase1_remaining_summary(embedding_artifact_ready: bool) -> &'static str {
+     if embedding_artifact_ready {
+-        "final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
++        "final ONNX/ort embedding runtime (dll + feature flag); default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+     } else {
+-        "valid local ONNX embedding artifact; final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
++        "valid local ONNX embedding artifact (run embedding-bootstrap); final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+     }
+ }
+ 
+ fn phase1_next_milestone(embedding_artifact_ready: bool) -> &'static str {
+     if embedding_artifact_ready {
+-        "wire final local ONNX/ort embedding runtime behind embedding.rs"
++        "download onnxruntime.dll, set ORT_DYLIB_PATH, and build with --features onnx-runtime (auto-detected when model is present)"
+     } else {
+-        "configure valid local ONNX embedding artifact and .identity.json manifest"
++        "run `identityd embedding-bootstrap` to download the local ONNX model and vocabulary"
+     }
+ }
+ 
+@@ -1309,8 +1318,19 @@ async fn run_pipeline_loop(
+     interval_ms: u64,
+ ) -> Result<(), Box<dyn Error>> {
+     loop {
+-        let summary = pipeline_once_if_idle(&paths, process_limit, promote_limit, idle_ms)?;
+-        print_pipeline_summary("pipeline cycle", &summary);
++        match pipeline_once_if_idle(&paths, process_limit, promote_limit, idle_ms) {
++            Ok(summary) => {
++                if !summary.processed.skipped_idle_gate {
++                    print_pipeline_summary("pipeline cycle", &summary);
++                }
++            }
++            Err(error) => {
++                eprintln!(
++                    "pipeline cycle error (will retry after {}ms): {error}",
++                    interval_ms
++                );
++            }
++        }
+         sleep(Duration::from_millis(interval_ms)).await;
+     }
+ }
+@@ -1597,10 +1617,10 @@ mod tests {
+         );
+         assert_eq!(phase1_embedding_artifact_status(false, "empty"), "empty");
+         assert_eq!(phase1_embedding_artifact_status(true, "ready"), "ready");
+-        assert!(phase1_remaining_summary(false).starts_with("valid local ONNX"));
++                assert!(phase1_remaining_summary(false).starts_with("valid local ONNX"));
+         assert!(phase1_remaining_summary(true).starts_with("final ONNX"));
+-        assert!(phase1_next_milestone(false).starts_with("configure valid local ONNX"));
+-        assert!(phase1_next_milestone(true).starts_with("wire final local ONNX"));
++        assert!(phase1_next_milestone(false).starts_with("run "));
++        assert!(phase1_next_milestone(true).starts_with("download"));
+     }
+ 
+     #[test]
+diff --git a/crates/identityd/src/processor.rs b/crates/identityd/src/processor.rs
+index d983ac6..5c78cf0 100644
+--- a/crates/identityd/src/processor.rs
++++ b/crates/identityd/src/processor.rs
+@@ -4,6 +4,7 @@ use crate::transit::{TransitBuffer, TransitError};
+ use crate::workspace::IdentityPaths;
+ use std::fmt;
+ use std::time::Duration;
++use unicode_normalization::UnicodeNormalization;
+ 
+ #[derive(Debug)]
+ pub struct ProcessSummary {
+@@ -166,12 +167,17 @@ pub fn pipeline_once_if_idle(
+ 
+ #[inline]
+ fn clean_for_next_stage(content: &str) -> Option<String> {
+-    let cleaned = content.split_whitespace().collect::<Vec<_>>().join(" ");
+-
+-    if cleaned.is_empty() {
++    let normalized: String = content
++        .chars()
++        .map(|c| if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c })
++        .collect();
++    let cleaned: String = normalized.nfkc().collect::<String>();
++    let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
++
++    if compact.is_empty() {
+         None
+     } else {
+-        Some(cleaned)
++        Some(compact)
+     }
+ }
+ 
+diff --git a/docs/system-map.md b/docs/system-map.md
+index 91a3e47..e075274 100644
+--- a/docs/system-map.md
++++ b/docs/system-map.md
+@@ -53,7 +53,7 @@ flowchart TD
+     CLI -->|"cleaned-list"| Cleaned
+     CLI -->|"memory-list"| Memory
+     CLI -->|"memory-stats / memory-export / memory-protocol-health / repair-protocol-schema / repair-memory-vectors"| Memory
+-    CLI -->|"embedding-runtime-health / embedding-active-health / onnx-runtime-health / embedding-tokenizer-health / embedding-tokenize / embedding-onnx-run / embedding-manifest-write"| EmbedProto
++    CLI -->|"embedding-runtime-health / embedding-active-health / onnx-runtime-health / embedding-tokenizer-health / embedding-tokenize / embedding-onnx-run / embedding-manifest-write / embedding-bootstrap"| EmbedProto
+     CLI -->|"memory-search"| Memory
+     CLI -->|"memory-edge-* / memory-graph-health"| MemoryGraph
+     CLI -->|"slice-preview / prompt-package"| Slice
+@@ -75,7 +75,7 @@ flowchart TD
+     Crypto -->|"protected capture text\n+ source labels"| Transit
+     Processor -->|"claim queued"| Transit
+     Idle -->|"allows processing only after idle threshold"| Processor
+-    Processor -->|"protect cleaned output\n+ mark processed"| Cleaned
++    Processor -->|"Unicode NFKC normalize + strip control chars\n+ mark processed"| Cleaned
+     Processor -->|"mark failed"| Transit
+     Processor -->|"decrypt local cleaned text\nthen embed"| EmbedProto
+     EmbedProto -->|"WordPiece token tensors"| Tokenizer
+@@ -148,6 +148,7 @@ flowchart TD
+ | `Resource Budget Probe` | Resource guard | Implemented | `crates/identityd/src/resource.rs`, `crates/identityd/src/main.rs` | Reports current process working-set/pagefile memory on Windows, binary size, and budget status through `doctor` without adding a measurement dependency. |
+ | `Ingest Safety Filter` | Privacy guard | Implemented | `crates/identityd/src/ingest_safety.rs` | Enforces a universal 1MB capture-content budget and 2048-byte source-label budget, then blocks secret-bearing paths, SSH/AWS/Azure/GPG config roots, private keys, credential markers, known secret token prefixes, card-like numbers including spaced/dashed variants, bank-routing markers, and precise-location markers before SQLite persistence. |
+ | `Local Content Protection` | Privacy guard | Implemented on Windows | `crates/identityd/src/crypto.rs`, `crates/identityd/src/transit.rs`, `crates/identityd/src/identity.rs`, `crates/identityd/src/main.rs` | Protects captured text, source labels, cleaned staging text, and prototype `.me` semantic text fields before SQLite persistence. On Windows this uses the local user's DPAPI boundary; legacy plaintext rows remain readable for development migration compatibility. `doctor` reports legacy plaintext field counts and `protect-at-rest` migrates them locally. Cross-platform OS-backed backends remain future hardening work. |
++| `ONNX Artifact Bootstrap` | Bootstrap tool | Implemented | `crates/identityd/src/bootstrap.rs` | Downloads the all-MiniLM-L6-v2 ONNX model and WordPiece vocabulary from Hugging Face using the system `curl.exe`, writes the adjacent `.identity.json` manifest, and prints environment variable configuration guidance. Requires no additional Rust dependencies. |
+ | `Local Embedding Prototype` | Compute stage | Implemented prototype with explicit runtime boundary | `crates/identityd/src/embedding.rs` | Generates deterministic local 384-dimensional embeddings for promoted cleaned text, exposes model/runtime metadata, preflights a configured `IDENTITY_EMBEDDING_MODEL_PATH` for local `.onnx` artifact existence/type/size plus an adjacent `<model>.onnx.identity.json` manifest with the expected embedding dimension, can write that sidecar through `embedding-manifest-write`, can validate and run local WordPiece tokenization through `embedding-tokenizer-health` and `embedding-tokenize`, can attempt a read-only ONNX Runtime session load through `onnx-runtime-health`, can execute an explicit local ONNX embedding smoke path through `embedding-onnx-run` when built with `--features onnx-runtime`, and reports local embedding latency against the 200ms map-stage budget through `doctor`. The live `EmbeddingEngine` now selects a stable runtime/model id at store-open time: hash remains default, `IDENTITY_EMBEDDING_RUNTIME=onnx` may select the manifest model id when the local runtime is healthy, and unavailable ONNX falls back to hash. |
+ | `Identity Memory Store` | Local store | Implemented prototype | `crates/identityd/src/identity.rs` | Stores local `.me` memory nodes plus fixed-width vector blobs in `identity.me/state.db`; assigns each node a stable UUIDv4-style `node_uid`, UTC ISO8601 `created_at_utc`, and UTC ISO8601 `last_accessed_utc` while keeping compact SQLite row ids and millisecond timestamps for local joins and ordering; updates last-access metadata when retrieval returns a node; exports recent nodes as local protocol-shaped JSON using `node_uid` and target edge `node_uid` values rather than internal row ids; validates protocol-facing UUIDs, UTC timestamps, object-shaped structured attributes, and active vector dimensions through `doctor` and `memory-protocol-health`; repairs bounded protocol-field drift through `repair-protocol-schema`; now separates memory-domain derivation from the concrete SQLite persistence backend and routes vector encode/decode/similarity decisions through a local embedding-engine boundary to keep the promotion and retrieval surface stable ahead of later ONNX and vector-store swaps; persists the selected embedding model id/runtime separately from structural schema migration, lets empty stores adopt the active runtime, and keeps non-empty hash-backed stores on hash until an explicit re-embedding migration exists; mirrors promoted vector blobs into the reserved local vector-store root, checks the primary mirror directly instead of masking misses through SQLite fallback reads, backfills that mirror from valid SQLite vectors on open, and can fall back to SQLite when primary vector blobs are missing or corrupt during retrieval; classifies promoted captures by source type such as filesystem, local web capture, and Windows UI activity; derives structured summaries and lightweight JSON attributes for Windows activity captures from application, window, focus, and visible-text fields; searches with vector similarity plus lexical scoring; reports and repairs vector health; stores prototype graph edges between memory nodes. |
+ | `Prototype Memory Graph Edges` | Local store table | Implemented prototype | `crates/identityd/src/identity.rs` | Stores bounded weighted edges in `graph_edges`, rejects invalid/self edges, uses SQLite foreign-key checks, auto-links nearby vectors during memory promotion, exposes manual edge commands, reports graph health, and applies explicit edge-weight decay. This is local graph scaffolding inside the SQLite `.me` prototype, not final LanceDB graph completion. |
+@@ -156,10 +157,10 @@ flowchart TD
+ | `.meslice Preview Generator` | Privacy boundary | Implemented prototype | `crates/identityd/src/slice.rs` | Builds scoped context blocks and prompt packages from local memory search. |
+ | `Local Capture Endpoint` | Ingestion adapter | Implemented | `crates/identityd/src/proxy.rs`, `crates/identityd/src/main.rs` | Accepts local HTTP captures at `127.0.0.1:8080` only when `X-Identity-Capture-Token` matches the workspace-local `capture.token`; caps headers at 16KB and uses the shared 1MB ingest safety capture budget; accepts only textual content types; non-loopback binds are rejected unless explicitly forced for local development. |
+ | `HTML/Text Cleaner` | Capture normalizer | Implemented | `crates/identityd/src/proxy.rs`, `lol-html` | Extracts visible document text through a lightweight streaming parser and ignores script/style raw text before transit persistence. |
+-| `Active Window Capture` | Ingestion adapter | Implemented minimal on Windows | `crates/identityd/src/activity.rs`, `crates/identityd/src/main.rs` | Captures the current foreground window title, executable name, focused-control text, and a bounded set of visible child-window text strings, using bounded `WM_GETTEXT` and focused-control MSAA accessibility fallback when plain caption APIs do not expose enough control text, then writes local activity snapshots into the transit buffer. One-shot and bounded watch modes are both available. This is a phase-1 foothold, not yet full UI Automation text extraction. |
+-| `Filesystem Watcher` | Ingestion adapter | Implemented | `crates/identityd/src/filesystem.rs` | Uses `ReadDirectoryChangesW` on Windows, falls back to polling with `--poll`, validates watch roots before startup, refuses broad/sensitive roots unless `--allow-unsafe-watch-root` is explicitly passed, exposes this policy through `doctor`, filters conservative text/code files, retries transient Windows file locks, and dedupes burst events by per-path content hash. |
++| `Active Window Capture` | Ingestion adapter | Implemented minimal on Windows | `crates/identityd/src/activity.rs`, `crates/identityd/src/main.rs` | Captures the current foreground window title, executable name, focused-control text, and a bounded set of visible child-window text strings. Extracts focused-control text through a three-stage pipeline: UI Automation (`IUIAutomation::GetFocusedElement` with Value and Name properties) for modern Windows apps, MSAA `IAccessible` (`accName`/`accValue`) for classic controls, and raw `WM_GETTEXT` as final fallback. Also uses bounded `WM_GETTEXT` and MSAA for visible child-window text when UIA is not available. One-shot and bounded watch modes are both available. This is a phase-1 foothold, with UIA providing rich text from modern edit controls, browsers, and Electron apps.
++| `Filesystem Watcher` | Ingestion adapter | Implemented | `crates/identityd/src/filesystem.rs` | Uses `ReadDirectoryChangesW` on Windows, falls back to polling with `--poll`, validates watch roots before startup, refuses broad/sensitive roots unless `--allow-unsafe-watch-root` is explicitly passed, exposes this policy through `doctor`, filters text-like files by extension (25 supported extensions including code, config, and data formats), checks first 512 bytes for null bytes to skip binary files with text extensions, treats invalid UTF-8 as non-text, retries transient Windows file locks, reads up to 1MB per file, and dedupes burst events by per-path content hash. |
+ | `Idle Telemetry Gate` | Resource guard | Implemented minimal | `crates/identityd/src/idle.rs` | Gates processing by recent user input on Windows (`GetLastInputInfo`) and falls open where OS telemetry is unavailable. |
+-| `Transit Processor` | Pipeline worker | Implemented | `crates/identityd/src/processor.rs` | Claims queued captures, stages cleaned output, promotes cleaned rows into local memory, and runs idle-gated pipeline cycles. |
++| `Transit Processor` | Pipeline worker | Implemented | `crates/identityd/src/processor.rs` | Claims queued captures, stages cleaned output through Unicode NFKC normalization with control-character stripping, promotes cleaned rows into local memory, and runs idle-gated pipeline cycles. The daemon pipeline loop is resilient to transient errors: it logs and retries rather than crashing. |
+ | `Tauri Overlay` | UI shell | Planned | `docs/engineering-roadmap.md` | Ambient command interface. |
+ | `.me Vector Graph` | Durable local state | Prototype partial | `crates/identityd/src/identity.rs`, `docs/local-vector-synthesis-architecture.md` | Current SQLite prototype stores memory nodes, vector blobs, and weighted graph edges; final embedded LanceDB or equivalent hybrid graph remains planned. |
+ | `Local Embedding Runtime` | Compute stage | Opt-in ONNX attempt / default hash fallback | `crates/identityd/src/embedding.rs`, `docs/local-vector-synthesis-architecture.md` | Current default implementation is deterministic local hashing. The optional `onnx-runtime` Cargo feature adds `ort` with default features disabled and dynamic loading, validates low-thread ONNX session loading, and can run an explicit local embedding inference smoke path from WordPiece tensors to a normalized 384-dimensional vector. `IDENTITY_EMBEDDING_RUNTIME=onnx` lets the live engine attempt ONNX during promotion/search while preserving hash fallback for local pipeline continuity. |
+@@ -220,6 +221,7 @@ Global `--root <folder>` can be used before a command to run against an explicit
+ | `embedding-tokenize` | Local tensor preparation | `--text`, optional `--vocab-path`, optional `--max-tokens` | None | Runs dependency-free local WordPiece tokenization and prints padded `input_ids`, `attention_mask`, and `token_type_ids` for BERT/MiniLM-style ONNX embedding models. |
+ | `embedding-onnx-run` | Feature-gated local embedding inference | `--text`, optional `--model-path`, optional `--vocab-path`, optional `--max-tokens`; requires `--features onnx-runtime` and configured ONNX Runtime dynamic library | None | Tokenizes local text, runs the local ONNX model with `input_ids`, `attention_mask`, and optional `token_type_ids`, extracts the first `f32` output tensor, pools it into the persisted 384-dimensional vector contract, normalizes the vector, and prints compact run metadata. |
+ | `embedding-manifest-write` | Local embedding artifact setup | `--model-path`, `--model-id`, optional `--force` | `<model>.onnx.identity.json` | Writes the local sidecar manifest expected by ONNX artifact preflight after validating that the artifact exists, is a non-empty file, and has an `.onnx` extension; refuses to overwrite an existing sidecar unless `--force` is passed, then prints artifact readiness fields. |
++| `embedding-bootstrap` | ONNX model bootstrap | optional `--model-dir` | `model.onnx`, `vocab.txt`, `<model>.onnx.identity.json` | Downloads the all-MiniLM-L6-v2 ONNX model (~23MB) and WordPiece vocabulary from Hugging Face using the system `curl.exe`, writes the adjacent manifest, and prints environment variable guidance for enabling the ONNX embedding runtime. Skips existing files. |
+ | `memory-export` | Local protocol inspection | `--limit` | None | Prints recent `.me` prototype nodes as protocol-shaped JSON with `node_id`, protocol timestamps, semantic payload, vector floats, and graph edges addressed by target `node_uid`; internal SQLite row ids and cleaned-event ids are omitted. |
+ | `memory-protocol-health` | Local protocol inspection | None | None | Prints protocol-facing readiness counts for UUIDv4-style node ids, UTC timestamps, object-shaped structured attributes, and active vector dimensions. |
+ | `repair-protocol-schema` | Memory repair | `--limit` | `identity.me/state.db.memory_nodes`, `identity.me/vectors/node-*.f32le` | Repairs bounded protocol-facing drift by regenerating invalid UUIDv4-style node ids, backfilling UTC timestamps from local millisecond epochs, normalizing malformed structured attributes to `{}`, and rebuilding wrong-sized vectors from protected local raw text. |
+@@ -329,7 +331,7 @@ sequenceDiagram
+ 
+     Worker->>Transit: claim_queued(limit)
+     Transit-->>Worker: oldest queued events
+-    Worker->>Cleaner: clean_for_next_stage(content)
++    Worker->>Cleaner: clean_for_next_stage(content) [NFKC + control strip + whitespace collapse]
+     Cleaner-->>Worker: ok / empty
+     Worker->>Staging: complete_processing_with_cleaned
+     Staging->>Transit: same SQLite transaction marks processed
+@@ -367,6 +369,7 @@ sequenceDiagram
+     alt idle threshold met
+         Worker->>Transit: claim queued captures
+         Transit-->>Worker: captured events
++        Worker->>Worker: NFKC normalize + strip control chars + collapse whitespace
+         Worker->>Staging: write cleaned output transactionally
+         Worker->>Staging: list cleaned pending promotion
+         Worker->>Embed: embed cleaned text locally
+diff --git a/path/to/file b/path/to/file
+new file mode 100644
+index 0000000..d288c28
+--- /dev/null
++++ b/path/to/file
+@@ -0,0 +1 @@
++file contents here
+\ No newline at end of file
+diff --git a/test_workspace/capture.token b/test_workspace/capture.token
+new file mode 100644
+index 0000000..1b67712
+--- /dev/null
++++ b/test_workspace/capture.token
+@@ -0,0 +1 @@
++a4abb45e4a86348e20597d03ccd7d7658735a4b83a95bef9c35a760477eee28a
+\ No newline at end of file
+diff --git a/test_workspace/identity.me/vectors/store.meta b/test_workspace/identity.me/vectors/store.meta
+new file mode 100644
+index 0000000..473fa69
+--- /dev/null
++++ b/test_workspace/identity.me/vectors/store.meta
+@@ -0,0 +1,4 @@
++format=raw-f32-le-v1
++model_id=identity-hash-embedding-v1
++embedding_dim=384
++blob_len=1536

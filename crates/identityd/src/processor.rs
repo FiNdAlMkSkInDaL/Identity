@@ -167,12 +167,29 @@ pub fn pipeline_once_if_idle(
 
 #[inline]
 fn clean_for_next_stage(content: &str) -> Option<String> {
-    let normalized: String = content
+    let mut compact = String::with_capacity(content.len());
+    let mut last_was_whitespace = true;
+
+    let normalized = content
         .chars()
         .map(|c| if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c })
-        .collect();
-    let cleaned: String = normalized.nfkc().collect::<String>();
-    let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        .nfkc();
+
+    for c in normalized {
+        if c.is_whitespace() {
+            if !last_was_whitespace {
+                compact.push(' ');
+                last_was_whitespace = true;
+            }
+        } else {
+            compact.push(c);
+            last_was_whitespace = false;
+        }
+    }
+
+    if last_was_whitespace && !compact.is_empty() {
+        compact.pop();
+    }
 
     if compact.is_empty() {
         None

@@ -311,10 +311,16 @@ Phase 1, days 1-30:
 
 Phase 2, days 31-60:
 
-- Build Tauri hotkey overlay.
-- Add intent parsing and boundary engine.
-- Generate in-memory `.meslice` payloads.
-- Inject scoped context into model calls.
+- Build lightweight hotkey context injection daemon (no Tauri overlay required for V0).
+- Add `context_snapshot.rs` to read active window metadata on demand without transit queuing.
+- Add `project_profile.rs` to load deterministic project profiles from `~/.identity/projects.json`.
+- Add `context_builder.rs` to combine snapshot, profile, and memory into a bounded `[IDENTITY CONTEXT]` block.
+- Add `clipboard.rs` to write to the Windows clipboard natively via Win32 API.
+- Add `hotkey.rs` to register a global system hotkey via `RegisterHotKey` and trigger context injection.
+- Add `context-now` CLI command with `--preview` and `--copy` modes.
+- Add `project-profile-list` CLI command.
+- Extend `daemon` with `--hotkey`, `--hotkey-combo`, and `--paste-on-hotkey` flags.
+- Seed a `tfl-central` example project profile in `~/.identity/projects.json`.
 
 Phase 3, days 61-90+:
 
@@ -326,15 +332,18 @@ Phase 3, days 61-90+:
 
 ## Next Agent Execution Steps
 
-Start from the existing `identityd` crate. The next code changes should be:
+Phase 1 is complete. Begin Phase 2 Hotkey Context Injection. The next code changes should be, in order:
 
-1. Keep Phase 1 hardening ahead of Phase 2 surface work.
-2. Replace the deterministic hash-embedding prototype with a lean local ONNX/`ort` embedding runtime behind the existing embedding-engine boundary.
-3. Decide whether the default durable vector backend should become LanceDB now, or keep the current lean filesystem+SQLite vector store until the native build-toolchain cost is explicitly accepted.
-4. Add local encryption for real captured `.me` content before any broad always-on capture defaults.
-5. Expand OS-native accessibility and filesystem capture coverage without adding heavy frameworks or hosted services.
+1. **Audit before building.** Inspect the repo and confirm: which function powers `capture-active-window`, which function powers `memory-search`, what `slice.rs` exposes, whether a clipboard utility exists, and whether `RegisterHotKey` can be called without the `windows` crate.
+2. **Add `context-now --preview`.** Implement `context_snapshot.rs`, `project_profile.rs`, and `context_builder.rs` as a minimal chain. Wire into a new `context-now` CLI command. Print the context block to stdout. No clipboard, no hotkey.
+3. **Add project profile loading.** Support `~/.identity/projects.json` with deterministic substring matching. Add `project-profile-list` command. Add a `tfl-central` seed profile with its guardrails and memory query terms.
+4. **Add `context-now --copy`.** Implement `clipboard.rs` with native Win32 `OpenClipboard`/`SetClipboardData`/`CloseClipboard`. Log a short confirmation line.
+5. **Add `daemon --hotkey`.** Implement `hotkey.rs` with native Win32 `RegisterHotKey`/`GetMessage` on a dedicated thread. Debounce rapid repeats. On press, call the same internal path as `context-now --copy`. Do not block the ingestion pipeline.
+6. **Add `--paste-on-hotkey` (opt-in).** Use native `SendInput` or `keybd_event` to simulate Ctrl+V after clipboard write. Default remains copy-only. Paste must never press Enter.
+7. **Update tests.** Cover project profile matching, context budget trimming, no raw IDs in output, guardrails present when project matches, empty memory results, missing active-window data, and prompt-injection sanitization.
+8. **Update `docs/system-map.md` and `README.md`** to mark Phase 2 modules as implemented once built.
 
-Treat `.meslice`, prompt packaging, and UI work as experimental until Phase 1 local synthesis, storage, resource budget checks, and capture privacy controls are stable.
+V0 definition of done: `context-now --preview` prints, `context-now --copy` writes clipboard, `daemon --hotkey` responds to hotkey. Pressing the hotkey inside Gemini/Codex/Antigravity copies a compact context block with active-window context, TfL guardrails (when matched), and relevant memory excerpts. No dashboard. No Tauri. No network. Binary and RAM budgets must remain within current limits.
 
 ## Reference Documents
 

@@ -2352,6 +2352,7 @@ dependencies = [
  "arrow-schema",
  "futures-util",
  "lancedb",
+ "libloading",
  "lol_html",
  "ort",
  "rusqlite",

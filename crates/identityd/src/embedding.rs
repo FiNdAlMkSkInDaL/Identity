@@ -288,17 +288,21 @@ pub fn active_embedding_health() -> ActiveEmbeddingHealth {
     let requested_runtime = requested_embedding_runtime();
     let explicit = is_embedding_runtime_explicitly_set();
 
-    // Explicit hash override: the user asked for hash, honor it.
-    if explicit && requested_runtime == EMBEDDING_RUNTIME_HASH {
+    // Default or explicit hash: if requested_runtime is hash, use hash immediately without probing.
+    if requested_runtime == EMBEDDING_RUNTIME_HASH {
         return ActiveEmbeddingHealth {
             env_var: EMBEDDING_RUNTIME_ENV,
             requested_runtime,
             active_runtime: EMBEDDING_RUNTIME_HASH,
-            fallback_reason: Some("explicitly set to hash".to_string()),
+            fallback_reason: Some(if explicit {
+                "explicitly set to hash".to_string()
+            } else {
+                "defaults to hash".to_string()
+            }),
         };
     }
 
-    // Try ONNX: either explicit request or auto-detect
+    // Try ONNX: requested_runtime is onnx (or something else), so attempt it
     match try_onnx_probe() {
         Ok(_) => ActiveEmbeddingHealth {
             env_var: EMBEDDING_RUNTIME_ENV,
@@ -614,28 +618,80 @@ fn tokenize_wordpiece_with_vocab(
     })
 }
 
+/// Set to `true` after the ONNX runtime has been successfully loaded into the process.
+/// The Snapdragon X Elite cpuinfo library has a TLS destructor that triggers an
+/// access-violation (0xc0000005) on process exit after an ORT session is created.
+/// Callers that loaded ONNX should call `std::process::exit(0)` at the end of the
+/// command to bypass C++ TLS cleanup and avoid the crash.
+pub static ORT_WAS_LOADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "onnx-runtime")]
+pub fn ensure_ort_initialized() -> Result<(), String> {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    let mut err = None;
+
+    INIT.call_once(|| {
+        let path = std::env::var_os(EMBEDDING_ONNX_DYLIB_PATH_ENV)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from);
+
+        if let Some(path) = path {
+            match ort::init_from(path) {
+                Ok(builder) => {
+                    if !builder.commit() {
+                        err = Some("Failed to commit ORT environment".to_string());
+                    } else {
+                        ORT_WAS_LOADED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                Err(e) => {
+                    err = Some(format!("Failed to initialize ORT from path: {e}"));
+                }
+            }
+        } else {
+            let builder = ort::init();
+            if !builder.commit() {
+                err = Some("Failed to commit default ORT environment".to_string());
+            } else {
+                ORT_WAS_LOADED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+
+    if let Some(e) = err {
+        Err(e)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(feature = "onnx-runtime")]
 fn run_onnx_embedding_session(
     model_path: &std::path::Path,
     vocab_path: &std::path::Path,
     tokenized: TokenizedInput,
 ) -> Result<OnnxEmbeddingRun, std::io::Error> {
+    ensure_ort_initialized().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
     use ort::{
         inputs,
         session::{builder::GraphOptimizationLevel, Session},
         value::TensorRef,
     };
 
-    let mut session = Session::builder()
-        .map_err(io_other)?
+    let builder = Session::builder().map_err(io_other)?;
+    let builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level1)
-        .map_err(io_other)?
-        .with_intra_threads(1)
-        .map_err(io_other)?
-        .with_inter_threads(1)
-        .map_err(io_other)?
-        .commit_from_file(model_path)
         .map_err(io_other)?;
+    let builder = builder
+        .with_intra_threads(1)
+        .map_err(io_other)?;
+    let mut builder = builder
+        .with_inter_threads(1)
+        .map_err(io_other)?;
+    let mut session = builder.commit_from_file(model_path).map_err(io_other)?;
 
     let input_names: Vec<&str> = session.inputs().iter().map(|input| input.name()).collect();
     if !input_names.contains(&"input_ids") {
@@ -936,6 +992,21 @@ fn load_onnx_session(
     use ort::session::{builder::GraphOptimizationLevel, Session};
 
     let started = std::time::Instant::now();
+    if let Err(e) = ensure_ort_initialized() {
+        return OnnxRuntimeHealth {
+            feature_enabled: true,
+            dylib_env_var: EMBEDDING_ONNX_DYLIB_PATH_ENV,
+            dylib_path_configured,
+            artifact_status,
+            session_status: format!("init-failed: {e}"),
+            load_ms: None,
+            input_count: None,
+            output_count: None,
+            first_input: None,
+            first_output: None,
+        };
+    }
+
     let session = (|| -> Result<Session, String> {
         let builder = Session::builder().map_err(|error| error.to_string())?;
         let builder = builder
@@ -951,18 +1022,27 @@ fn load_onnx_session(
     })();
 
     match session {
-        Ok(session) => OnnxRuntimeHealth {
-            feature_enabled: true,
-            dylib_env_var: EMBEDDING_ONNX_DYLIB_PATH_ENV,
-            dylib_path_configured,
-            artifact_status,
-            session_status: "ready".to_string(),
-            load_ms: Some(started.elapsed().as_millis()),
-            input_count: Some(session.inputs().len()),
-            output_count: Some(session.outputs().len()),
-            first_input: session.inputs().first().map(|input| input.name().to_string()),
-            first_output: session.outputs().first().map(|output| output.name().to_string()),
-        },
+        Ok(session) => {
+            let health = OnnxRuntimeHealth {
+                feature_enabled: true,
+                dylib_env_var: EMBEDDING_ONNX_DYLIB_PATH_ENV,
+                dylib_path_configured,
+                artifact_status,
+                session_status: "ready".to_string(),
+                load_ms: Some(started.elapsed().as_millis()),
+                input_count: Some(session.inputs().len()),
+                output_count: Some(session.outputs().len()),
+                first_input: session.inputs().first().map(|input| input.name().to_string()),
+                first_output: session.outputs().first().map(|output| output.name().to_string()),
+            };
+            // Intentionally leak the session to prevent C++ destructor from running.
+            // On Snapdragon X Elite, the cpuinfo thread-local storage destructor inside
+            // onnxruntime triggers an access-violation (0xc0000005) during Session::drop().
+            // The caller will call std::process::exit(0) after printing output, so no memory
+            // is actually stranded in practice.
+            std::mem::forget(session);
+            health
+        }
         Err(error) => OnnxRuntimeHealth {
             feature_enabled: true,
             dylib_env_var: EMBEDDING_ONNX_DYLIB_PATH_ENV,

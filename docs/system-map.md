@@ -103,12 +103,16 @@ flowchart TD
     OS["Ambient OS Activity"]
     Files["Approved Filesystem Roots"]
     Browser["Browser / Local Web Traffic"]
-    Overlay["Tauri Ambient Overlay"]
+    Hotkey["Global Hotkey Listener\nhotkey.rs"]
     Daemon["identityd"]
     Transit["SQLite Transit Buffer"]
     Cleaner["Local Cleaner / SLM Summarizer"]
     Embedder["Local Embedding Runtime\nONNX / ort"]
     MeGraph[".me Hybrid Vector Graph\nLanceDB"]
+    Snapshot["Context Snapshot\ncontext_snapshot.rs"]
+    Profile["Project Profile Matcher\nproject_profile.rs"]
+    Builder["Context Builder\ncontext_builder.rs"]
+    Clipboard["Clipboard Writer\nclipboard.rs"]
     Boundary["Need-to-Know Boundary Engine"]
     Meslice["Ephemeral .meslice"]
     Remote["External LLM / Agent Endpoint"]
@@ -119,12 +123,17 @@ flowchart TD
     OS --> Daemon
     Files --> Daemon
     Browser --> Daemon
-    Overlay --> Boundary
+    Hotkey --> Snapshot
 
     Daemon --> Transit
     Transit --> Cleaner
     Cleaner --> Embedder
     Embedder --> MeGraph
+
+    Snapshot --> Profile
+    Profile --> Builder
+    Builder --> MeGraph
+    Builder --> Clipboard
 
     Boundary --> MeGraph
     Boundary --> Meslice
@@ -161,7 +170,12 @@ flowchart TD
 | `Filesystem Watcher` | Ingestion adapter | Implemented | `crates/identityd/src/filesystem.rs` | Uses `ReadDirectoryChangesW` on Windows, falls back to polling with `--poll`, validates watch roots before startup, refuses broad/sensitive roots unless `--allow-unsafe-watch-root` is explicitly passed, exposes this policy through `doctor`, filters text-like files by extension (25 supported extensions including code, config, and data formats), checks first 512 bytes for null bytes to skip binary files with text extensions, treats invalid UTF-8 as non-text, retries transient Windows file locks, reads up to 1MB per file, and dedupes burst events by per-path content hash. |
 | `Idle Telemetry Gate` | Resource guard | Implemented minimal | `crates/identityd/src/idle.rs` | Gates processing by recent user input on Windows (`GetLastInputInfo`) and falls open where OS telemetry is unavailable. |
 | `Transit Processor` | Pipeline worker | Implemented | `crates/identityd/src/processor.rs` | Claims queued captures, stages cleaned output through Unicode NFKC normalization with control-character stripping, promotes cleaned rows into local memory, and runs idle-gated pipeline cycles. The daemon pipeline loop is resilient to transient errors: it logs and retries rather than crashing. |
-| `Tauri Overlay` | UI shell | Planned | `docs/engineering-roadmap.md` | Ambient command interface. |
+| `Context Snapshot` | Context capture module | Planned Phase 2 | `crates/identityd/src/context_snapshot.rs` | Reads active foreground window metadata (process name, title, focused-control text, optional selected text) on demand without queuing a transit capture. Reuses existing `activity.rs` native Windows calls. |
+| `Project Profile Matcher` | Deterministic classifier | Planned Phase 2 | `crates/identityd/src/project_profile.rs`, `~/.identity/projects.json` | Loads JSON/TOML project profiles, matches the active context snapshot against window title, process name, and path substrings, and returns project guardrails and memory query terms. No ML required. |
+| `Context Builder` | Context formatter | Planned Phase 2 | `crates/identityd/src/context_builder.rs` | Combines context snapshot, matched project profile, and memory search results into a structured, sanitized `[IDENTITY CONTEXT]` block. Enforces char/token budget (default 8000 chars). Strips internal IDs, hashes, and scores. Sanitizes focused text to prevent prompt injection. |
+| `Clipboard Writer` | Output adapter | Planned Phase 2 | `crates/identityd/src/clipboard.rs` | Writes a UTF-16 string to the Windows clipboard using native `OpenClipboard`/`SetClipboardData`/`CloseClipboard` API calls. No GUI framework dependency. |
+| `Hotkey Listener` | Input adapter | Planned Phase 2 | `crates/identityd/src/hotkey.rs` | Registers a global system hotkey via Win32 `RegisterHotKey`/`GetMessage`, fires the context injection pipeline on press, debounces rapid repeats, and runs only when `--hotkey` flag is passed. Does not block the daemon ingestion pipeline. |
+| `Tauri Overlay` | UI shell | Deferred | `docs/engineering-roadmap.md` | Optional future visual overlay. Not required for V0 clipboard-first hotkey injection. |
 | `.me Vector Graph` | Durable local state | Prototype partial | `crates/identityd/src/identity.rs`, `docs/local-vector-synthesis-architecture.md` | Current SQLite prototype stores memory nodes, vector blobs, and weighted graph edges; final embedded LanceDB or equivalent hybrid graph remains planned. |
 | `Local Embedding Runtime` | Compute stage | Opt-in ONNX attempt / default hash fallback | `crates/identityd/src/embedding.rs`, `docs/local-vector-synthesis-architecture.md` | Current default implementation is deterministic local hashing. The optional `onnx-runtime` Cargo feature adds `ort` with default features disabled and dynamic loading, validates low-thread ONNX session loading, and can run an explicit local embedding inference smoke path from WordPiece tensors to a normalized 384-dimensional vector. `IDENTITY_EMBEDDING_RUNTIME=onnx` lets the live engine attempt ONNX during promotion/search while preserving hash fallback for local pipeline continuity. |
 | `Boundary Engine` | Privacy gate | Planned | `docs/ephemeral-handshake-architecture.md` | Chooses minimum context needed for a task. |
@@ -194,7 +208,16 @@ flowchart TD
   logs/          reserved local daemon logs
 ```
 
-## 5. Implemented Command Surface
+## 5. Local Workspace Additions (Phase 2)
+
+```text
+~/.identity/
+  projects.json   optional deterministic project profile config
+                  matches window title / process / path to project id
+                  contains per-project memory query terms and guardrails
+```
+
+## 6. Implemented Command Surface
 
 Global `--root <folder>` can be used before a command to run against an explicit Identity workspace root, which keeps tests and development runs out of the real `~/.identity` ledger.
 
@@ -235,7 +258,9 @@ Global `--root <folder>` can be used before a command to run against an explicit
 | `prompt-package` | Context injection artifact | `--intent`, `--prompt`, `--limit` | None | Emits a local prompt package containing scoped context plus user task. |
 | `serve` | Local proxy capture | `--addr`, `--allow-non-loopback`, `X-Identity-Capture-Token` for writes | `captured_events` | Runs `/health` and token-authorized `/capture`; defaults to loopback-only binding and returns bounded HTTP errors for invalid or oversized captures. |
 | `watch` | Filesystem capture | `--path`, `--non-recursive`, `--poll`, `--allow-unsafe-watch-root` | `captured_events` | Uses Windows filesystem events by default on Windows and keeps polling as an explicit fallback. Validates the root against the safe-root policy and dedupes repeated same-content events per path. |
-| `daemon` | Phase 1 local daemon orchestration | `--addr`, `--process-limit`, `--promote-limit`, `--idle-ms`, `--interval-ms`, optional `--watch-path`, `--watch-active-window`, `--activity-interval-ms`, `--non-recursive`, `--allow-non-loopback`, `--allow-unsafe-watch-root` | `captured_events`, `cleaned_events`, `identity.me/state.db`, optional filesystem and OS activity captures | Runs the loopback capture endpoint and idle-gated clean/promote pipeline together in one process. Optional `--watch-path` adds a shutdown-aware filesystem watcher after safe-root validation; optional `--watch-active-window` adds bounded foreground-window capture. On Windows the filesystem watcher keeps the native `ReadDirectoryChangesW` path while still stopping cleanly on `Ctrl+C`. |
+| `daemon` | Phase 1/2 local daemon orchestration | `--addr`, `--process-limit`, `--promote-limit`, `--idle-ms`, `--interval-ms`, optional `--watch-path`, `--watch-active-window`, `--activity-interval-ms`, `--non-recursive`, `--allow-non-loopback`, `--allow-unsafe-watch-root`, planned `--hotkey`, `--hotkey-combo`, `--paste-on-hotkey` | `captured_events`, `cleaned_events`, `identity.me/state.db`, optional filesystem and OS activity captures, optional clipboard writes | Runs the loopback capture endpoint and idle-gated clean/promote pipeline together in one process. Optional `--watch-path` adds a shutdown-aware filesystem watcher after safe-root validation; optional `--watch-active-window` adds bounded foreground-window capture. Planned `--hotkey` registers a global system hotkey and copies generated context to clipboard on each press. On Windows the filesystem watcher keeps the native `ReadDirectoryChangesW` path while still stopping cleanly on `Ctrl+C`. |
+| `context-now` | Phase 2 on-demand context generation | `--preview`, `--copy`, `--project`, `--limit`, `--max-chars`, `--include-current-window`, `--include-focused-text`, `--include-project-memory` | Clipboard (when `--copy`) | Planned. Generates a compact sanitized `[IDENTITY CONTEXT]` block from the active window and `.me` memory, prints it (with `--preview`) or copies it to clipboard (with `--copy`). |
+| `project-profile-list` | Phase 2 project profile inspection | None | None | Planned. Lists known project profiles loaded from `~/.identity/projects.json` and reports which profile matches the current active window. |
 | `process-once` | Transit processing | `--limit` | `captured_events.status`, `cleaned_events` | Claims captures and stages normalized text. |
 | `process-idle-once` | Idle-gated transit processing | `--limit`, `--idle-ms` | `captured_events.status`, `cleaned_events` when idle | Runs one processing batch only after the configured idle threshold. |
 | `pipeline-once` | Idle-gated local state pipeline | `--process-limit`, `--promote-limit`, `--idle-ms` | `captured_events.status`, `cleaned_events`, `identity.me/state.db`, redaction timestamps when idle | Runs one local clean/promote/redact cycle under the idle gate. |
@@ -492,6 +517,33 @@ sequenceDiagram
     Slice-->>CLI: SYSTEM CONTEXT + USER TASK
 ```
 
+### Hotkey Context Injection (Planned Phase 2)
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Hotkey as Global Hotkey Listener
+    participant Snapshot as Context Snapshot
+    participant Profile as Project Profile Matcher
+    participant Builder as Context Builder
+    participant Memory as Identity Memory Store
+    participant Clip as Clipboard Writer
+
+    User->>Hotkey: press Ctrl+Space (or configured combo)
+    Hotkey->>Snapshot: capture_context_snapshot()
+    Snapshot-->>Hotkey: process, title, focused_text, path_hint
+    Hotkey->>Profile: match_profile(snapshot)
+    Profile-->>Hotkey: project guardrails + memory_query_terms
+    Hotkey->>Builder: build_context(snapshot, profile)
+    Builder->>Memory: search(query_terms, limit=8)
+    Memory-->>Builder: ranked memory summaries
+    Builder->>Builder: format + budget trim (max 8000 chars)
+    Builder->>Builder: strip IDs/hashes/scores, sanitize injection patterns
+    Builder-->>Hotkey: [IDENTITY CONTEXT] block
+    Hotkey->>Clip: copy_to_clipboard(block)
+    Hotkey->>Hotkey: log confirmation line
+```
+
 ## 8. Planned Pipeline Boundaries
 
 | Boundary | Upstream | Downstream | Rule |
@@ -510,6 +562,7 @@ sequenceDiagram
 | `.me` to `.meslice` | Boundary engine | External agent | Export minimum declarative facts only. |
 | External execution to feedback | Agent endpoint | Session watcher | Capture only scoped task outputs. |
 | Feedback to `.me` | Delta extractor | Graph reconciler | Validate deltas before merge. |
+| Hotkey to clipboard | Hotkey listener | Context snapshot → project profile → context builder → clipboard writer | Read active window on demand, match project profile, search memory, format sanitized block, write to clipboard only. Never auto-submit. Never expose raw DB internals. |
 
 ## 9. Maintenance Rules
 

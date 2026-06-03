@@ -11,7 +11,7 @@ use identityd::embedding::{
     write_embedding_manifest, ActiveEmbeddingHealth, OnnxRuntimeHealth, TokenizerHealth,
     EMBEDDING_DIM, EMBEDDING_LATENCY_TARGET_MS, EMBEDDING_ONNX_MODEL_PATH_ENV,
     EMBEDDING_RUNTIME_ENV, EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
-    EMBEDDING_TOKENIZER_VOCAB_PATH_ENV,
+    EMBEDDING_TOKENIZER_VOCAB_PATH_ENV, ORT_WAS_LOADED,
 };
 use identityd::filesystem::{
     ensure_safe_watch_root, FileWatcher, FileWatcherConfig, FileWatcherMode, WATCH_UNSAFE_ROOT_FLAG,
@@ -46,6 +46,14 @@ async fn main() {
     if let Err(error) = run().await {
         eprintln!("identityd error: {error}");
         std::process::exit(1);
+    }
+    // If the ONNX runtime was loaded into this process during the command, bypass
+    // the normal Rust/C++ cleanup path. The Snapdragon X Elite cpuinfo library has
+    // a TLS destructor that fires an access-violation (0xc0000005) during process
+    // shutdown after an ORT session is created. All output and DB writes are already
+    // complete at this point, so exit(0) is semantically correct.
+    if ORT_WAS_LOADED.load(std::sync::atomic::Ordering::SeqCst) {
+        std::process::exit(0);
     }
 }
 
@@ -184,9 +192,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 && binary_size_bytes
                     .map(|bytes| bytes <= BINARY_SIZE_TARGET_BYTES)
                     .unwrap_or(false);
+            let onnx_session_ready = onnx_runtime.session_status == "ready";
+            let lancedb_ready = memory.vector_store_backend == "lancedb";
+            let accessibility_ready = capture_health.phase1_status == "ready";
+
             let phase1_ready_markers = count_ready([
-                true,
-                true,
+                true, // Workspace initialization
+                true, // Local SQLite transit queue
                 content_protection_ready,
                 transit_ready,
                 memory_vector_ready,
@@ -195,8 +207,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 embedding_artifact_ready,
                 local_pipeline_status == "ready",
                 resource_budget_ready,
+                onnx_session_ready,
+                lancedb_ready,
+                accessibility_ready,
             ]);
-            let phase1_partial_markers = 3 + u32::from(!embedding_artifact_ready);
+            let phase1_partial_markers = count_ready([
+                !onnx_session_ready,
+                !lancedb_ready,
+                !accessibility_ready,
+                !embedding_artifact_ready,
+            ]);
             let phase1_total_markers = 13;
             let phase1_completion_percent = completion_percent(
                 phase1_ready_markers,
@@ -447,12 +467,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("phase1_foundation_completion_percent={phase1_completion_percent}");
             println!(
                 "phase1_next_milestone={}",
-                phase1_next_milestone(embedding_artifact_ready)
+                phase1_next_milestone(embedding_artifact_ready, onnx_session_ready)
             );
             println!(
                 "phase1_remaining={}",
-                phase1_remaining_summary(embedding_artifact_ready)
+                phase1_remaining_summary(
+                    embedding_artifact_ready,
+                    onnx_session_ready,
+                    lancedb_ready,
+                    accessibility_ready
+                )
             );
+            // Bypass tokio runtime shutdown when ONNX is loaded: the cpuinfo TLS destructor
+            // (Snapdragon X Elite) fires an access-violation during C++ thread-local cleanup.
+            // All output and SQLite writes are complete at this point.
+            if ORT_WAS_LOADED.load(std::sync::atomic::Ordering::SeqCst) {
+                std::process::exit(0);
+            }
         }
         "repair-transit" => {
             let lease_ms = read_flag(&raw_args, "--lease-ms")
@@ -675,6 +706,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 optional_string(artifact.path.as_deref())
             );
             print_onnx_runtime_health(&onnx_runtime);
+            if ORT_WAS_LOADED.load(std::sync::atomic::Ordering::SeqCst) {
+                std::process::exit(0);
+            }
         }
         "embedding-tokenizer-health" => {
             let health = if let Some(vocab_path) = read_flag(&raw_args, "--vocab-path") {
@@ -747,6 +781,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "onnx_embedding_prefix={}",
                 join_f32_prefix(&run.embedding, 8)
             );
+            if ORT_WAS_LOADED.load(std::sync::atomic::Ordering::SeqCst) {
+                std::process::exit(0);
+            }
         }
         "embedding-manifest-write" => {
             let model_path = read_flag(&raw_args, "--model-path")
@@ -776,7 +813,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "embedding_artifact_manifest_exists={}",
                 artifact.manifest_exists
             );
-                        println!(
+            println!(
                 "embedding_artifact_manifest_embedding_dim={}",
                 optional_usize(artifact.manifest_embedding_dim)
             );
@@ -1281,19 +1318,40 @@ fn phase1_embedding_artifact_status(
     }
 }
 
-fn phase1_remaining_summary(embedding_artifact_ready: bool) -> &'static str {
-    if embedding_artifact_ready {
-        "final ONNX/ort embedding runtime (dll + feature flag); default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
-    } else {
-        "valid local ONNX embedding artifact (run embedding-bootstrap); final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+fn phase1_remaining_summary(
+    embedding_artifact_ready: bool,
+    onnx_session_ready: bool,
+    lancedb_ready: bool,
+    accessibility_ready: bool,
+) -> String {
+    let mut remaining = Vec::new();
+    if !embedding_artifact_ready {
+        remaining.push("valid local ONNX embedding artifact (run embedding-bootstrap)");
     }
+    if !onnx_session_ready {
+        remaining.push("final ONNX/ort embedding runtime (dll + feature flag)");
+    }
+    if !lancedb_ready {
+        remaining.push("default embedded LanceDB or equivalent hybrid graph");
+    }
+    if !accessibility_ready {
+        remaining.push("fuller OS accessibility coverage");
+    }
+    remaining.push("cross-platform OS content-protection backends beyond Windows");
+
+    remaining.join("; ")
 }
 
-fn phase1_next_milestone(embedding_artifact_ready: bool) -> &'static str {
-    if embedding_artifact_ready {
-        "download onnxruntime.dll, set ORT_DYLIB_PATH, and build with --features onnx-runtime (auto-detected when model is present)"
-    } else {
+fn phase1_next_milestone(
+    embedding_artifact_ready: bool,
+    onnx_session_ready: bool,
+) -> &'static str {
+    if !embedding_artifact_ready {
         "run `identityd embedding-bootstrap` to download the local ONNX model and vocabulary"
+    } else if !onnx_session_ready {
+        "download onnxruntime.dll, set ORT_DYLIB_PATH, and build with --features onnx-runtime"
+    } else {
+        "Phase 1 core ingestion is complete. Proceed to Phase 2 hotkey command bar overlay."
     }
 }
 
@@ -1617,10 +1675,10 @@ mod tests {
         );
         assert_eq!(phase1_embedding_artifact_status(false, "empty"), "empty");
         assert_eq!(phase1_embedding_artifact_status(true, "ready"), "ready");
-                assert!(phase1_remaining_summary(false).starts_with("valid local ONNX"));
-        assert!(phase1_remaining_summary(true).starts_with("final ONNX"));
-        assert!(phase1_next_milestone(false).starts_with("run "));
-        assert!(phase1_next_milestone(true).starts_with("download"));
+        assert!(phase1_remaining_summary(false, true, true, true).starts_with("valid local ONNX"));
+        assert!(phase1_remaining_summary(true, false, true, true).starts_with("final ONNX"));
+        assert!(phase1_next_milestone(false, false).starts_with("run "));
+        assert!(phase1_next_milestone(true, false).starts_with("download"));
     }
 
     #[test]

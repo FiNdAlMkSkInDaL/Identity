@@ -55,38 +55,31 @@ Objective: Establish the localized ingestion engine and prove that a `.me` datab
   - `BGE-Micro-v2`
 - Convert buffered Markdown into dense vectors on system-idle triggers.
 
-## 3. Phase 2: Ambient Chat Bar and Local `.meslice` Generator
+## 3. Phase 2: Hotkey Context Injection Daemon
 
 Target window: Days 31-60
 
-Objective: Build the user interaction layer and orchestrate the local need-to-know semantic filter that extracts time-bound context streams.
+Objective: Build the lightweight keyboard-driven interaction layer that captures local active window/control text on a global hotkey trigger, queries relevant memory, formats a compact context block, and copies it to the clipboard (or optionally pastes it) for direct AI tool consumption.
 
-### Task 2.1: Hotkey Ambient Window
+### Task 2.1: Context Snapshot and Active Window Capture
+- Expose native active window metadata and focused-control text retrieval on Windows natively.
+- Return structured window state containing process name, window title, focused text, and optional selected text.
+- Enforce strict size bounds and sanitization.
 
-- Develop a system-wide global hotkey listener, such as `Cmd+Shift+S`.
-- Open an ultra-minimal overlay command input bar.
-- Keep the interface fast, quiet, and keyboard-first.
+### Task 2.2: Local Project Profile Matching
+- Parse and load deterministic project profiles from `~/.identity/projects.json` or `projects.toml`.
+- Match the active window title, process name, path, or domain to a specific project.
+- Retrieve project-specific memory query terms and strict guardrails.
 
-### Task 2.2: Intent Parsing and Boundary Engine
+### Task 2.3: Context Builder and Budget Control
+- Query the `.me` SQLite memory store using terms associated with the matched project.
+- Package the matched guardrails, recent captures, active window environment, and semantic memory facts into a structured context block.
+- Enforce a strict token/character size budget, trimming lower-ranked items first to ensure it remains pasteable (default max 8000 characters).
 
-- Package a local 1B-to-3B parameter SLM, such as `Phi-3-mini-4k-instruct`.
-- Run the model through WebGPU or another local acceleration path where possible.
-- Route user prompts into the local SLM.
-- Extract semantic parameters, operational intent, and the minimum required entities.
-
-### Task 2.3: In-Memory Context Mutation
-
-- Query LanceDB vectors using the SLM-produced whitelist entities.
-- Construct a transient `.meslice` in volatile memory.
-- Mask explicit personal names, persistent database IDs, and sensitive identifiers with single-use randomized cryptographic tracking strings.
-- Keep the `.meslice` task-scoped and expiry-bound.
-
-### Task 2.4: Runtime API Context Injection
-
-- Build an outbound network handler.
-- Append the temporary `.meslice` payload inside system delimiter blocks in the prompt header.
-- Stream the combined prompt to a standard foundational API such as Anthropic Claude or OpenAI GPT.
-- Return the clean task response to the user's overlay window.
+### Task 2.4: Clipboard and Native Hotkey Daemon
+- Implement a global hotkey listener (`Ctrl+Space` or custom) natively using Win32 API.
+- Copy generated context blocks to the system clipboard upon hotkey trigger.
+- Optionally support native keyboard event simulation to paste the context block into the focused AI tool.
 
 ## 4. Phase 3: Bi-Directional State Synchronization and Protocol Scale
 
@@ -156,10 +149,10 @@ By the end of Phase 1:
 
 By the end of Phase 2:
 
-- A user can open a hotkey bar and issue an intent.
-- The system can generate a scoped `.meslice`.
-- The system can inject that context into a model request.
-- The response can be displayed without exposing the full `.me` graph.
+- The daemon runs with global hotkey support.
+- A user can trigger a context capture in any editor, terminal, or browser window.
+- The system generates a compact, sanitized context block and copies it to the clipboard.
+- Project profiles dynamically match window metadata to inject specialized guardrails and retrieve scoped memory.
 
 By the end of Phase 3:
 

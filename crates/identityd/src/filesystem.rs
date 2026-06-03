@@ -358,7 +358,12 @@ fn windows_watch_loop(
     let _event_guard = EventHandle(raw_event);
     let buffer = TransitBuffer::open(&paths)?;
     let mut seen = HashMap::new();
-    let mut events = [0_u8; 16 * 1024];
+
+    #[repr(C, align(4))]
+    struct AlignedBuffer([u8; 16 * 1024]);
+    let mut events_buf = AlignedBuffer([0_u8; 16 * 1024]);
+    let events = &mut events_buf.0;
+
     let mut overlapped = WindowsOverlapped {
         internal: 0,
         internal_high: 0,
@@ -368,7 +373,7 @@ fn windows_watch_loop(
     };
 
     loop {
-        issue_directory_read(raw_handle, &mut events, config.recursive, &mut overlapped)?;
+        issue_directory_read(raw_handle, events, config.recursive, &mut overlapped)?;
 
         loop {
             let wait = unsafe { WaitForSingleObject(raw_event, WINDOWS_WATCH_SHUTDOWN_POLL_MS) };
@@ -702,7 +707,26 @@ fn native_watcher_status() -> &'static str {
 
 #[inline]
 fn collapse_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut compact = String::with_capacity(input.len());
+    let mut last_was_whitespace = true;
+
+    for c in input.chars() {
+        if c.is_whitespace() {
+            if !last_was_whitespace {
+                compact.push(' ');
+                last_was_whitespace = true;
+            }
+        } else {
+            compact.push(c);
+            last_was_whitespace = false;
+        }
+    }
+
+    if last_was_whitespace && !compact.is_empty() {
+        compact.pop();
+    }
+
+    compact
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -725,16 +749,25 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 /// Returns `true` if the first 512 bytes of a file contain null bytes,
 /// which strongly indicates binary content that should not be ingested.
 fn has_null_bytes(path: &Path) -> Result<bool, FileWatchError> {
-    let mut file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error.into()),
-    };
-
-    let mut buf = [0u8; 512];
-    use std::io::Read;
-    let n = file.read(&mut buf).unwrap_or(0);
-    Ok(buf[..n].contains(&0))
+    for attempt in 0..3 {
+        match fs::File::open(path) {
+            Ok(mut file) => {
+                let mut buf = [0u8; 512];
+                use std::io::Read;
+                let n = file.read(&mut buf).unwrap_or(0);
+                return Ok(buf[..n].contains(&0));
+            }
+            Err(error) if is_transient_file_lock(&error) && attempt < 2 => {
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            Err(error) if is_transient_file_lock(&error) => {
+                return Ok(true);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

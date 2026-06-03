@@ -255,7 +255,6 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
 }
 
 #[cfg(windows)]
-#[cfg(windows)]
 fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
     use std::ffi::c_void;
 

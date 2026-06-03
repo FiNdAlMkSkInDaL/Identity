@@ -425,7 +425,26 @@ fn decode_entities(input: &str) -> String {
 }
 
 fn collapse_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut compact = String::with_capacity(input.len());
+    let mut last_was_whitespace = true;
+
+    for c in input.chars() {
+        if c.is_whitespace() {
+            if !last_was_whitespace {
+                compact.push(' ');
+                last_was_whitespace = true;
+            }
+        } else {
+            compact.push(c);
+            last_was_whitespace = false;
+        }
+    }
+
+    if last_was_whitespace && !compact.is_empty() {
+        compact.pop();
+    }
+
+    compact
 }
 
 fn looks_like_html(input: &str) -> bool {
