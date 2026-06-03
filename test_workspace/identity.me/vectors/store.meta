@@ -1,0 +1,4 @@
+format=raw-f32-le-v1
+model_id=identity-hash-embedding-v1
+embedding_dim=384
+blob_len=1536

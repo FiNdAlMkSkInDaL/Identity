@@ -255,6 +255,272 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
 }
 
 #[cfg(windows)]
+#[cfg(windows)]
+fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
+    use std::ffi::c_void;
+
+    type Hresult = i32;
+    type Bstr = *mut u16;
+
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    union VariantData {
+        bstr_val: Bstr,
+        _pad: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct Variant {
+        vt: u16,
+        _reserved1: u16,
+        _reserved2: u16,
+        _reserved3: u16,
+        data: VariantData,
+    }
+
+    const VT_BSTR: u16 = 8;
+
+    impl Default for Variant {
+        fn default() -> Self {
+            Self {
+                vt: 0,
+                _reserved1: 0,
+                _reserved2: 0,
+                _reserved3: 0,
+                data: VariantData { _pad: 0 },
+            }
+        }
+    }
+
+    #[repr(C)]
+    struct IUnknown {
+        lp_vtbl: *const IUnknownVtbl,
+    }
+
+    #[repr(C)]
+    struct IUnknownVtbl {
+        query_interface: unsafe extern "system" fn(
+            *mut IUnknown,
+            *const Guid,
+            *mut *mut c_void,
+        ) -> Hresult,
+        add_ref: unsafe extern "system" fn(*mut IUnknown) -> u32,
+        release: unsafe extern "system" fn(*mut IUnknown) -> u32,
+    }
+
+    #[repr(C)]
+    struct Automation {
+        lp_vtbl: *const AutomationVtbl,
+    }
+
+    #[repr(C)]
+    struct AutomationVtbl {
+        parent: IUnknownVtbl,
+        _pad0: [usize; 4], // indices 3-6: CompareElements, CompareRuntimeIds, GetRootElement, ElementFromPoint
+        get_focused_element:
+            unsafe extern "system" fn(*mut Automation, *mut *mut c_void) -> Hresult,
+    }
+
+    #[repr(C)]
+    struct Element {
+        lp_vtbl: *const ElementVtbl,
+    }
+
+    #[repr(C)]
+    struct ElementVtbl {
+        parent: IUnknownVtbl,
+        _pad0: [usize; 7], // indices 3-9: SetFocus .. BuildUpdatedCache
+        get_current_property_value: unsafe extern "system" fn(
+            *mut Element,
+            i32,       // propertyId
+            *mut Variant, // retVal
+        ) -> Hresult,
+    }
+
+    // CLSID_CUIAutomation: {FF48DBA4-60EF-4201-AA87-54103EEF594E}
+    const CLSID_CUIAUTOMATION: Guid = Guid {
+        data1: 0xFF48_DBA4,
+        data2: 0x60EF,
+        data3: 0x4201,
+        data4: [0xAA, 0x87, 0x54, 0x10, 0x3E, 0xEF, 0x59, 0x4E],
+    };
+    // IID_IUIAutomation: {30CBE57D-D9D0-452A-AB13-7AC5AC4825EE}
+    const IID_IUIAUTOMATION: Guid = Guid {
+        data1: 0x30CB_E57D,
+        data2: 0xD9D0,
+        data3: 0x452A,
+        data4: [0xAB, 0x13, 0x7A, 0xC5, 0xAC, 0x48, 0x25, 0xEE],
+    };
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *mut c_void, coinit: u32) -> Hresult;
+        fn CoUninitialize();
+        fn CoCreateInstance(
+            rclsid: *const Guid,
+            pUnkOuter: *mut c_void,
+            dwClsContext: u32,
+            riid: *const Guid,
+            ppv: *mut *mut c_void,
+        ) -> Hresult;
+    }
+
+    #[link(name = "oleaut32")]
+    extern "system" {
+        fn SysFreeString(bstr: Bstr);
+        fn SysStringLen(bstr: Bstr) -> u32;
+    }
+
+    const CLSCTX_INPROC_SERVER: u32 = 1;
+    const UIA_NAME_PROPERTY_ID: i32 = 30005;
+    const UIA_VALUE_VALUE_PROPERTY_ID: i32 = 30045;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsChild(hWndParent: *mut c_void, hWnd: *mut c_void) -> i32;
+    }
+
+    struct ComInitGuard(bool);
+
+    impl Drop for ComInitGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
+    struct AutoRelease<T> {
+        ptr: *mut T,
+    }
+
+    impl<T> AutoRelease<T> {
+        unsafe fn release(&self) {
+            if !self.ptr.is_null() {
+                let unk = self.ptr.cast::<IUnknown>();
+                unsafe {
+                    ((*(*unk).lp_vtbl).release)(unk);
+                }
+            }
+        }
+    }
+
+    impl<T> Drop for AutoRelease<T> {
+        fn drop(&mut self) {
+            unsafe {
+                self.release();
+            }
+        }
+    }
+
+    fn take_bstr(value: Bstr) -> String {
+        if value.is_null() {
+            return String::new();
+        }
+        let len = unsafe { SysStringLen(value) as usize };
+        let text = normalize_capture_text(&String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(value, len)
+        }));
+        unsafe {
+            SysFreeString(value);
+        }
+        text
+    }
+
+    let init = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+    let _com_guard = if init >= 0 {
+        ComInitGuard(true)
+    } else if init == RPC_E_CHANGED_MODE {
+        ComInitGuard(false)
+    } else {
+        return None;
+    };
+
+    // Create CUIAutomation
+    let mut raw_automation = std::ptr::null_mut();
+    let hr = unsafe {
+        CoCreateInstance(
+            &CLSID_CUIAUTOMATION,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IUIAUTOMATION,
+            &mut raw_automation,
+        )
+    };
+    if hr < 0 || raw_automation.is_null() {
+        return None;
+    }
+    let auto = AutoRelease::<Automation> {
+        ptr: raw_automation.cast::<Automation>(),
+    };
+
+    // Get focused element
+    let mut raw_element = std::ptr::null_mut::<c_void>();
+    let hr = unsafe {
+        ((*(*auto.ptr).lp_vtbl).get_focused_element)(auto.ptr, &mut raw_element)
+    };
+    if hr < 0 || raw_element.is_null() {
+        return None;
+    }
+
+    // Verify the focused element belongs to our window tree
+    if hwnd != raw_element && unsafe { IsChild(hwnd, raw_element.cast()) } == 0 {
+        return None;
+    }
+
+    let element = AutoRelease::<Element> {
+        ptr: raw_element.cast::<Element>(),
+    };
+
+    // Try Value property first (edit controls, text boxes)
+    let mut value_variant = Variant::default();
+    let value_hr = unsafe {
+        ((*(*element.ptr).lp_vtbl).get_current_property_value)(
+            element.ptr,
+            UIA_VALUE_VALUE_PROPERTY_ID,
+            &mut value_variant,
+        )
+    };
+    let value_text = if value_hr >= 0 && value_variant.vt == VT_BSTR {
+        take_bstr(unsafe { value_variant.data.bstr_val })
+    } else {
+        String::new()
+    };
+
+    // Try Name property as fallback
+    let mut name_variant = Variant::default();
+    let name_hr = unsafe {
+        ((*(*element.ptr).lp_vtbl).get_current_property_value)(
+            element.ptr,
+            UIA_NAME_PROPERTY_ID,
+            &mut name_variant,
+        )
+    };
+    let name_text = if name_hr >= 0 && name_variant.vt == VT_BSTR {
+        take_bstr(unsafe { name_variant.data.bstr_val })
+    } else {
+        String::new()
+    };
+
+    let result = prefer_text(value_text, name_text);
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 fn focused_control_text(root_hwnd: *mut std::ffi::c_void, title: &str) -> Option<String> {
     use std::ffi::c_void;
 
@@ -307,9 +573,15 @@ fn focused_control_text(root_hwnd: *mut std::ffi::c_void, title: &str) -> Option
         return None;
     }
 
+    let uia_text = read_uia_text(gui.hwnd_focus).unwrap_or_default();
+    let msaa_text = if uia_text.is_empty() {
+        read_accessible_text(gui.hwnd_focus)
+    } else {
+        String::new()
+    };
     let focused_text = prefer_text(
+        prefer_text(uia_text, msaa_text),
         read_window_text(gui.hwnd_focus),
-        read_accessible_text(gui.hwnd_focus),
     );
     if focused_text.is_empty() || focused_text == title {
         None

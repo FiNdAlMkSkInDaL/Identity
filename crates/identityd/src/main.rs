@@ -1,6 +1,7 @@
 use identityd::activity::{
     capture_active_window_once, watch_active_window_until_shutdown, DEFAULT_ACTIVITY_POLL_MS,
 };
+use identityd::bootstrap::{bootstrap_onnx_artifact, print_bootstrap_guidance};
 use identityd::capture::capture_adapter_health;
 use identityd::crypto::protection_backend;
 use identityd::embedding::{
@@ -775,10 +776,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "embedding_artifact_manifest_exists={}",
                 artifact.manifest_exists
             );
-            println!(
+                        println!(
                 "embedding_artifact_manifest_embedding_dim={}",
                 optional_usize(artifact.manifest_embedding_dim)
             );
+        }
+        "embedding-bootstrap" => {
+            let model_dir = read_flag(&raw_args, "--model-dir")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.identity_dir.join("models"));
+            let result = bootstrap_onnx_artifact(&model_dir)?;
+
+            print_bootstrap_guidance(&result);
         }
         "memory-export" => {
             let limit = read_flag(&raw_args, "--limit")
@@ -1242,7 +1251,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
     );
 }
 
@@ -1274,17 +1283,17 @@ fn phase1_embedding_artifact_status(
 
 fn phase1_remaining_summary(embedding_artifact_ready: bool) -> &'static str {
     if embedding_artifact_ready {
-        "final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+        "final ONNX/ort embedding runtime (dll + feature flag); default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
     } else {
-        "valid local ONNX embedding artifact; final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
+        "valid local ONNX embedding artifact (run embedding-bootstrap); final ONNX/ort embedding runtime; default embedded LanceDB or equivalent hybrid graph; fuller OS accessibility coverage; cross-platform OS content-protection backends beyond Windows"
     }
 }
 
 fn phase1_next_milestone(embedding_artifact_ready: bool) -> &'static str {
     if embedding_artifact_ready {
-        "wire final local ONNX/ort embedding runtime behind embedding.rs"
+        "download onnxruntime.dll, set ORT_DYLIB_PATH, and build with --features onnx-runtime (auto-detected when model is present)"
     } else {
-        "configure valid local ONNX embedding artifact and .identity.json manifest"
+        "run `identityd embedding-bootstrap` to download the local ONNX model and vocabulary"
     }
 }
 
@@ -1309,8 +1318,19 @@ async fn run_pipeline_loop(
     interval_ms: u64,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        let summary = pipeline_once_if_idle(&paths, process_limit, promote_limit, idle_ms)?;
-        print_pipeline_summary("pipeline cycle", &summary);
+        match pipeline_once_if_idle(&paths, process_limit, promote_limit, idle_ms) {
+            Ok(summary) => {
+                if !summary.processed.skipped_idle_gate {
+                    print_pipeline_summary("pipeline cycle", &summary);
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "pipeline cycle error (will retry after {}ms): {error}",
+                    interval_ms
+                );
+            }
+        }
         sleep(Duration::from_millis(interval_ms)).await;
     }
 }
@@ -1597,10 +1617,10 @@ mod tests {
         );
         assert_eq!(phase1_embedding_artifact_status(false, "empty"), "empty");
         assert_eq!(phase1_embedding_artifact_status(true, "ready"), "ready");
-        assert!(phase1_remaining_summary(false).starts_with("valid local ONNX"));
+                assert!(phase1_remaining_summary(false).starts_with("valid local ONNX"));
         assert!(phase1_remaining_summary(true).starts_with("final ONNX"));
-        assert!(phase1_next_milestone(false).starts_with("configure valid local ONNX"));
-        assert!(phase1_next_milestone(true).starts_with("wire final local ONNX"));
+        assert!(phase1_next_milestone(false).starts_with("run "));
+        assert!(phase1_next_milestone(true).starts_with("download"));
     }
 
     #[test]

@@ -569,6 +569,11 @@ fn ingest_file_if_text(
         return Ok(());
     }
 
+    // Check first 512 bytes for null bytes — strong binary indicator
+    if has_null_bytes(path)? {
+        return Ok(());
+    }
+
     let Some(content) = read_text_with_short_retry(path)? else {
         return Ok(());
     };
@@ -604,7 +609,12 @@ fn read_text_with_short_retry(path: &Path) -> Result<Option<String>, FileWatchEr
             Err(error) if is_transient_file_lock(&error) => {
                 return Ok(None);
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    || error.kind() == ErrorKind::InvalidData =>
+            {
+                return Ok(None)
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -640,6 +650,19 @@ pub fn is_supported_text_path(path: &Path) -> bool {
             | "js"
             | "jsx"
             | "py"
+            | "json"
+            | "csv"
+            | "sql"
+            | "css"
+            | "xml"
+            | "yaml"
+            | "yml"
+            | "sh"
+            | "bat"
+            | "ps1"
+            | "conf"
+            | "cfg"
+            | "ini"
     )
 }
 
@@ -699,6 +722,21 @@ fn stable_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Returns `true` if the first 512 bytes of a file contain null bytes,
+/// which strongly indicates binary content that should not be ingested.
+fn has_null_bytes(path: &Path) -> Result<bool, FileWatchError> {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut buf = [0u8; 512];
+    use std::io::Read;
+    let n = file.read(&mut buf).unwrap_or(0);
+    Ok(buf[..n].contains(&0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ensure_safe_watch_root, filesystem_watch_policy_health, is_supported_text_path};
@@ -711,8 +749,10 @@ mod tests {
         assert!(is_supported_text_path(Path::new("notes.MD")));
         assert!(is_supported_text_path(Path::new("page.HTML")));
         assert!(is_supported_text_path(Path::new("lib.rs")));
-        assert!(!is_supported_text_path(Path::new("data.json")));
-        assert!(!is_supported_text_path(Path::new("query.sql")));
+        assert!(is_supported_text_path(Path::new("config.YAML")));
+        assert!(is_supported_text_path(Path::new("data.JSON")));
+        assert!(is_supported_text_path(Path::new("query.SQL")));
+        assert!(is_supported_text_path(Path::new("script.PS1")));
         assert!(!is_supported_text_path(Path::new("events.log")));
         assert!(!is_supported_text_path(Path::new("photo.png")));
         assert!(!is_supported_text_path(Path::new("no-extension")));

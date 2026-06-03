@@ -2356,6 +2356,7 @@ dependencies = [
  "ort",
  "rusqlite",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]

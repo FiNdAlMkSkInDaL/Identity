@@ -4,6 +4,7 @@ use crate::transit::{TransitBuffer, TransitError};
 use crate::workspace::IdentityPaths;
 use std::fmt;
 use std::time::Duration;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug)]
 pub struct ProcessSummary {
@@ -166,12 +167,17 @@ pub fn pipeline_once_if_idle(
 
 #[inline]
 fn clean_for_next_stage(content: &str) -> Option<String> {
-    let cleaned = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized: String = content
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c })
+        .collect();
+    let cleaned: String = normalized.nfkc().collect::<String>();
+    let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    if cleaned.is_empty() {
+    if compact.is_empty() {
         None
     } else {
-        Some(cleaned)
+        Some(compact)
     }
 }
 

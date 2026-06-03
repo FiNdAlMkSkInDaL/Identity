@@ -18,3 +18,4 @@ lol_html = "2.7"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "load-dynamic", "std"], optional = true }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt", "signal", "time"] }
+unicode-normalization = "0.1"
