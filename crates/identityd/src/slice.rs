@@ -182,7 +182,7 @@ fn infer_context_group(intent: &str) -> String {
     }
 }
 
-fn security_block(input: &str) -> Option<SecurityBlock> {
+pub fn security_block(input: &str) -> Option<SecurityBlock> {
     let lower = input.to_ascii_lowercase();
     let checks = [
         ("private_keys", ["private key", "ssh key", "seed phrase"]),

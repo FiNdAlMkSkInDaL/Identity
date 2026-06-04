@@ -24,6 +24,9 @@ use identityd::proxy::LocalCaptureServer;
 use identityd::resource::{
     current_process_resources, memory_budget_status, IDLE_MEMORY_TARGET_BYTES,
 };
+use identityd::context_builder::build_identity_context;
+use identityd::context_snapshot::{capture_context_snapshot, ContextSnapshot};
+use identityd::project_profile::{find_matching_profile, load_profiles};
 use identityd::slice::{build_prompt_package, generate_meslice};
 use identityd::transit::{TransitBuffer, TransitSourceFamilyCounts, DEFAULT_PROCESSING_LEASE_MS};
 use identityd::workspace::IdentityPaths;
@@ -193,7 +196,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     .map(|bytes| bytes <= BINARY_SIZE_TARGET_BYTES)
                     .unwrap_or(false);
             let onnx_session_ready = onnx_runtime.session_status == "ready";
-            let lancedb_ready = memory.vector_store_backend == "lancedb";
+            let lancedb_ready = memory.vector_store_backend.contains("lancedb");
             let accessibility_ready = capture_health.phase1_status == "ready";
 
             let phase1_ready_markers = count_ready([
@@ -987,6 +990,47 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("graph_orphans={}", health.orphan_count);
             println!("graph_decayed_edges={}", health.decayed_edges);
         }
+        "context-now" => {
+            let is_preview = has_flag(&raw_args, "--preview");
+            let is_copy = has_flag(&raw_args, "--copy");
+            if !is_preview && !is_copy {
+                return Err("context-now command requires --preview and/or --copy flag".into());
+            }
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(3);
+
+            let snapshot = capture_context_snapshot().unwrap_or_else(|_| ContextSnapshot::default());
+            let profiles = load_profiles(&paths)?;
+            let matched_profile = find_matching_profile(&profiles, &snapshot);
+            let context = build_identity_context(&paths, &snapshot, matched_profile.as_ref(), limit)?;
+
+            let block = context.to_context_block();
+            if is_preview {
+                println!("{}", block);
+            }
+            if is_copy {
+                identityd::clipboard::set_clipboard_text(&block)?;
+                println!("copied compiled context to clipboard ({} bytes)", block.len());
+            }
+        }
+        "project-profile-list" => {
+            let profiles = load_profiles(&paths)?;
+            if profiles.is_empty() {
+                println!("no project profiles defined");
+            } else {
+                for profile in profiles {
+                    println!(
+                        "profile={} filters={} queries={} guardrails={}",
+                        profile.name,
+                        profile.window_filters.join(","),
+                        profile.memory_query_terms.join(","),
+                        profile.guardrails.len()
+                    );
+                }
+            }
+        }
         "slice-preview" => {
             let intent = read_flag(&raw_args, "--intent")
                 .or_else(|| read_flag(&raw_args, "--query"))
@@ -1173,6 +1217,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .transpose()?
                 .unwrap_or(DEFAULT_ACTIVITY_POLL_MS);
             let recursive = !has_flag(&raw_args, "--non-recursive");
+            let hotkey = has_flag(&raw_args, "--hotkey");
+            let hotkey_combo = read_flag(&raw_args, "--hotkey-combo")
+                .unwrap_or_else(|| "ctrl+alt+i".to_string());
+            let paste_on_hotkey = has_flag(&raw_args, "--paste-on-hotkey");
 
             if let Some(path) = watch_path.as_ref() {
                 if !path.exists() {
@@ -1201,6 +1249,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     watch_active_window,
                     activity_interval_ms,
                     recursive,
+                    hotkey,
+                    hotkey_combo,
+                    paste_on_hotkey,
                 },
             )
             .await?;
@@ -1288,7 +1339,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  context-now [--preview] [--copy] [--limit 3]\n  project-profile-list\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root] [--hotkey] [--hotkey-combo <combo>] [--paste-on-hotkey]"
     );
 }
 
@@ -1421,11 +1472,38 @@ struct DaemonConfig {
     watch_active_window: bool,
     activity_interval_ms: u64,
     recursive: bool,
+    hotkey: bool,
+    hotkey_combo: String,
+    paste_on_hotkey: bool,
 }
 
 async fn run_daemon(paths: IdentityPaths, config: DaemonConfig) -> Result<(), Box<dyn Error>> {
     let server = LocalCaptureServer::new(config.addr, paths.clone())?;
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    let _hotkey_handle = if config.hotkey {
+        match identityd::hotkey::start_hotkey_listener(
+            paths.clone(),
+            &config.hotkey_combo,
+            config.paste_on_hotkey,
+            shutdown.clone(),
+        ) {
+            Ok(handle) => {
+                println!(
+                    "global hotkey listener started on combo '{}' (paste={})",
+                    config.hotkey_combo, config.paste_on_hotkey
+                );
+                Some(handle)
+            }
+            Err(error) => {
+                eprintln!("failed to start global hotkey listener: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let pipeline = run_pipeline_loop(
         paths.clone(),
         config.process_limit,

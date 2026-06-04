@@ -1567,7 +1567,7 @@ mod tests {
         let valid = root.join("model.onnx");
         let wrong_extension = root.join("model.bin");
         fs::write(&valid, [1_u8, 2, 3, 4]).unwrap();
-        fs::write(&embedding_manifest_path(&valid),
+        fs::write(embedding_manifest_path(&valid),
             format!(r#"{{"model_id":"test-minilm","embedding_dim":{}}}"#, EMBEDDING_DIM)).unwrap();
         fs::write(&wrong_extension, [1_u8]).unwrap();
         let empty = root.join("empty.onnx");
@@ -1576,7 +1576,7 @@ mod tests {
         fs::write(&no_manifest, [1_u8]).unwrap();
         let wrong_dimension = root.join("wrong-dim.onnx");
         fs::write(&wrong_dimension, [1_u8]).unwrap();
-        fs::write(&embedding_manifest_path(&wrong_dimension),
+        fs::write(embedding_manifest_path(&wrong_dimension),
             r#"{"model_id":"wrong-dim","embedding_dim":768}"#).unwrap();
 
         let ready = embedding_artifact_health_for_path(Some(valid.clone()));

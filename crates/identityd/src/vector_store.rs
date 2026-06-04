@@ -194,6 +194,18 @@ impl VectorStore {
     pub fn read_primary(&self, node_id: i64) -> Result<Option<Vec<u8>>, VectorStoreError> {
         self.primary.read(node_id)
     }
+
+    pub fn read_mirror(&self, node_id: i64) -> Result<Option<Vec<u8>>, VectorStoreError> {
+        #[cfg(feature = "lancedb-backend")]
+        {
+            self.mirror.read(node_id)
+        }
+        #[cfg(not(feature = "lancedb-backend"))]
+        {
+            let _ = node_id;
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(feature = "lancedb-backend")]

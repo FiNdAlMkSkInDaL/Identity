@@ -98,7 +98,7 @@ cargo run -p identityd -- serve
 cargo run -p identityd -- watch --path C:\Users\finph\Documents
 cargo run -p identityd -- watch --path C:\Users\finph\Documents --poll
 
-# Phase 2 hotkey context injection (planned)
+# Phase 2 hotkey context injection
 cargo run -p identityd -- context-now --preview
 cargo run -p identityd -- context-now --copy
 cargo run -p identityd -- context-now --preview --project tfl-central
@@ -237,4 +237,4 @@ policy enforcement, reports each local capture adapter status plus protected
 source-family counts, and reports whether any legacy plaintext fields still need
 `protect-at-rest`.
 
-`daemon` is the phase 1/2 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. Planned Phase 2 adds `--hotkey` to register a global system hotkey (default `Ctrl+Space`) that generates a compact sanitized context block from the active window and local `.me` memory and copies it to the clipboard. On Windows the filesystem watcher stays on the native event path. `--watch-path` uses the same safe-root policy as `watch`.
+`daemon` is the phase 1/2 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. Phase 2 adds `--hotkey` to register a global system hotkey (default `Ctrl+Space`) that generates a compact sanitized context block from the active window and local `.me` memory and copies it to the clipboard. On Windows the filesystem watcher stays on the native event path. `--watch-path` uses the same safe-root policy as `watch`.

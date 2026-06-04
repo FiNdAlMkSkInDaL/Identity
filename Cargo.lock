@@ -2356,6 +2356,8 @@ dependencies = [
  "lol_html",
  "ort",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tokio",
  "unicode-normalization",
 ]

@@ -59,19 +59,25 @@ impl From<TransitError> for ActivityError {
     }
 }
 
-pub fn capture_active_window_once(paths: &IdentityPaths) -> Result<i64, ActivityError> {
-    #[cfg(windows)]
-    {
-        let snapshot = capture_foreground_window_snapshot()?.ok_or(ActivityError::EmptyCapture)?;
-        let content = format_capture_content(&snapshot);
-        let buffer = TransitBuffer::open(paths)?;
-        return buffer
-            .ingest_text("windows-ui:foreground-window", &content)
-            .map_err(ActivityError::from);
+fn platform_source_label() -> &'static str {
+    if cfg!(windows) {
+        "windows-ui:foreground-window"
+    } else if cfg!(target_os = "macos") {
+        "macos-ui:foreground-window"
+    } else if cfg!(target_os = "linux") {
+        "linux-ui:foreground-window"
+    } else {
+        "generic-ui:foreground-window"
     }
+}
 
-    #[allow(unreachable_code)]
-    Err(ActivityError::UnsupportedPlatform)
+pub fn capture_active_window_once(paths: &IdentityPaths) -> Result<i64, ActivityError> {
+    let snapshot = capture_foreground_window_snapshot()?.ok_or(ActivityError::EmptyCapture)?;
+    let content = format_capture_content(&snapshot);
+    let buffer = TransitBuffer::open(paths)?;
+    buffer
+        .ingest_text(platform_source_label(), &content)
+        .map_err(ActivityError::from)
 }
 
 pub async fn watch_active_window_until_shutdown(
@@ -79,41 +85,30 @@ pub async fn watch_active_window_until_shutdown(
     poll_interval_ms: u64,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), ActivityError> {
-    #[cfg(windows)]
-    {
-        let buffer = TransitBuffer::open(&paths)?;
-        let poll_interval = Duration::from_millis(poll_interval_ms.max(100));
-        let mut last_snapshot = None;
+    let buffer = TransitBuffer::open(&paths)?;
+    let poll_interval = Duration::from_millis(poll_interval_ms.max(100));
+    let mut last_snapshot = None;
 
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            if let Some(snapshot) = capture_foreground_window_snapshot()? {
-                if should_emit_snapshot(last_snapshot.as_ref(), &snapshot) {
-                    let id = buffer.ingest_text(
-                        "windows-ui:foreground-window",
-                        &format_capture_content(&snapshot),
-                    )?;
-                    println!(
-                        "queued active window capture #{id} from {}",
-                        snapshot.application
-                    );
-                    last_snapshot = Some(snapshot);
-                }
-            }
-
-            sleep(poll_interval).await;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
         }
-    }
 
-    #[allow(unreachable_code)]
-    {
-        let _ = paths;
-        let _ = poll_interval_ms;
-        let _ = shutdown;
-        Err(ActivityError::UnsupportedPlatform)
+        if let Some(snapshot) = capture_foreground_window_snapshot()? {
+            if should_emit_snapshot(last_snapshot.as_ref(), &snapshot) {
+                let id = buffer.ingest_text(
+                    platform_source_label(),
+                    &format_capture_content(&snapshot),
+                )?;
+                println!(
+                    "queued active window capture #{id} from {}",
+                    snapshot.application
+                );
+                last_snapshot = Some(snapshot);
+            }
+        }
+
+        sleep(poll_interval).await;
     }
 }
 
@@ -252,6 +247,101 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
         focused_text,
         visible_text,
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, ActivityError> {
+    use std::process::Command;
+    let app_output = Command::new("osascript")
+        .args(&["-e", "tell application \"System Events\" to name of first process whose frontmost is true"])
+        .output();
+    let title_output = Command::new("osascript")
+        .args(&["-e", "tell application \"System Events\" to tell (first process whose frontmost is true) to if (count of windows) > 0 then name of window 1 else \"\""])
+        .output();
+
+    let application = match app_output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "unknown".to_string(),
+    };
+    let title = match title_output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "".to_string(),
+    };
+
+    if application.is_empty() && title.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(WindowSnapshot {
+        application,
+        title: if title.is_empty() { "Active Window".to_string() } else { title },
+        focused_text: None,
+        visible_text: Vec::new(),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, ActivityError> {
+    use std::process::Command;
+    let active_win_output = Command::new("xprop")
+        .args(&["-root", "_NET_ACTIVE_WINDOW"])
+        .output();
+    
+    let window_id = match active_win_output {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.split("window id #").nth(1).map(|id| id.trim().to_string())
+        }
+        _ => None,
+    };
+
+    let Some(win_id) = window_id else {
+        return Ok(None);
+    };
+
+    let title_output = Command::new("xprop")
+        .args(&["-id", &win_id, "_NET_WM_NAME"])
+        .output();
+    let title = match title_output {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.split('=')
+                .nth(1)
+                .map(|v| v.replace('"', "").trim().to_string())
+                .unwrap_or_default()
+        }
+        _ => "".to_string(),
+    };
+
+    let class_output = Command::new("xprop")
+        .args(&["-id", &win_id, "WM_CLASS"])
+        .output();
+    let application = match class_output {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.split('=')
+                .nth(1)
+                .map(|v| v.replace('"', "").replace(',', "").trim().to_string())
+                .unwrap_or_default()
+        }
+        _ => "".to_string(),
+    };
+
+    if application.is_empty() && title.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(WindowSnapshot {
+        application: if application.is_empty() { "unknown".to_string() } else { application },
+        title: if title.is_empty() { "Active Window".to_string() } else { title },
+        focused_text: None,
+        visible_text: Vec::new(),
+    }))
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, ActivityError> {
+    Ok(None)
 }
 
 #[cfg(windows)]

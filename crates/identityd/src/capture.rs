@@ -21,7 +21,7 @@ pub fn capture_adapter_health(paths: &IdentityPaths) -> CaptureAdapterHealth {
         loopback_token_exists,
         filesystem_adapter: "safe-root-policy",
         active_window_adapter: active_window_capture_status(),
-        phase1_status: phase1_capture_adapters_status(loopback_token_exists),
+        phase1_status: phase1_capture_adapters_status(loopback_token_exists, active_window_capture_status()),
         filesystem_policy: filesystem_watch_policy_health(),
     }
 }
@@ -37,16 +37,22 @@ fn loopback_capture_status(capture_token_exists: bool) -> &'static str {
 fn active_window_capture_status() -> &'static str {
     if cfg!(windows) {
         "windows-minimal"
+    } else if cfg!(target_os = "macos") {
+        "macos-accessibility"
+    } else if cfg!(target_os = "linux") {
+        "linux-accessibility"
     } else {
         "unsupported-platform"
     }
 }
 
-fn phase1_capture_adapters_status(capture_token_exists: bool) -> &'static str {
-    if capture_token_exists {
+fn phase1_capture_adapters_status(capture_token_exists: bool, active_window: &str) -> &'static str {
+    if !capture_token_exists {
+        "needs-repair"
+    } else if active_window == "unsupported-platform" {
         "partial"
     } else {
-        "needs-repair"
+        "ready"
     }
 }
 
@@ -70,7 +76,7 @@ mod tests {
         assert_eq!(health.loopback_adapter, "token-protected");
         assert!(health.loopback_token_exists);
         assert_eq!(health.filesystem_adapter, "safe-root-policy");
-        assert_eq!(health.phase1_status, "partial");
+        assert_eq!(health.phase1_status, "ready");
         assert!(health.filesystem_policy.safe_root_enforced);
         assert!(!health.active_window_adapter.is_empty());
 

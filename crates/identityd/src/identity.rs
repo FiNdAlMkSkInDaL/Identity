@@ -538,7 +538,18 @@ impl SqliteMemoryBackend {
                 .read_primary(id)?
                 .map(|primary| primary.len() == bytes.len())
                 .unwrap_or(false);
-            if !primary_ready {
+
+            let mirror_needed = cfg!(feature = "lancedb-backend");
+            let mirror_ready = if mirror_needed {
+                vector_store
+                    .read_mirror(id)?
+                    .map(|mirror| mirror.len() == bytes.len())
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+
+            if !primary_ready || !mirror_ready {
                 vector_store.upsert(id, &bytes)?;
             }
         }

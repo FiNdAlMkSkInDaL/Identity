@@ -14,6 +14,7 @@ pub struct IdentityPaths {
     pub transit_db: PathBuf,
     pub logs_dir: PathBuf,
     pub capture_token: PathBuf,
+    pub projects_json: PathBuf,
 }
 
 #[derive(Debug)]
@@ -54,6 +55,7 @@ impl IdentityPaths {
         let transit_db = root.join("transit.db");
         let logs_dir = root.join("logs");
         let capture_token = root.join("capture.token");
+        let projects_json = root.join("projects.json");
 
         Self {
             root,
@@ -63,6 +65,7 @@ impl IdentityPaths {
             transit_db,
             logs_dir,
             capture_token,
+            projects_json,
         }
     }
 
@@ -72,6 +75,35 @@ impl IdentityPaths {
         fs::create_dir_all(&self.vector_store_dir)?;
         fs::create_dir_all(&self.logs_dir)?;
         self.ensure_capture_token()?;
+        self.ensure_default_projects_json()?;
+        Ok(())
+    }
+
+    pub fn ensure_default_projects_json(&self) -> Result<(), WorkspaceError> {
+        if self.projects_json.exists() {
+            return Ok(());
+        }
+
+        let seed_data = r#"[
+  {
+    "name": "tfl-central",
+    "window_filters": [
+      "tfl-central",
+      "tfl",
+      "oyster"
+    ],
+    "guardrails": [
+      "Do not expose Transport for London (TfL) credentials, private API keys, or security tokens.",
+      "The user is working on TfL integrations. Restrict answers to transport data or code."
+    ],
+    "memory_query_terms": [
+      "tfl",
+      "transport for london",
+      "oyster"
+    ]
+  }
+]"#;
+        fs::write(&self.projects_json, seed_data)?;
         Ok(())
     }
 

@@ -173,10 +173,9 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<(), std::io::Error
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("curl.exe exited with code {code}; download may have failed"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "curl.exe exited with code {code}; download may have failed"
+        )));
     }
 
     Ok(())
