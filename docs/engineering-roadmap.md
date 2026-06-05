@@ -77,7 +77,7 @@ Objective: Build the lightweight keyboard-driven interaction layer that captures
 - Enforce a strict token/character size budget, trimming lower-ranked items first to ensure it remains pasteable (default max 8000 characters).
 
 ### Task 2.4: Clipboard and Native Hotkey Daemon
-- Implement a global hotkey listener (`Ctrl+Space` or custom) natively using Win32 API.
+- Implement a global hotkey listener (`Ctrl+Shift+I` or custom) natively using Win32 API.
 - Copy generated context blocks to the system clipboard upon hotkey trigger.
 - Optionally support native keyboard event simulation to paste the context block into the focused AI tool.
 

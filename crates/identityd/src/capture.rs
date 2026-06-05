@@ -21,7 +21,10 @@ pub fn capture_adapter_health(paths: &IdentityPaths) -> CaptureAdapterHealth {
         loopback_token_exists,
         filesystem_adapter: "safe-root-policy",
         active_window_adapter: active_window_capture_status(),
-        phase1_status: phase1_capture_adapters_status(loopback_token_exists, active_window_capture_status()),
+        phase1_status: phase1_capture_adapters_status(
+            loopback_token_exists,
+            active_window_capture_status(),
+        ),
         filesystem_policy: filesystem_watch_policy_health(),
     }
 }

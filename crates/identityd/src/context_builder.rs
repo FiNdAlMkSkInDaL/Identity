@@ -144,8 +144,9 @@ pub fn build_identity_context(
                 }
             }
 
-            // Format, filter, and limit
+            // Format, filter, deduplicate repeated facts, and limit.
             let mut total_chars = 0;
+            let mut seen_facts = std::collections::HashSet::new();
             for node in unique_memories {
                 // Check memory fact against security blacklist
                 if security_block(&node.summary).is_some() {
@@ -161,6 +162,10 @@ pub fn build_identity_context(
                 } else {
                     sanitized
                 };
+                let fact_key = normalize_fact_key(&truncated);
+                if fact_key.is_empty() || !seen_facts.insert(fact_key) {
+                    continue;
+                }
 
                 // Enforce budget limits (max total 1200 chars)
                 if total_chars + truncated.len() > 1200 {
@@ -206,6 +211,14 @@ fn stable_hash_hex(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn normalize_fact_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -309,6 +322,44 @@ mod tests {
         assert!(block.contains("Active Profile: tfl-central"));
         assert!(block.contains("Follow TfL API regulations"));
         assert!(block.contains("London Underground stations map"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_context_deduplicates_repeated_fact_text() {
+        let root = std::env::temp_dir().join("identity-context-dedup-test");
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let content = "Active application: msedge.exe\nActive window title: Google Gemini";
+
+        for id in 1..=2 {
+            let cleaned = CleanedEvent {
+                id,
+                captured_event_id: id,
+                source: "windows-ui:active-window".to_string(),
+                cleaned_content: content.to_string(),
+                content_hash: format!("hash-{id}"),
+                cleaned_at_ms: id,
+                promoted_at_ms: None,
+            };
+            store.insert_memory_from_cleaned(&cleaned).unwrap();
+        }
+
+        let snap = ContextSnapshot {
+            process_name: "msedge".to_string(),
+            window_title: "Google Gemini".to_string(),
+            focused_text: None,
+        };
+
+        let ctx = build_identity_context(&paths, &snap, None, 5).unwrap();
+        assert_eq!(ctx.facts.len(), 1);
+        assert_eq!(
+            ctx.facts[0],
+            "UI activity in msedge.exe; window Google Gemini"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

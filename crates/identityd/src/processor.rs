@@ -3,6 +3,7 @@ use crate::idle::{is_idle_for, IdleError};
 use crate::transit::{TransitBuffer, TransitError};
 use crate::workspace::IdentityPaths;
 use std::fmt;
+use std::io::Write;
 use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
 
@@ -123,7 +124,10 @@ pub fn promote_once(paths: &IdentityPaths, limit: u32) -> Result<PromoteSummary,
                 promoted += 1;
             }
             Err(error) => {
-                eprintln!("failed to promote cleaned event #{}: {error}", cleaned.id);
+                log_error(&format!(
+                    "failed to promote cleaned event #{}: {error}",
+                    cleaned.id
+                ));
                 failed += 1;
             }
         }
@@ -165,6 +169,10 @@ pub fn pipeline_once_if_idle(
     })
 }
 
+fn log_error(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
 #[inline]
 fn clean_for_next_stage(content: &str) -> Option<String> {
     let mut compact = String::with_capacity(content.len());
@@ -172,7 +180,13 @@ fn clean_for_next_stage(content: &str) -> Option<String> {
 
     let normalized = content
         .chars()
-        .map(|c| if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
         .nfkc();
 
     for c in normalized {

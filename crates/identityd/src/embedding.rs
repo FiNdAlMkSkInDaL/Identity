@@ -275,7 +275,11 @@ pub fn tokenizer_health() -> TokenizerHealth {
 
     // Fall back to default bootstrap directory
     if let Some(home) = home_dir() {
-        let default_vocab = home.join(".identity").join("identity.me").join("models").join("vocab.txt");
+        let default_vocab = home
+            .join(".identity")
+            .join("identity.me")
+            .join("models")
+            .join("vocab.txt");
         if default_vocab.exists() {
             return tokenizer_health_for_path(Some(default_vocab));
         }
@@ -334,7 +338,12 @@ fn requested_embedding_runtime() -> String {
 }
 
 fn default_model_path() -> Option<std::path::PathBuf> {
-    home_dir().map(|h| h.join(".identity").join("identity.me").join("models").join("model.onnx"))
+    home_dir().map(|h| {
+        h.join(".identity")
+            .join("identity.me")
+            .join("models")
+            .join("model.onnx")
+    })
 }
 
 /// Attempts an ONNX embedding probe using configured env vars or default model paths.
@@ -350,7 +359,8 @@ fn try_onnx_probe() -> Result<OnnxEmbeddingRun, std::io::Error> {
     match (model_path, vocab_path) {
         (Some(model), Some(vocab)) => {
             return run_onnx_embedding_file(
-                &model, &vocab,
+                &model,
+                &vocab,
                 "Identity local embedding runtime health probe.",
                 EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
             );
@@ -375,12 +385,21 @@ fn try_onnx_probe() -> Result<OnnxEmbeddingRun, std::io::Error> {
         std::io::Error::new(std::io::ErrorKind::NotFound,
             "home directory unavailable; set IDENTITY_EMBEDDING_MODEL_PATH and IDENTITY_TOKENIZER_VOCAB_PATH")
     })?;
-    let default_model = home.join(".identity").join("identity.me").join("models").join("model.onnx");
-    let default_vocab = home.join(".identity").join("identity.me").join("models").join("vocab.txt");
+    let default_model = home
+        .join(".identity")
+        .join("identity.me")
+        .join("models")
+        .join("model.onnx");
+    let default_vocab = home
+        .join(".identity")
+        .join("identity.me")
+        .join("models")
+        .join("vocab.txt");
 
     if default_model.exists() && default_vocab.exists() {
         return run_onnx_embedding_file(
-            &default_model, &default_vocab,
+            &default_model,
+            &default_vocab,
             "Identity local embedding runtime health probe.",
             EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
         );
@@ -415,7 +434,12 @@ fn try_onnx_embed(text: &str) -> Result<OnnxEmbeddingRun, std::io::Error> {
 
     match (model_path, vocab_path) {
         (Some(model), Some(vocab)) => {
-            return run_onnx_embedding_file(&model, &vocab, text, EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS);
+            return run_onnx_embedding_file(
+                &model,
+                &vocab,
+                text,
+                EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
+            );
         }
         (Some(_), None) | (None, Some(_)) => { /* fall through to default */ }
         (None, None) => {}
@@ -425,14 +449,30 @@ fn try_onnx_embed(text: &str) -> Result<OnnxEmbeddingRun, std::io::Error> {
     let home = home_dir().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
     })?;
-    let default_model = home.join(".identity").join("identity.me").join("models").join("model.onnx");
-    let default_vocab = home.join(".identity").join("identity.me").join("models").join("vocab.txt");
+    let default_model = home
+        .join(".identity")
+        .join("identity.me")
+        .join("models")
+        .join("model.onnx");
+    let default_vocab = home
+        .join(".identity")
+        .join("identity.me")
+        .join("models")
+        .join("vocab.txt");
 
     if default_model.exists() && default_vocab.exists() {
-        return run_onnx_embedding_file(&default_model, &default_vocab, text, EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS);
+        return run_onnx_embedding_file(
+            &default_model,
+            &default_vocab,
+            text,
+            EMBEDDING_TOKENIZER_DEFAULT_MAX_TOKENS,
+        );
     }
 
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "ONNX embedding model not configured"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "ONNX embedding model not configured",
+    ))
 }
 
 pub fn tokenizer_health_for_vocab_path(path: &std::path::Path) -> TokenizerHealth {
@@ -455,7 +495,10 @@ fn tokenizer_health_for_path(path: Option<std::path::PathBuf>) -> TokenizerHealt
 
     let metadata = std::fs::metadata(&path).ok();
     let exists = metadata.is_some();
-    let is_file = metadata.as_ref().map(std::fs::Metadata::is_file).unwrap_or(false);
+    let is_file = metadata
+        .as_ref()
+        .map(std::fs::Metadata::is_file)
+        .unwrap_or(false);
     let size_bytes = metadata.as_ref().map(std::fs::Metadata::len);
     let mut token_count = None;
     let mut status = if !exists {
@@ -553,17 +596,21 @@ pub fn run_onnx_embedding_from_env(
     let model_path = std::env::var_os(EMBEDDING_ONNX_MODEL_PATH_ENV)
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{EMBEDDING_ONNX_MODEL_PATH_ENV} is not configured"),
-        ))?;
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{EMBEDDING_ONNX_MODEL_PATH_ENV} is not configured"),
+            )
+        })?;
     let vocab_path = std::env::var_os(EMBEDDING_TOKENIZER_VOCAB_PATH_ENV)
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{EMBEDDING_TOKENIZER_VOCAB_PATH_ENV} is not configured"),
-        ))?;
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{EMBEDDING_TOKENIZER_VOCAB_PATH_ENV} is not configured"),
+            )
+        })?;
 
     run_onnx_embedding_file(&model_path, &vocab_path, text, max_tokens)
 }
@@ -685,12 +732,8 @@ fn run_onnx_embedding_session(
     let builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level1)
         .map_err(io_other)?;
-    let builder = builder
-        .with_intra_threads(1)
-        .map_err(io_other)?;
-    let mut builder = builder
-        .with_inter_threads(1)
-        .map_err(io_other)?;
+    let builder = builder.with_intra_threads(1).map_err(io_other)?;
+    let mut builder = builder.with_inter_threads(1).map_err(io_other)?;
     let mut session = builder.commit_from_file(model_path).map_err(io_other)?;
 
     let input_names: Vec<&str> = session.inputs().iter().map(|input| input.name()).collect();
@@ -709,8 +752,10 @@ fn run_onnx_embedding_session(
 
     let shape = [1usize, tokenized.input_ids.len()];
     let input_ids = TensorRef::from_array_view((shape, &*tokenized.input_ids)).map_err(io_other)?;
-    let attention_mask = TensorRef::from_array_view((shape, &*tokenized.attention_mask)).map_err(io_other)?;
-    let token_type_ids = TensorRef::from_array_view((shape, &*tokenized.token_type_ids)).map_err(io_other)?;
+    let attention_mask =
+        TensorRef::from_array_view((shape, &*tokenized.attention_mask)).map_err(io_other)?;
+    let token_type_ids =
+        TensorRef::from_array_view((shape, &*tokenized.token_type_ids)).map_err(io_other)?;
 
     let outputs = if input_names.contains(&"token_type_ids") {
         session.run(inputs! {
@@ -1018,7 +1063,9 @@ fn load_onnx_session(
         let mut builder = builder
             .with_inter_threads(1)
             .map_err(|error| error.to_string())?;
-        builder.commit_from_file(path).map_err(|error| error.to_string())
+        builder
+            .commit_from_file(path)
+            .map_err(|error| error.to_string())
     })();
 
     match session {
@@ -1032,8 +1079,14 @@ fn load_onnx_session(
                 load_ms: Some(started.elapsed().as_millis()),
                 input_count: Some(session.inputs().len()),
                 output_count: Some(session.outputs().len()),
-                first_input: session.inputs().first().map(|input| input.name().to_string()),
-                first_output: session.outputs().first().map(|output| output.name().to_string()),
+                first_input: session
+                    .inputs()
+                    .first()
+                    .map(|input| input.name().to_string()),
+                first_output: session
+                    .outputs()
+                    .first()
+                    .map(|output| output.name().to_string()),
             };
             // Intentionally leak the session to prevent C++ destructor from running.
             // On Snapdragon X Elite, the cpuinfo thread-local storage destructor inside
@@ -1085,15 +1138,24 @@ pub fn write_embedding_manifest(
 ) -> Result<std::path::PathBuf, std::io::Error> {
     let model_id = model_id.trim();
     if model_id.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model id must not be empty"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedding model id must not be empty",
+        ));
     }
     if model_id.len() > EMBEDDING_MANIFEST_MODEL_ID_MAX_BYTES {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model id is too long"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedding model id is too long",
+        ));
     }
 
     let metadata = std::fs::metadata(model_path)?;
     if !metadata.is_file() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model path is not a file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedding model path is not a file",
+        ));
     }
     let has_onnx_extension = model_path
         .extension()
@@ -1101,17 +1163,24 @@ pub fn write_embedding_manifest(
         .map(|extension| extension.eq_ignore_ascii_case("onnx"))
         .unwrap_or(false);
     if !has_onnx_extension {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-            "embedding model path must have .onnx extension"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedding model path must have .onnx extension",
+        ));
     }
     if metadata.len() == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "embedding model file is empty"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedding model file is empty",
+        ));
     }
 
     let manifest_path = embedding_manifest_path(model_path);
     if manifest_path.exists() && !overwrite {
-        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists,
-            "embedding manifest already exists; pass --force to overwrite it"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "embedding manifest already exists; pass --force to overwrite it",
+        ));
     }
 
     let manifest = format!(
@@ -1123,7 +1192,9 @@ pub fn write_embedding_manifest(
     Ok(manifest_path)
 }
 
-pub fn embedding_artifact_health_for_model_path(model_path: &std::path::Path) -> EmbeddingArtifactHealth {
+pub fn embedding_artifact_health_for_model_path(
+    model_path: &std::path::Path,
+) -> EmbeddingArtifactHealth {
     embedding_artifact_health_for_path(Some(model_path.to_path_buf()))
 }
 
@@ -1148,7 +1219,10 @@ fn embedding_artifact_health_for_path(path: Option<std::path::PathBuf>) -> Embed
 
     let metadata = std::fs::metadata(&path).ok();
     let exists = metadata.is_some();
-    let is_file = metadata.as_ref().map(std::fs::Metadata::is_file).unwrap_or(false);
+    let is_file = metadata
+        .as_ref()
+        .map(std::fs::Metadata::is_file)
+        .unwrap_or(false);
     let has_onnx_extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1520,9 +1594,16 @@ mod tests {
         let root = temp_test_dir("identity-tokenizer-tokenize-test");
         fs::create_dir_all(&root).unwrap();
         let vocab = root.join("vocab.txt");
-        fs::write(&vocab, "[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\nworld\n##s\n!\nprivate\n").unwrap();
+        fs::write(
+            &vocab,
+            "[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\nworld\n##s\n!\nprivate\n",
+        )
+        .unwrap();
         let tokenized = tokenize_wordpiece_file(&vocab, "Hello worlds! private", 10).unwrap();
-        assert_eq!(tokenized.tokens, vec!["[CLS]", "hello", "world", "##s", "!", "private", "[SEP]"]);
+        assert_eq!(
+            tokenized.tokens,
+            vec!["[CLS]", "hello", "world", "##s", "!", "private", "[SEP]"]
+        );
         assert_eq!(tokenized.input_ids, vec![2, 4, 5, 6, 7, 8, 3, 0, 0, 0]);
         assert_eq!(tokenized.attention_mask, vec![1, 1, 1, 1, 1, 1, 1, 0, 0, 0]);
         assert_eq!(tokenized.token_type_ids, vec![0; 10]);
@@ -1561,14 +1642,23 @@ mod tests {
     fn embedding_artifact_health_validates_configured_model_path() {
         let root = std::env::temp_dir().join(format!(
             "identity-embedding-artifact-test-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         let valid = root.join("model.onnx");
         let wrong_extension = root.join("model.bin");
         fs::write(&valid, [1_u8, 2, 3, 4]).unwrap();
-        fs::write(embedding_manifest_path(&valid),
-            format!(r#"{{"model_id":"test-minilm","embedding_dim":{}}}"#, EMBEDDING_DIM)).unwrap();
+        fs::write(
+            embedding_manifest_path(&valid),
+            format!(
+                r#"{{"model_id":"test-minilm","embedding_dim":{}}}"#,
+                EMBEDDING_DIM
+            ),
+        )
+        .unwrap();
         fs::write(&wrong_extension, [1_u8]).unwrap();
         let empty = root.join("empty.onnx");
         fs::write(&empty, []).unwrap();
@@ -1576,8 +1666,11 @@ mod tests {
         fs::write(&no_manifest, [1_u8]).unwrap();
         let wrong_dimension = root.join("wrong-dim.onnx");
         fs::write(&wrong_dimension, [1_u8]).unwrap();
-        fs::write(embedding_manifest_path(&wrong_dimension),
-            r#"{"model_id":"wrong-dim","embedding_dim":768}"#).unwrap();
+        fs::write(
+            embedding_manifest_path(&wrong_dimension),
+            r#"{"model_id":"wrong-dim","embedding_dim":768}"#,
+        )
+        .unwrap();
 
         let ready = embedding_artifact_health_for_path(Some(valid.clone()));
         let wrong = embedding_artifact_health_for_path(Some(wrong_extension));
@@ -1645,7 +1738,10 @@ mod tests {
     fn temp_test_dir(prefix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "{prefix}-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ))
     }
 }

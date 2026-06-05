@@ -4,7 +4,7 @@ use crate::workspace::{IdentityPaths, WorkspaceError};
 use lol_html::html_content::TextType;
 use lol_html::{doc_text, HtmlRewriter, Settings};
 use std::fmt;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
@@ -45,6 +45,7 @@ pub struct LocalCaptureServer {
     addr: SocketAddr,
     paths: IdentityPaths,
     capture_token: String,
+    listener: Option<TcpListener>,
 }
 
 impl LocalCaptureServer {
@@ -54,15 +55,37 @@ impl LocalCaptureServer {
             addr,
             paths,
             capture_token,
+            listener: None,
+        })
+    }
+
+    pub async fn bind(addr: SocketAddr, paths: IdentityPaths) -> Result<Self, ProxyError> {
+        let capture_token = paths.ensure_capture_token()?;
+        let listener = TcpListener::bind(addr).await?;
+        log_info(&format!(
+            "identityd capture endpoint listening on http://{}",
+            addr
+        ));
+        Ok(Self {
+            addr,
+            paths,
+            capture_token,
+            listener: Some(listener),
         })
     }
 
     pub async fn run(self) -> Result<(), ProxyError> {
-        let listener = TcpListener::bind(self.addr).await?;
-        println!(
-            "identityd capture endpoint listening on http://{}",
-            self.addr
-        );
+        let listener = match self.listener {
+            Some(listener) => listener,
+            None => {
+                let listener = TcpListener::bind(self.addr).await?;
+                log_info(&format!(
+                    "identityd capture endpoint listening on http://{}",
+                    self.addr
+                ));
+                listener
+            }
+        };
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -71,11 +94,21 @@ impl LocalCaptureServer {
 
             tokio::spawn(async move {
                 if let Err(error) = handle_connection(stream, paths, capture_token).await {
-                    eprintln!("failed to handle capture request from {peer_addr}: {error}");
+                    log_error(&format!(
+                        "failed to handle capture request from {peer_addr}: {error}"
+                    ));
                 }
             });
         }
     }
+}
+
+fn log_info(message: &str) {
+    let _ = writeln!(std::io::stdout(), "{message}");
+}
+
+fn log_error(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
 }
 
 async fn handle_connection(

@@ -54,8 +54,23 @@ Current responsibility:
 - Protect captured text, source labels, cleaned staging text, and prototype `.me` semantic text fields before SQLite persistence, while preserving legacy plaintext reads for development data.
 - Report and repair legacy plaintext development rows through `doctor` and `protect-at-rest`.
 - Redact duplicate transit content after successful local `.me` promotion.
+- Run the default local context daemon through `start`, which enables loopback capture, the idle-gated pipeline, bounded active-window metadata capture, and the global `Ctrl+Shift+I` clipboard hotkey.
+- Keep the default build lean: filesystem vector blobs plus SQLite fallback are the normal vector backend. LanceDB/Arrow are opt-in only through `--features lancedb-backend`.
+- Keep Windows active-window deep UI Automation/MSAA text extraction opt-in only through `IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT=1`; the default daemon captures stable foreground application/title metadata because the deep native path can access-violate when launched hidden.
 
 Do not start by building UI, cloud sync, model orchestration, or cryptographic protocol machinery until the local daemon and ingestion pipeline are stable.
+
+## Recent Stability And Debloat Decisions
+
+These are current implementation facts, not wishlist items:
+
+- `.\target\release\identityd.exe start` is the simplest visible daemon command. `.\start-identity.cmd` wraps it.
+- `.\start-identity-hidden.cmd` starts the same default daemon as a hidden background process.
+- `.\scripts\test-identity-hotkey.ps1` is the local end-to-end self-test. It starts a temporary hidden daemon, checks `/health`, simulates `Ctrl+Shift+I`, verifies an `IDENTITY-CONTEXT-BLOCK` lands on the clipboard, restores the clipboard, and stops the temporary daemon.
+- The default hotkey is `Ctrl+Shift+I`, copy-only. `--paste-on-hotkey` remains opt-in and must never press Enter.
+- Long-running daemon logging paths must be non-panicking. Do not use raw `println!`/`eprintln!` in daemon hot paths where broken hidden-process stdout/stderr handles could kill the process.
+- The default release build intentionally excludes LanceDB/Arrow. Measured lean default release size was about 2.2 MB versus about 29.8 MB with the previous LanceDB-default build. Do not re-enable `lancedb-backend` by default without explicit human approval.
+- The Codex in-app Browser plugin may fail on this Windows desktop with an `AttachConsole failed` / `windows sandbox failed: spawn setup refresh` error before it opens a tab. Treat that as a Codex desktop Browser bridge issue, not as proof that `identityd` is broken. Prefer the local `/health` endpoint and `scripts/test-identity-hotkey.ps1` for daemon verification.
 
 ## Implementation Stack Constraints
 
@@ -67,7 +82,7 @@ Use these defaults unless a human explicitly changes the architecture:
 - Ambient daemon memory target: under 50MB.
 - Hidden overlay memory target: under 40MB.
 - Transit buffer: SQLite for queued raw captures.
-- Embedded vector store: LanceDB, in process, zero-server.
+- Embedded vector store: filesystem vector blobs plus SQLite fallback by default; LanceDB/Arrow only behind the explicit `lancedb-backend` feature.
 - Local inference: ONNX Runtime or `ort` Rust bindings.
 - Acceleration targets: CoreML on Apple Silicon, DirectML on Windows, WebGPU where appropriate.
 - Quantization: prefer FP16 or INT4 profiles for local models.
@@ -160,7 +175,8 @@ OS activity / filesystem / local proxy
     -> SQLite transit buffer
     -> idle-aware local SLM cleaner
     -> local embedding model
-    -> LanceDB hybrid vector graph
+    -> filesystem vector blobs + SQLite prototype graph
+       (optional LanceDB backend only with --features lancedb-backend)
 ```
 
 Capture sources:
@@ -279,7 +295,7 @@ If the local proxy drops or a website prevents loopback routing:
 | 3 | Trigger | OS telemetry watchdog | Async |
 | 4 | Purify | Local 1B-3B SLM | Under 1.5s burst |
 | 5 | Map | Local embedding model | Under 200ms burst |
-| 6 | Store | LanceDB `.me` graph | Under 10ms |
+| 6 | Store | filesystem vector blobs + SQLite graph | Under 10ms |
 
 ### Handshake
 
@@ -332,18 +348,16 @@ Phase 3, days 61-90+:
 
 ## Next Agent Execution Steps
 
-Phase 1 is complete. Begin Phase 2 Hotkey Context Injection. The next code changes should be, in order:
+Phase 2 V0 hotkey context injection is implemented. Future work should preserve this working baseline before expanding scope.
 
-1. **Audit before building.** Inspect the repo and confirm: which function powers `capture-active-window`, which function powers `memory-search`, what `slice.rs` exposes, whether a clipboard utility exists, and whether `RegisterHotKey` can be called without the `windows` crate.
-2. **Add `context-now --preview`.** Implement `context_snapshot.rs`, `project_profile.rs`, and `context_builder.rs` as a minimal chain. Wire into a new `context-now` CLI command. Print the context block to stdout. No clipboard, no hotkey.
-3. **Add project profile loading.** Support `~/.identity/projects.json` with deterministic substring matching. Add `project-profile-list` command. Add a `tfl-central` seed profile with its guardrails and memory query terms.
-4. **Add `context-now --copy`.** Implement `clipboard.rs` with native Win32 `OpenClipboard`/`SetClipboardData`/`CloseClipboard`. Log a short confirmation line.
-5. **Add `daemon --hotkey`.** Implement `hotkey.rs` with native Win32 `RegisterHotKey`/`GetMessage` on a dedicated thread. Debounce rapid repeats. On press, call the same internal path as `context-now --copy`. Do not block the ingestion pipeline.
-6. **Add `--paste-on-hotkey` (opt-in).** Use native `SendInput` or `keybd_event` to simulate Ctrl+V after clipboard write. Default remains copy-only. Paste must never press Enter.
-7. **Update tests.** Cover project profile matching, context budget trimming, no raw IDs in output, guardrails present when project matches, empty memory results, missing active-window data, and prompt-injection sanitization.
-8. **Update `docs/system-map.md` and `README.md`** to mark Phase 2 modules as implemented once built.
+1. **Do not rebuild UI first.** Keep the current clipboard-first daemon path stable before adding any Tauri overlay, dashboard, cloud sync, or model orchestration.
+2. **Preserve the lean default.** Normal `cargo build --release -p identityd` must use filesystem vectors plus SQLite fallback. `lancedb-backend` and `onnx-runtime` stay explicit opt-in feature flags.
+3. **Validate daemon behavior locally.** Run `.\scripts\test-identity-hotkey.ps1` after any hotkey, clipboard, active-window, daemon, or startup change. It is the canonical local V0 smoke test.
+4. **Measure bloat.** Run `cargo tree -p identityd --edges normal`, `cargo test -p identityd`, and `cargo build --release -p identityd`; check `(Get-Item target/release/identityd.exe).Length`. The default binary target remains under 15 MB.
+5. **Keep active-window capture safe.** Do not enable deep Windows UI Automation/MSAA text extraction by default. The safe default is foreground app and title metadata; deeper text extraction is only for explicit local debugging with `IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT=1`.
+6. **Update `docs/system-map.md`, `README.md`, and this file** whenever command defaults, runtime boundaries, dependency defaults, daemon state transitions, or capture surfaces change.
 
-V0 definition of done: `context-now --preview` prints, `context-now --copy` writes clipboard, `daemon --hotkey` responds to hotkey. Pressing the hotkey inside Gemini/Codex/Antigravity copies a compact context block with active-window context, TfL guardrails (when matched), and relevant memory excerpts. No dashboard. No Tauri. No network. Binary and RAM budgets must remain within current limits.
+Current V0 definition of done: `context-now --preview` prints, `context-now --copy` writes clipboard, `start` runs the default local context daemon, and pressing `Ctrl+Shift+I` inside Gemini/Codex/Antigravity copies a compact context block with active-window metadata and relevant memory excerpts when available. No dashboard. No Tauri. No network. Binary and RAM budgets remain hard constraints.
 
 ## Reference Documents
 

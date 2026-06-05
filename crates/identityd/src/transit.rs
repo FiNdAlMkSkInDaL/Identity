@@ -89,6 +89,7 @@ pub enum TransitError {
     Crypto(CryptoError),
     IngestSafety(IngestSafetyError),
     InvalidState(String),
+    Io(std::io::Error),
     Sqlite(rusqlite::Error),
 }
 
@@ -99,6 +100,7 @@ impl fmt::Display for TransitError {
             Self::Crypto(error) => write!(f, "{error}"),
             Self::IngestSafety(error) => write!(f, "{error}"),
             Self::InvalidState(reason) => write!(f, "invalid transit state: {reason}"),
+            Self::Io(error) => write!(f, "{error}"),
             Self::Sqlite(error) => write!(f, "{error}"),
         }
     }
@@ -109,6 +111,12 @@ impl std::error::Error for TransitError {}
 impl From<rusqlite::Error> for TransitError {
     fn from(value: rusqlite::Error) -> Self {
         Self::Sqlite(value)
+    }
+}
+
+impl From<std::io::Error> for TransitError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
     }
 }
 
@@ -132,6 +140,9 @@ pub const DEFAULT_PROCESSING_LEASE_MS: i64 = 5 * 60 * 1000;
 
 impl TransitBuffer {
     pub fn open(paths: &IdentityPaths) -> Result<Self, TransitError> {
+        if let Some(parent) = paths.transit_db.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(&paths.transit_db)?;
         let buffer = Self { conn };
         buffer.initialize_schema()?;

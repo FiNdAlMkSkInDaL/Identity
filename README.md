@@ -99,12 +99,16 @@ cargo run -p identityd -- watch --path C:\Users\finph\Documents
 cargo run -p identityd -- watch --path C:\Users\finph\Documents --poll
 
 # Phase 2 hotkey context injection
+.\start-identity.cmd
+.\start-identity-hidden.cmd
+.\scripts\test-identity-hotkey.ps1
+.\target\release\identityd.exe start
 cargo run -p identityd -- context-now --preview
 cargo run -p identityd -- context-now --copy
 cargo run -p identityd -- context-now --preview --project tfl-central
 cargo run -p identityd -- project-profile-list
-cargo run -p identityd -- daemon --hotkey --hotkey-combo "Ctrl+Space"
-cargo run -p identityd -- daemon --hotkey --hotkey-combo "Ctrl+Space" --paste-on-hotkey
+cargo run -p identityd -- daemon --watch-active-window --hotkey --hotkey-combo "Ctrl+Shift+I"
+cargo run -p identityd -- daemon --watch-active-window --hotkey --hotkey-combo "Ctrl+Shift+I" --paste-on-hotkey
 ```
 
 `watch` uses Windows filesystem events by default on Windows. Use `--poll` only as
@@ -119,7 +123,7 @@ current Rust LanceDB stack requires a heavier native build toolchain, including
 `protoc`:
 
 ```powershell
-cargo build -p identityd --features lancedb-backend
+cargo build --release -p identityd --features lancedb-backend
 ```
 
 The current embedding runtime is explicit but still intentionally marked as a
@@ -237,4 +241,4 @@ policy enforcement, reports each local capture adapter status plus protected
 source-family counts, and reports whether any legacy plaintext fields still need
 `protect-at-rest`.
 
-`daemon` is the phase 1/2 convenience entrypoint. It runs the loopback capture server and the idle-gated clean/promote pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path` plus bounded foreground-window capture with `--watch-active-window`. Phase 2 adds `--hotkey` to register a global system hotkey (default `Ctrl+Space`) that generates a compact sanitized context block from the active window and local `.me` memory and copies it to the clipboard. On Windows the filesystem watcher stays on the native event path. `--watch-path` uses the same safe-root policy as `watch`.
+`start` is the simplest local context entrypoint. It runs the loopback capture server, idle-gated clean/promote pipeline, bounded foreground-window capture, and a global `Ctrl+Shift+I` hotkey that copies a compact sanitized context block to the clipboard. `start-identity.cmd` runs it visibly in the current terminal; closing that terminal also stops the daemon. `start-identity-hidden.cmd` starts the same default daemon in a hidden background process. `scripts\test-identity-hotkey.ps1` starts a temporary daemon, simulates `Ctrl+Shift+I`, verifies the clipboard receives an Identity context block, and restores the previous clipboard text. On Windows, default active-window capture records the foreground executable and title; set `IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT=1` only for local debugging of deeper UI Automation/MSAA text extraction. `daemon` remains the lower-level phase 1/2 orchestration entrypoint: it runs the loopback capture server and idle-gated pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path`, bounded foreground-window capture with `--watch-active-window`, and hotkey capture with `--hotkey`. On Windows the filesystem watcher stays on the native event path. `--watch-path` uses the same safe-root policy as `watch`.

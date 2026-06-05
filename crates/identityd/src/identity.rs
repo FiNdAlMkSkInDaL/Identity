@@ -162,6 +162,7 @@ pub enum IdentityError {
     Crypto(CryptoError),
     EmbeddingModelMismatch(String),
     InvalidGraphEdge(String),
+    Io(std::io::Error),
     Random(std::io::Error),
     Sqlite(rusqlite::Error),
     VectorStore(VectorStoreError),
@@ -174,6 +175,7 @@ impl fmt::Display for IdentityError {
             Self::Crypto(error) => write!(f, "{error}"),
             Self::EmbeddingModelMismatch(message) => write!(f, "{message}"),
             Self::InvalidGraphEdge(reason) => write!(f, "invalid graph edge: {reason}"),
+            Self::Io(error) => write!(f, "{error}"),
             Self::Random(error) => write!(f, "failed to generate local node UUID: {error}"),
             Self::Sqlite(error) => write!(f, "{error}"),
             Self::VectorStore(error) => write!(f, "{error}"),
@@ -186,6 +188,12 @@ impl std::error::Error for IdentityError {}
 impl From<rusqlite::Error> for IdentityError {
     fn from(value: rusqlite::Error) -> Self {
         Self::Sqlite(value)
+    }
+}
+
+impl From<std::io::Error> for IdentityError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
     }
 }
 
@@ -434,6 +442,9 @@ struct SqliteMemoryBackend {
 
 impl SqliteMemoryBackend {
     fn open(paths: &IdentityPaths) -> Result<Self, IdentityError> {
+        if let Some(parent) = paths.identity_db.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(&paths.identity_db)?;
         let backend = Self { conn };
         backend.initialize_schema()?;

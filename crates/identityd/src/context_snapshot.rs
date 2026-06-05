@@ -26,7 +26,9 @@ pub enum SnapshotError {
 impl fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedPlatform => write!(f, "active window snapshot is only supported on Windows"),
+            Self::UnsupportedPlatform => {
+                write!(f, "active window snapshot is only supported on Windows")
+            }
             Self::NoForegroundWindow => write!(f, "no foreground window is currently active"),
         }
     }
@@ -93,7 +95,9 @@ fn capture_context_snapshot_windows() -> Result<ContextSnapshot, SnapshotError> 
     struct ProcessHandle(Handle);
     impl Drop for ProcessHandle {
         fn drop(&mut self) {
-            unsafe { CloseHandle(self.0); }
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
     }
 
@@ -128,7 +132,9 @@ fn capture_context_snapshot_windows() -> Result<ContextSnapshot, SnapshotError> 
 
     // Resolve process name from executable path.
     let mut process_id: Dword = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, &mut process_id); }
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+    }
 
     let process_name = if process_id != 0 {
         let proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
@@ -136,9 +142,7 @@ fn capture_context_snapshot_windows() -> Result<ContextSnapshot, SnapshotError> 
             let guard = ProcessHandle(proc);
             let mut buf: Vec<u16> = vec![0u16; 260];
             let mut size: Dword = buf.len() as Dword;
-            let ok = unsafe {
-                QueryFullProcessImageNameW(guard.0, 0, buf.as_mut_ptr(), &mut size)
-            };
+            let ok = unsafe { QueryFullProcessImageNameW(guard.0, 0, buf.as_mut_ptr(), &mut size) };
             if ok != 0 {
                 let path = String::from_utf16_lossy(&buf[..size as usize]);
                 Path::new(&path)
@@ -157,9 +161,17 @@ fn capture_context_snapshot_windows() -> Result<ContextSnapshot, SnapshotError> 
     };
 
     // Focused-control text via UIA / MSAA / WM_GETTEXT chain.
-    let focused_text = read_focused_text(hwnd, &title, VT_I4, CHILDID_SELF, OBJID_CLIENT,
-                                        COINIT_APARTMENTTHREADED, RPC_E_CHANGED_MODE,
-                                        MAX_WINDOW_TEXT_CHARS, WINDOW_TEXT_TIMEOUT_MS);
+    let focused_text = read_focused_text(
+        hwnd,
+        &title,
+        VT_I4,
+        CHILDID_SELF,
+        OBJID_CLIENT,
+        COINIT_APARTMENTTHREADED,
+        RPC_E_CHANGED_MODE,
+        MAX_WINDOW_TEXT_CHARS,
+        WINDOW_TEXT_TIMEOUT_MS,
+    );
 
     Ok(ContextSnapshot {
         process_name,
@@ -204,7 +216,10 @@ fn try_uia_focused_text(coinit_apartmentthreaded: u32, rpc_e_changed_mode: i32) 
     // UIA COM GUIDs and interface definitions (minimal subset).
     #[repr(C)]
     struct Guid {
-        data1: u32, data2: u16, data3: u16, data4: [u8; 8],
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
     }
 
     // IUnknown vtable stubs — just enough to call Release.
@@ -225,11 +240,15 @@ fn try_uia_focused_text(coinit_apartmentthreaded: u32, rpc_e_changed_mode: i32) 
 
     // IUIAutomation CLSID / IID (from Windows SDK).
     let clsid_uia_automation = Guid {
-        data1: 0xff48dba4, data2: 0x60ef, data3: 0x4201,
+        data1: 0xff48dba4,
+        data2: 0x60ef,
+        data3: 0x4201,
         data4: [0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e],
     };
     let iid_iuia = Guid {
-        data1: 0x30cbe57d, data2: 0xd9d0, data3: 0x452a,
+        data1: 0x30cbe57d,
+        data2: 0xd9d0,
+        data3: 0x452a,
         data4: [0xab, 0x13, 0x7a, 0xc5, 0xac, 0x48, 0x25, 0xee],
     };
 
@@ -249,17 +268,17 @@ fn try_uia_focused_text(coinit_apartmentthreaded: u32, rpc_e_changed_mode: i32) 
             &mut punk,
         );
         if hr < 0 || punk.is_null() {
-            if coinit_ok { CoUninitialize(); }
+            if coinit_ok {
+                CoUninitialize();
+            }
             return None;
         }
 
         // IUIAutomation::GetFocusedElement is at vtable slot 8 (0-indexed).
         // Vtable: [QueryInterface, AddRef, Release, ..., GetFocusedElement=8]
         let vtable = *(punk as *mut *mut *mut usize);
-        type GetFocusedElementFn = unsafe extern "system" fn(
-            this: *mut c_void,
-            element: *mut *mut c_void,
-        ) -> HResult;
+        type GetFocusedElementFn =
+            unsafe extern "system" fn(this: *mut c_void, element: *mut *mut c_void) -> HResult;
         let get_focused: GetFocusedElementFn = std::mem::transmute(*vtable.add(8));
 
         let mut elem: *mut c_void = std::ptr::null_mut();
@@ -271,7 +290,9 @@ fn try_uia_focused_text(coinit_apartmentthreaded: u32, rpc_e_changed_mode: i32) 
         release_uia(punk);
 
         if hr < 0 || elem.is_null() {
-            if coinit_ok { CoUninitialize(); }
+            if coinit_ok {
+                CoUninitialize();
+            }
             return None;
         }
 
@@ -293,25 +314,42 @@ fn try_uia_focused_text(coinit_apartmentthreaded: u32, rpc_e_changed_mode: i32) 
             let len = SysStringLen(bstr) as usize;
             let text = String::from_utf16_lossy(std::slice::from_raw_parts(bstr, len)).to_string();
             SysFreeString(bstr);
-            if text.is_empty() { None } else { Some(text) }
-        } else { None };
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        } else {
+            None
+        };
 
         let name_text = if value_text.is_none() {
             let mut nbstr: *mut u16 = std::ptr::null_mut();
             if get_name(elem, &mut nbstr) >= 0 && !nbstr.is_null() {
                 let len = SysStringLen(nbstr) as usize;
-                let text = String::from_utf16_lossy(std::slice::from_raw_parts(nbstr, len)).to_string();
+                let text =
+                    String::from_utf16_lossy(std::slice::from_raw_parts(nbstr, len)).to_string();
                 SysFreeString(nbstr);
-                if text.is_empty() { None } else { Some(text) }
-            } else { None }
-        } else { None };
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Release IUIAutomationElement.
         let release_elem: unsafe extern "system" fn(*mut c_void) -> u32 =
             std::mem::transmute(*elem_vtable.add(2));
         release_elem(elem);
 
-        if coinit_ok { CoUninitialize(); }
+        if coinit_ok {
+            CoUninitialize();
+        }
         value_text.or(name_text)
     }
 }
@@ -330,7 +368,9 @@ fn try_msaa_focused_text(
     #[repr(C)]
     struct Variant {
         vt: u16,
-        r1: u16, r2: u16, r3: u16,
+        r1: u16,
+        r2: u16,
+        r3: u16,
         val: i64,
     }
 
@@ -345,8 +385,8 @@ fn try_msaa_focused_text(
     }
 
     const IID_IACCESSIBLE: [u8; 16] = [
-        0x18, 0xc3, 0x5b, 0x61, 0x90, 0x44, 0xcf, 0x11,
-        0xa8, 0x38, 0x00, 0xdd, 0x01, 0x06, 0x62, 0x25,
+        0x18, 0xc3, 0x5b, 0x61, 0x90, 0x44, 0xcf, 0x11, 0xa8, 0x38, 0x00, 0xdd, 0x01, 0x06, 0x62,
+        0x25,
     ];
 
     let mut acc: *mut c_void = std::ptr::null_mut();
@@ -363,18 +403,18 @@ fn try_msaa_focused_text(
             fn SysStringLen(bstr: *mut u16) -> u32;
         }
 
-        type GetAccNameFn = unsafe extern "system" fn(
-            *mut c_void,
-            Variant,
-            *mut *mut u16,
-        ) -> HResult;
-        type GetAccValueFn = unsafe extern "system" fn(
-            *mut c_void,
-            Variant,
-            *mut *mut u16,
-        ) -> HResult;
+        type GetAccNameFn =
+            unsafe extern "system" fn(*mut c_void, Variant, *mut *mut u16) -> HResult;
+        type GetAccValueFn =
+            unsafe extern "system" fn(*mut c_void, Variant, *mut *mut u16) -> HResult;
 
-        let self_variant = Variant { vt: vt_i4, r1: 0, r2: 0, r3: 0, val: childid_self as i64 };
+        let self_variant = Variant {
+            vt: vt_i4,
+            r1: 0,
+            r2: 0,
+            r3: 0,
+            val: childid_self as i64,
+        };
 
         let get_value: GetAccValueFn = std::mem::transmute(*vtable.add(10));
         let get_name: GetAccNameFn = std::mem::transmute(*vtable.add(7));
@@ -384,19 +424,40 @@ fn try_msaa_focused_text(
             let len = SysStringLen(bstr) as usize;
             let text = String::from_utf16_lossy(std::slice::from_raw_parts(bstr, len)).to_string();
             SysFreeString(bstr);
-            if text.is_empty() { None } else { Some(text) }
-        } else { None };
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        } else {
+            None
+        };
 
         let name_text = if value_text.is_none() {
-            let nv = Variant { vt: vt_i4, r1: 0, r2: 0, r3: 0, val: childid_self as i64 };
+            let nv = Variant {
+                vt: vt_i4,
+                r1: 0,
+                r2: 0,
+                r3: 0,
+                val: childid_self as i64,
+            };
             let mut nbstr: *mut u16 = std::ptr::null_mut();
             if get_name(acc, nv, &mut nbstr) >= 0 && !nbstr.is_null() {
                 let len = SysStringLen(nbstr) as usize;
-                let text = String::from_utf16_lossy(std::slice::from_raw_parts(nbstr, len)).to_string();
+                let text =
+                    String::from_utf16_lossy(std::slice::from_raw_parts(nbstr, len)).to_string();
                 SysFreeString(nbstr);
-                if text.is_empty() { None } else { Some(text) }
-            } else { None }
-        } else { None };
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let release: unsafe extern "system" fn(*mut c_void) -> u32 =
             std::mem::transmute(*vtable.add(2));
@@ -441,7 +502,11 @@ fn try_wm_gettext(
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let text = String::from_utf16_lossy(&buf[..len]).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use crate::workspace::IdentityPaths;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -202,10 +202,10 @@ impl FileWatcher {
                 let config = self.config;
                 let shutdown = shutdown.clone();
 
-                println!(
+                log_info(&format!(
                     "watching {} with Windows filesystem events",
                     config.root.display()
-                );
+                ));
 
                 return tokio::task::spawn_blocking(move || {
                     windows_watch_loop(paths, config, shutdown)
@@ -218,10 +218,10 @@ impl FileWatcher {
     }
 
     async fn run_poll_loop(self, shutdown: Arc<AtomicBool>) -> Result<(), FileWatchError> {
-        println!(
+        log_info(&format!(
             "polling {} for local text captures",
             self.config.root.display()
-        );
+        ));
 
         let mut seen = HashMap::new();
         let paths = self.paths;
@@ -600,8 +600,15 @@ fn ingest_file_if_text(
     let id = buffer.ingest_text(&source, &cleaned)?;
     seen.insert(path.to_path_buf(), fingerprint);
 
-    println!("queued filesystem capture #{id} from {}", path.display());
+    log_info(&format!(
+        "queued filesystem capture #{id} from {}",
+        path.display()
+    ));
     Ok(())
+}
+
+fn log_info(message: &str) {
+    let _ = writeln!(std::io::stdout(), "{message}");
 }
 
 fn read_text_with_short_retry(path: &Path) -> Result<Option<String>, FileWatchError> {

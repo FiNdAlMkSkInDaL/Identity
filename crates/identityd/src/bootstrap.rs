@@ -4,9 +4,10 @@
 // downloads. Existing files are not re-downloaded.
 
 use crate::embedding::{
-    embedding_artifact_health_for_model_path, embedding_manifest_path, tokenizer_health_for_vocab_path,
-    write_embedding_manifest, EMBEDDING_ONNX_DYLIB_PATH_ENV, EMBEDDING_ONNX_MODEL_PATH_ENV,
-    EMBEDDING_RUNTIME_ENV, EMBEDDING_RUNTIME_ONNX, EMBEDDING_TOKENIZER_VOCAB_PATH_ENV,
+    embedding_artifact_health_for_model_path, embedding_manifest_path,
+    tokenizer_health_for_vocab_path, write_embedding_manifest, EMBEDDING_ONNX_DYLIB_PATH_ENV,
+    EMBEDDING_ONNX_MODEL_PATH_ENV, EMBEDDING_RUNTIME_ENV, EMBEDDING_RUNTIME_ONNX,
+    EMBEDDING_TOKENIZER_VOCAB_PATH_ENV,
 };
 
 const BOOTSTRAP_MODEL_URL: &str =
@@ -106,10 +107,7 @@ pub fn print_bootstrap_guidance(result: &BootstrapResult) {
     println!("  model  : {}", result.model_path.display());
     println!("  vocab  : {}", result.vocab_path.display());
     println!("  manifest: {}", result.manifest_path.display());
-    println!(
-        "  model size : {} bytes",
-        result.model_size_bytes
-    );
+    println!("  model size : {} bytes", result.model_size_bytes);
     println!(
         "  vocab size : {} bytes ({} tokens)",
         result.vocab_size_bytes, result.vocab_token_count
@@ -180,4 +178,3 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<(), std::io::Error
 
     Ok(())
 }
-

@@ -1,6 +1,7 @@
 use crate::transit::{TransitBuffer, TransitError};
 use crate::workspace::IdentityPaths;
 use std::fmt;
+use std::io::Write;
 #[cfg(windows)]
 use std::path::Path;
 use std::sync::{
@@ -28,6 +29,8 @@ const OBJID_CLIENT: u32 = 0xFFFF_FFFCu32;
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
 #[cfg(windows)]
 const RPC_E_CHANGED_MODE: i32 = -2147417850;
+#[cfg(windows)]
+const WINDOWS_DEEP_ACTIVE_TEXT_ENV: &str = "IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT";
 
 #[derive(Debug)]
 pub enum ActivityError {
@@ -96,20 +99,22 @@ pub async fn watch_active_window_until_shutdown(
 
         if let Some(snapshot) = capture_foreground_window_snapshot()? {
             if should_emit_snapshot(last_snapshot.as_ref(), &snapshot) {
-                let id = buffer.ingest_text(
-                    platform_source_label(),
-                    &format_capture_content(&snapshot),
-                )?;
-                println!(
+                let id = buffer
+                    .ingest_text(platform_source_label(), &format_capture_content(&snapshot))?;
+                log_info(&format!(
                     "queued active window capture #{id} from {}",
                     snapshot.application
-                );
+                ));
                 last_snapshot = Some(snapshot);
             }
         }
 
         sleep(poll_interval).await;
     }
+}
+
+fn log_info(message: &str) {
+    let _ = writeln!(std::io::stdout(), "{message}");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +150,17 @@ fn format_capture_content(snapshot: &WindowSnapshot) -> String {
 
 fn should_emit_snapshot(previous: Option<&WindowSnapshot>, current: &WindowSnapshot) -> bool {
     previous != Some(current)
+}
+
+#[cfg(windows)]
+fn deep_active_window_text_enabled() -> bool {
+    match std::env::var(WINDOWS_DEEP_ACTIVE_TEXT_ENV) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }
 
 #[cfg(windows)]
@@ -211,8 +227,14 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
         return Ok(None);
     }
 
-    let visible_text = collect_visible_window_text(hwnd, &title);
-    let focused_text = focused_control_text(hwnd, title.as_str());
+    let (visible_text, focused_text) = if deep_active_window_text_enabled() {
+        (
+            collect_visible_window_text(hwnd, &title),
+            focused_control_text(hwnd, title.as_str()),
+        )
+    } else {
+        (Vec::new(), None)
+    };
 
     let mut process_id = 0;
     unsafe {
@@ -253,7 +275,10 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
 fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, ActivityError> {
     use std::process::Command;
     let app_output = Command::new("osascript")
-        .args(&["-e", "tell application \"System Events\" to name of first process whose frontmost is true"])
+        .args(&[
+            "-e",
+            "tell application \"System Events\" to name of first process whose frontmost is true",
+        ])
         .output();
     let title_output = Command::new("osascript")
         .args(&["-e", "tell application \"System Events\" to tell (first process whose frontmost is true) to if (count of windows) > 0 then name of window 1 else \"\""])
@@ -274,7 +299,11 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
 
     Ok(Some(WindowSnapshot {
         application,
-        title: if title.is_empty() { "Active Window".to_string() } else { title },
+        title: if title.is_empty() {
+            "Active Window".to_string()
+        } else {
+            title
+        },
         focused_text: None,
         visible_text: Vec::new(),
     }))
@@ -286,11 +315,13 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
     let active_win_output = Command::new("xprop")
         .args(&["-root", "_NET_ACTIVE_WINDOW"])
         .output();
-    
+
     let window_id = match active_win_output {
         Ok(out) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stdout);
-            s.split("window id #").nth(1).map(|id| id.trim().to_string())
+            s.split("window id #")
+                .nth(1)
+                .map(|id| id.trim().to_string())
         }
         _ => None,
     };
@@ -332,8 +363,16 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
     }
 
     Ok(Some(WindowSnapshot {
-        application: if application.is_empty() { "unknown".to_string() } else { application },
-        title: if title.is_empty() { "Active Window".to_string() } else { title },
+        application: if application.is_empty() {
+            "unknown".to_string()
+        } else {
+            application
+        },
+        title: if title.is_empty() {
+            "Active Window".to_string()
+        } else {
+            title
+        },
         focused_text: None,
         visible_text: Vec::new(),
     }))
@@ -345,7 +384,7 @@ fn capture_foreground_window_snapshot() -> Result<Option<WindowSnapshot>, Activi
 }
 
 #[cfg(windows)]
-fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
+fn read_uia_text(_hwnd: *mut std::ffi::c_void) -> Option<String> {
     use std::ffi::c_void;
 
     type Hresult = i32;
@@ -397,11 +436,8 @@ fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
 
     #[repr(C)]
     struct IUnknownVtbl {
-        query_interface: unsafe extern "system" fn(
-            *mut IUnknown,
-            *const Guid,
-            *mut *mut c_void,
-        ) -> Hresult,
+        query_interface:
+            unsafe extern "system" fn(*mut IUnknown, *const Guid, *mut *mut c_void) -> Hresult,
         add_ref: unsafe extern "system" fn(*mut IUnknown) -> u32,
         release: unsafe extern "system" fn(*mut IUnknown) -> u32,
     }
@@ -414,7 +450,7 @@ fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
     #[repr(C)]
     struct AutomationVtbl {
         parent: IUnknownVtbl,
-        _pad0: [usize; 4], // indices 3-6: CompareElements, CompareRuntimeIds, GetRootElement, ElementFromPoint
+        _pad0: [usize; 5], // indices 3-7: CompareElements, CompareRuntimeIds, GetRootElement, ElementFromHandle, ElementFromPoint
         get_focused_element:
             unsafe extern "system" fn(*mut Automation, *mut *mut c_void) -> Hresult,
     }
@@ -430,7 +466,7 @@ fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
         _pad0: [usize; 7], // indices 3-9: SetFocus .. BuildUpdatedCache
         get_current_property_value: unsafe extern "system" fn(
             *mut Element,
-            i32,       // propertyId
+            i32,          // propertyId
             *mut Variant, // retVal
         ) -> Hresult,
     }
@@ -472,11 +508,6 @@ fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
     const CLSCTX_INPROC_SERVER: u32 = 1;
     const UIA_NAME_PROPERTY_ID: i32 = 30005;
     const UIA_VALUE_VALUE_PROPERTY_ID: i32 = 30045;
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn IsChild(hWndParent: *mut c_void, hWnd: *mut c_void) -> i32;
-    }
 
     struct ComInitGuard(bool);
 
@@ -556,15 +587,8 @@ fn read_uia_text(hwnd: *mut std::ffi::c_void) -> Option<String> {
 
     // Get focused element
     let mut raw_element = std::ptr::null_mut::<c_void>();
-    let hr = unsafe {
-        ((*(*auto.ptr).lp_vtbl).get_focused_element)(auto.ptr, &mut raw_element)
-    };
+    let hr = unsafe { ((*(*auto.ptr).lp_vtbl).get_focused_element)(auto.ptr, &mut raw_element) };
     if hr < 0 || raw_element.is_null() {
-        return None;
-    }
-
-    // Verify the focused element belongs to our window tree
-    if hwnd != raw_element && unsafe { IsChild(hwnd, raw_element.cast()) } == 0 {
         return None;
     }
 

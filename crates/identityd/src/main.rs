@@ -3,6 +3,8 @@ use identityd::activity::{
 };
 use identityd::bootstrap::{bootstrap_onnx_artifact, print_bootstrap_guidance};
 use identityd::capture::capture_adapter_health;
+use identityd::context_builder::build_identity_context;
+use identityd::context_snapshot::{capture_context_snapshot, ContextSnapshot};
 use identityd::crypto::protection_backend;
 use identityd::embedding::{
     active_embedding_health, embedding_artifact_health_for_model_path,
@@ -20,18 +22,17 @@ use identityd::identity::IdentityStore;
 use identityd::processor::{
     pipeline_once_if_idle, process_once, process_once_if_idle, promote_once,
 };
+use identityd::project_profile::{find_matching_profile, load_profiles};
 use identityd::proxy::LocalCaptureServer;
 use identityd::resource::{
     current_process_resources, memory_budget_status, IDLE_MEMORY_TARGET_BYTES,
 };
-use identityd::context_builder::build_identity_context;
-use identityd::context_snapshot::{capture_context_snapshot, ContextSnapshot};
-use identityd::project_profile::{find_matching_profile, load_profiles};
 use identityd::slice::{build_prompt_package, generate_meslice};
 use identityd::transit::{TransitBuffer, TransitSourceFamilyCounts, DEFAULT_PROCESSING_LEASE_MS};
 use identityd::workspace::IdentityPaths;
 use std::env;
 use std::error::Error;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
@@ -47,7 +48,7 @@ const BINARY_SIZE_TARGET_BYTES: u64 = 15 * 1024 * 1024;
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("identityd error: {error}");
+        log_error(&format!("identityd error: {error}"));
         std::process::exit(1);
     }
     // If the ONNX runtime was loaded into this process during the command, bypass
@@ -196,7 +197,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     .map(|bytes| bytes <= BINARY_SIZE_TARGET_BYTES)
                     .unwrap_or(false);
             let onnx_session_ready = onnx_runtime.session_status == "ready";
-            let lancedb_ready = memory.vector_store_backend.contains("lancedb");
+            let vector_store_ready = memory.vector_store_backend == "filesystem+sqlite"
+                || memory.vector_store_backend.contains("lancedb");
             let accessibility_ready = capture_health.phase1_status == "ready";
 
             let phase1_ready_markers = count_ready([
@@ -211,12 +213,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 local_pipeline_status == "ready",
                 resource_budget_ready,
                 onnx_session_ready,
-                lancedb_ready,
+                vector_store_ready,
                 accessibility_ready,
             ]);
             let phase1_partial_markers = count_ready([
                 !onnx_session_ready,
-                !lancedb_ready,
+                !vector_store_ready,
                 !accessibility_ready,
                 !embedding_artifact_ready,
             ]);
@@ -477,7 +479,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 phase1_remaining_summary(
                     embedding_artifact_ready,
                     onnx_session_ready,
-                    lancedb_ready,
+                    vector_store_ready,
                     accessibility_ready
                 )
             );
@@ -1001,10 +1003,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .transpose()?
                 .unwrap_or(3);
 
-            let snapshot = capture_context_snapshot().unwrap_or_else(|_| ContextSnapshot::default());
+            let snapshot =
+                capture_context_snapshot().unwrap_or_else(|_| ContextSnapshot::default());
             let profiles = load_profiles(&paths)?;
             let matched_profile = find_matching_profile(&profiles, &snapshot);
-            let context = build_identity_context(&paths, &snapshot, matched_profile.as_ref(), limit)?;
+            let context =
+                build_identity_context(&paths, &snapshot, matched_profile.as_ref(), limit)?;
 
             let block = context.to_context_block();
             if is_preview {
@@ -1012,7 +1016,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             if is_copy {
                 identityd::clipboard::set_clipboard_text(&block)?;
-                println!("copied compiled context to clipboard ({} bytes)", block.len());
+                println!(
+                    "copied compiled context to clipboard ({} bytes)",
+                    block.len()
+                );
             }
         }
         "project-profile-list" => {
@@ -1188,7 +1195,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("press Ctrl+C to stop filesystem watching");
             watcher.run().await?;
         }
-        "daemon" => {
+        "daemon" | "start" => {
+            let start_preset = command == "start";
             let addr = read_flag(&raw_args, "--addr")
                 .unwrap_or_else(|| "127.0.0.1:8080".to_string())
                 .parse::<SocketAddr>()?;
@@ -1211,15 +1219,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .transpose()?
                 .unwrap_or(2000);
             let watch_path = read_flag(&raw_args, "--watch-path").map(PathBuf::from);
-            let watch_active_window = has_flag(&raw_args, "--watch-active-window");
+            let watch_active_window = start_preset || has_flag(&raw_args, "--watch-active-window");
             let activity_interval_ms = read_flag(&raw_args, "--activity-interval-ms")
                 .map(|value| value.parse::<u64>())
                 .transpose()?
                 .unwrap_or(DEFAULT_ACTIVITY_POLL_MS);
             let recursive = !has_flag(&raw_args, "--non-recursive");
-            let hotkey = has_flag(&raw_args, "--hotkey");
+            let hotkey = start_preset || has_flag(&raw_args, "--hotkey");
             let hotkey_combo = read_flag(&raw_args, "--hotkey-combo")
-                .unwrap_or_else(|| "ctrl+alt+i".to_string());
+                .unwrap_or_else(|| "ctrl+shift+i".to_string());
             let paste_on_hotkey = has_flag(&raw_args, "--paste-on-hotkey");
 
             if let Some(path) = watch_path.as_ref() {
@@ -1236,7 +1244,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 })?;
             }
 
-            println!("press Ctrl+C to stop identityd daemon");
+            if start_preset {
+                log_info(&format!(
+                    "starting identityd default local context capture (hotkey={hotkey_combo}, paste={paste_on_hotkey})"
+                ));
+            }
+            log_info("press Ctrl+C to stop identityd daemon");
             run_daemon(
                 paths,
                 DaemonConfig {
@@ -1339,7 +1352,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  context-now [--preview] [--copy] [--limit 3]\n  project-profile-list\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root] [--hotkey] [--hotkey-combo <combo>] [--paste-on-hotkey]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  start [--paste-on-hotkey] [--hotkey-combo ctrl+shift+i]\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  context-now [--preview] [--copy] [--limit 3]\n  project-profile-list\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root] [--hotkey] [--hotkey-combo <combo>] [--paste-on-hotkey]"
     );
 }
 
@@ -1372,7 +1385,7 @@ fn phase1_embedding_artifact_status(
 fn phase1_remaining_summary(
     embedding_artifact_ready: bool,
     onnx_session_ready: bool,
-    lancedb_ready: bool,
+    vector_store_ready: bool,
     accessibility_ready: bool,
 ) -> String {
     let mut remaining = Vec::new();
@@ -1382,8 +1395,8 @@ fn phase1_remaining_summary(
     if !onnx_session_ready {
         remaining.push("final ONNX/ort embedding runtime (dll + feature flag)");
     }
-    if !lancedb_ready {
-        remaining.push("default embedded LanceDB or equivalent hybrid graph");
+    if !vector_store_ready {
+        remaining.push("default local vector store backend");
     }
     if !accessibility_ready {
         remaining.push("fuller OS accessibility coverage");
@@ -1393,10 +1406,7 @@ fn phase1_remaining_summary(
     remaining.join("; ")
 }
 
-fn phase1_next_milestone(
-    embedding_artifact_ready: bool,
-    onnx_session_ready: bool,
-) -> &'static str {
+fn phase1_next_milestone(embedding_artifact_ready: bool, onnx_session_ready: bool) -> &'static str {
     if !embedding_artifact_ready {
         "run `identityd embedding-bootstrap` to download the local ONNX model and vocabulary"
     } else if !onnx_session_ready {
@@ -1434,13 +1444,37 @@ async fn run_pipeline_loop(
                 }
             }
             Err(error) => {
-                eprintln!(
-                    "pipeline cycle error (will retry after {}ms): {error}",
-                    interval_ms
-                );
+                log_error(&format!(
+                    "pipeline cycle error (will retry after {interval_ms}ms): {error}"
+                ));
             }
         }
         sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+async fn run_daemon_active_window_watch(
+    paths: IdentityPaths,
+    interval_ms: u64,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error>> {
+    let retry_ms = interval_ms.max(1000);
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        match watch_active_window_until_shutdown(paths.clone(), interval_ms, shutdown.clone()).await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                log_error(&format!(
+                    "active-window watcher error (will retry after {retry_ms}ms): {error}"
+                ));
+                sleep(Duration::from_millis(retry_ms)).await;
+            }
+        }
     }
 }
 
@@ -1478,7 +1512,24 @@ struct DaemonConfig {
 }
 
 async fn run_daemon(paths: IdentityPaths, config: DaemonConfig) -> Result<(), Box<dyn Error>> {
-    let server = LocalCaptureServer::new(config.addr, paths.clone())?;
+    loop {
+        match run_daemon_once(paths.clone(), &config).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                log_error(&format!(
+                    "identityd daemon stopped unexpectedly: {error}; restarting in 1000ms"
+                ));
+                sleep(Duration::from_millis(1000)).await;
+            }
+        }
+    }
+}
+
+async fn run_daemon_once(
+    paths: IdentityPaths,
+    config: &DaemonConfig,
+) -> Result<(), Box<dyn Error>> {
+    let server = LocalCaptureServer::bind(config.addr, paths.clone()).await?;
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let _hotkey_handle = if config.hotkey {
@@ -1489,14 +1540,14 @@ async fn run_daemon(paths: IdentityPaths, config: DaemonConfig) -> Result<(), Bo
             shutdown.clone(),
         ) {
             Ok(handle) => {
-                println!(
+                log_info(&format!(
                     "global hotkey listener started on combo '{}' (paste={})",
                     config.hotkey_combo, config.paste_on_hotkey
-                );
+                ));
                 Some(handle)
             }
             Err(error) => {
-                eprintln!("failed to start global hotkey listener: {error}");
+                log_error(&format!("failed to start global hotkey listener: {error}"));
                 None
             }
         }
@@ -1512,14 +1563,10 @@ async fn run_daemon(paths: IdentityPaths, config: DaemonConfig) -> Result<(), Bo
         config.interval_ms,
     );
     let activity_watch = config.watch_active_window.then(|| {
-        watch_active_window_until_shutdown(
-            paths.clone(),
-            config.activity_interval_ms,
-            shutdown.clone(),
-        )
+        run_daemon_active_window_watch(paths.clone(), config.activity_interval_ms, shutdown.clone())
     });
 
-    if let Some(watch_root) = config.watch_path {
+    if let Some(watch_root) = config.watch_path.clone() {
         let watcher = FileWatcher::new(
             paths,
             FileWatcherConfig {
@@ -1539,26 +1586,37 @@ async fn run_daemon(paths: IdentityPaths, config: DaemonConfig) -> Result<(), Bo
             tokio::pin!(activity_watch);
 
             tokio::select! {
-                result = &mut server => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                result = &mut pipeline => result,
-                result = &mut watcher => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                result = &mut activity_watch => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                _ = signal::ctrl_c() => {
-                    shutdown.store(true, Ordering::Relaxed);
-                    println!("shutdown signal received");
-                    Ok(())
-                }
+                result = &mut server => match result {
+                    Ok(()) => Err("capture endpoint stopped unexpectedly".into()),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                },
+                result = &mut pipeline => match result {
+                    Ok(()) => Err("pipeline loop stopped unexpectedly".into()),
+                    Err(error) => Err(error),
+                },
+                result = &mut watcher => match result {
+                    Ok(()) => Err("filesystem watcher stopped unexpectedly".into()),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                },
+                result = &mut activity_watch => match result {
+                    Ok(()) => Err("active-window watcher stopped unexpectedly".into()),
+                    Err(error) => Err(error),
+                },
             }
         } else {
             tokio::select! {
-                result = &mut server => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                result = &mut pipeline => result,
-                result = &mut watcher => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                _ = signal::ctrl_c() => {
-                    shutdown.store(true, Ordering::Relaxed);
-                    println!("shutdown signal received");
-                    Ok(())
-                }
+                result = &mut server => match result {
+                    Ok(()) => Err("capture endpoint stopped unexpectedly".into()),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                },
+                result = &mut pipeline => match result {
+                    Ok(()) => Err("pipeline loop stopped unexpectedly".into()),
+                    Err(error) => Err(error),
+                },
+                result = &mut watcher => match result {
+                    Ok(()) => Err("filesystem watcher stopped unexpectedly".into()),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                },
             }
         }
     } else {
@@ -1570,31 +1628,36 @@ async fn run_daemon(paths: IdentityPaths, config: DaemonConfig) -> Result<(), Bo
             tokio::pin!(activity_watch);
 
             tokio::select! {
-                result = &mut server => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                result = &mut pipeline => result,
-                result = &mut activity_watch => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                _ = signal::ctrl_c() => {
-                    shutdown.store(true, Ordering::Relaxed);
-                    println!("shutdown signal received");
-                    Ok(())
-                }
+                result = &mut server => match result {
+                    Ok(()) => Err("capture endpoint stopped unexpectedly".into()),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                },
+                result = &mut pipeline => match result {
+                    Ok(()) => Err("pipeline loop stopped unexpectedly".into()),
+                    Err(error) => Err(error),
+                },
+                result = &mut activity_watch => match result {
+                    Ok(()) => Err("active-window watcher stopped unexpectedly".into()),
+                    Err(error) => Err(error),
+                },
             }
         } else {
             tokio::select! {
-                result = &mut server => result.map_err(|error| Box::new(error) as Box<dyn Error>),
-                result = &mut pipeline => result,
-                _ = signal::ctrl_c() => {
-                    shutdown.store(true, Ordering::Relaxed);
-                    println!("shutdown signal received");
-                    Ok(())
-                }
+                result = &mut server => match result {
+                    Ok(()) => Err("capture endpoint stopped unexpectedly".into()),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                },
+                result = &mut pipeline => match result {
+                    Ok(()) => Err("pipeline loop stopped unexpectedly".into()),
+                    Err(error) => Err(error),
+                },
             }
         }
     }
 }
 
 fn print_pipeline_summary(label: &str, summary: &identityd::processor::PipelineSummary) {
-    println!(
+    log_info(&format!(
         "{label}: process_claimed={process_claimed} processed={processed} process_failed={process_failed} skipped_idle_gate={skipped} promote_claimed={promote_claimed} promoted={promoted} promote_failed={promote_failed} redacted={redacted}",
         process_claimed = summary.processed.claimed,
         processed = summary.processed.processed,
@@ -1604,7 +1667,15 @@ fn print_pipeline_summary(label: &str, summary: &identityd::processor::PipelineS
         promoted = summary.promoted.promoted,
         promote_failed = summary.promoted.failed,
         redacted = summary.promoted.redacted
-    );
+    ));
+}
+
+fn log_info(message: &str) {
+    let _ = writeln!(std::io::stdout(), "{message}");
+}
+
+fn log_error(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
 }
 
 fn print_source_family_counts(sources: &TransitSourceFamilyCounts) {

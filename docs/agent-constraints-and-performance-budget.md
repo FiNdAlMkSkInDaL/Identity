@@ -22,7 +22,7 @@ Any architecture that requires a breach of these budgets should be rejected or b
 Agents may use these foundational primitives when the task genuinely requires them:
 
 - Async runtime: `tokio`, with features kept as narrow as possible.
-- Embedded vector DB: `lancedb` and `arrow`.
+- Optional embedded vector DB: `lancedb` and `arrow`, only behind an explicit feature flag.
 - Local ingest buffer: `rusqlite`.
 - Serialization: `serde` and `serde_json`.
 - HTML stream parsing: `lol-html` only. Do not replace this with a full DOM scraper.
