@@ -93,6 +93,42 @@ pub fn process_once(paths: &IdentityPaths, limit: u32) -> Result<ProcessSummary,
     })
 }
 
+pub fn process_capture(
+    paths: &IdentityPaths,
+    captured_event_id: i64,
+) -> Result<ProcessSummary, ProcessError> {
+    let buffer = TransitBuffer::open(paths)?;
+    let Some(event) = buffer.claim_queued_id(captured_event_id)? else {
+        return Ok(ProcessSummary {
+            claimed: 0,
+            processed: 0,
+            failed: 0,
+            skipped_idle_gate: false,
+        });
+    };
+
+    match clean_for_next_stage(&event.content) {
+        Some(cleaned) => {
+            buffer.complete_processing_with_cleaned(event.id, &event.source, &cleaned)?;
+            Ok(ProcessSummary {
+                claimed: 1,
+                processed: 1,
+                failed: 0,
+                skipped_idle_gate: false,
+            })
+        }
+        None => {
+            buffer.mark_failed(event.id, "empty content after local cleaning")?;
+            Ok(ProcessSummary {
+                claimed: 1,
+                processed: 0,
+                failed: 1,
+                skipped_idle_gate: false,
+            })
+        }
+    }
+}
+
 pub fn process_once_if_idle(
     paths: &IdentityPaths,
     limit: u32,
@@ -137,6 +173,46 @@ pub fn promote_once(paths: &IdentityPaths, limit: u32) -> Result<PromoteSummary,
 
     Ok(PromoteSummary {
         claimed: cleaned_events.len(),
+        promoted,
+        failed,
+        redacted: redaction
+            .redacted_captured_events
+            .max(redaction.redacted_cleaned_events),
+    })
+}
+
+pub fn promote_capture(
+    paths: &IdentityPaths,
+    captured_event_id: i64,
+) -> Result<PromoteSummary, ProcessError> {
+    let transit = TransitBuffer::open(paths)?;
+    let identity = IdentityStore::open(paths)?;
+    let Some(cleaned) = transit.cleaned_pending_for_capture(captured_event_id)? else {
+        return Ok(PromoteSummary {
+            claimed: 0,
+            promoted: 0,
+            failed: 0,
+            redacted: 0,
+        });
+    };
+
+    let (promoted, failed) = match identity.insert_memory_from_cleaned(&cleaned) {
+        Ok(_) => {
+            transit.mark_cleaned_promoted(cleaned.id)?;
+            (1, 0)
+        }
+        Err(error) => {
+            log_error(&format!(
+                "failed to promote cleaned event #{}: {error}",
+                cleaned.id
+            ));
+            (0, 1)
+        }
+    };
+    let redaction = transit.redact_promoted_content(1)?;
+
+    Ok(PromoteSummary {
+        claimed: 1,
         promoted,
         failed,
         redacted: redaction
@@ -214,7 +290,10 @@ fn clean_for_next_stage(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_for_next_stage, pipeline_once_if_idle, process_once, promote_once};
+    use super::{
+        clean_for_next_stage, pipeline_once_if_idle, process_capture, process_once,
+        promote_capture, promote_once,
+    };
     use crate::identity::IdentityStore;
     use crate::transit::TransitBuffer;
     use crate::workspace::IdentityPaths;
@@ -294,6 +373,57 @@ mod tests {
         let memories = identity.list_recent(10).unwrap();
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].summary, "Pipeline writes local memory.");
+
+        drop(identity);
+        drop(transit);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_and_promote_capture_targets_one_explicit_event() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-targeted-page-promote-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let transit = TransitBuffer::open(&paths).unwrap();
+        let older_id = transit
+            .ingest_text("manual", "Older queued note should stay queued.")
+            .unwrap();
+        let page_id = transit
+            .ingest_text(
+                "local-proxy:text/markdown",
+                "Page title: Identity Page URL: https://example.test Selected page text: Immediate context.",
+            )
+            .unwrap();
+
+        let processed = process_capture(&paths, page_id).unwrap();
+        assert_eq!(processed.claimed, 1);
+        assert_eq!(processed.processed, 1);
+
+        let promoted = promote_capture(&paths, page_id).unwrap();
+        assert_eq!(promoted.claimed, 1);
+        assert_eq!(promoted.promoted, 1);
+        assert_eq!(promoted.redacted, 1);
+
+        let events = transit.list_recent(10).unwrap();
+        let older = events.iter().find(|event| event.id == older_id).unwrap();
+        let page = events.iter().find(|event| event.id == page_id).unwrap();
+        assert_eq!(older.status, "queued");
+        assert_eq!(older.content, "Older queued note should stay queued.");
+        assert_eq!(page.status, "processed");
+        assert_eq!(page.content, "");
+
+        let identity = IdentityStore::open(&paths).unwrap();
+        let memories = identity.list_recent(10).unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].domain_context, "local.web.capture");
+        assert!(memories[0].summary.contains("Immediate context."));
 
         drop(identity);
         drop(transit);

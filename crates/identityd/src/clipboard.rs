@@ -16,6 +16,21 @@ pub fn set_clipboard_text(text: &str) -> Result<(), io::Error> {
     }
 }
 
+/// Read UTF-16 text from the system clipboard.
+pub fn get_clipboard_text() -> Result<String, io::Error> {
+    #[cfg(windows)]
+    {
+        get_clipboard_text_windows()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "clipboard reading is only supported on Windows",
+        ))
+    }
+}
+
 #[cfg(windows)]
 fn set_clipboard_text_windows(text: &str) -> Result<(), io::Error> {
     use std::ffi::c_void;
@@ -83,17 +98,110 @@ fn set_clipboard_text_windows(text: &str) -> Result<(), io::Error> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn get_clipboard_text_windows() -> Result<String, io::Error> {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hWndNewOwner: *mut c_void) -> i32;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn GetClipboardData(uFormat: u32) -> *mut c_void;
+        fn CloseClipboard() -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalLock(hMem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(hMem: *mut c_void) -> i32;
+        fn GlobalSize(hMem: *mut c_void) -> usize;
+    }
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "clipboard does not contain UTF-16 text",
+            ));
+        }
+
+        let handle = unsafe { GetClipboardData(CF_UNICODETEXT) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let ptr = unsafe { GlobalLock(handle) };
+        if ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let byte_len = unsafe { GlobalSize(handle) };
+        let unit_len = byte_len / 2;
+        let slice = unsafe { std::slice::from_raw_parts(ptr as *const u16, unit_len) };
+        let end = slice.iter().position(|unit| *unit == 0).unwrap_or(unit_len);
+        let text = String::from_utf16_lossy(&slice[..end]);
+        unsafe {
+            GlobalUnlock(handle);
+        }
+
+        Ok(text)
+    })();
+
+    unsafe {
+        CloseClipboard();
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_clipboard_does_not_panic() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().unwrap();
+        let original = get_clipboard_text().ok();
         let text = "Identity local-first clipboard test text.";
         let res = set_clipboard_text(text);
         #[cfg(windows)]
-        assert!(res.is_ok());
+        {
+            assert!(res.is_ok());
+            if let Some(original) = original {
+                let _ = set_clipboard_text(&original);
+            }
+        }
         #[cfg(not(windows))]
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_clipboard_round_trip_text() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().unwrap();
+        let original = get_clipboard_text().ok();
+        let text = "Identity clipboard read test.";
+        let write = set_clipboard_text(text);
+        #[cfg(windows)]
+        {
+            write.unwrap();
+            assert_eq!(get_clipboard_text().unwrap(), text);
+            if let Some(original) = original {
+                let _ = set_clipboard_text(&original);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(write.is_err());
+            assert!(get_clipboard_text().is_err());
+        }
     }
 }

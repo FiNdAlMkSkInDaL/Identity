@@ -267,6 +267,11 @@ impl IdentityStore {
         self.backend.list_recent(limit)
     }
 
+    pub fn recent_web_captures(&self, limit: u32) -> Result<Vec<MemoryNode>, IdentityError> {
+        self.backend
+            .list_recent_by_domain("local.web.capture", limit)
+    }
+
     pub fn export_recent_protocol_json(&self, limit: u32) -> Result<String, IdentityError> {
         let candidates =
             self.backend
@@ -577,6 +582,26 @@ impl SqliteMemoryBackend {
         )?;
 
         let rows = statement.query_map([limit as i64], map_memory_node)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(decrypt_memory_node)
+            .collect()
+    }
+
+    fn list_recent_by_domain(
+        &self,
+        domain_context: &str,
+        limit: u32,
+    ) -> Result<Vec<MemoryNode>, IdentityError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, created_at_ms, created_at_utc, last_accessed_ms, last_accessed_utc
+             FROM memory_nodes
+             WHERE domain_context = ?1
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+
+        let rows = statement.query_map(params![domain_context, limit as i64], map_memory_node)?;
         rows.collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .map(decrypt_memory_node)
@@ -1578,6 +1603,8 @@ fn classify_capture(source: &str) -> CaptureClassification {
 fn capture_attributes(source: &str, content: &str) -> String {
     if source.starts_with("windows-ui:") {
         windows_activity_attributes(content)
+    } else if source.starts_with("local-proxy:") {
+        web_capture_attributes(content)
     } else {
         "{}".to_string()
     }
@@ -1597,6 +1624,23 @@ fn windows_activity_attributes(content: &str) -> String {
     }
     if let Some(visible) = first_visible_line(content) {
         fields.push(json_field("first_visible_text", &visible));
+    }
+
+    if fields.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{{}}}", fields.join(","))
+    }
+}
+
+fn web_capture_attributes(content: &str) -> String {
+    let mut fields = Vec::new();
+
+    if let Some(title) = labelled_value(content, "Page title:") {
+        fields.push(json_field("page_title", &title));
+    }
+    if let Some(url) = labelled_value(content, "Page URL:") {
+        fields.push(json_field("page_url", &url));
     }
 
     if fields.is_empty() {
@@ -1785,8 +1829,33 @@ fn is_json_object_like(value: &str) -> bool {
 fn summarize_capture(source: &str, content: &str) -> String {
     if source.starts_with("windows-ui:") {
         summarize_windows_activity(content)
+    } else if source.starts_with("local-proxy:") {
+        summarize_web_capture(content)
     } else {
         summarize(content)
+    }
+}
+
+fn summarize_web_capture(content: &str) -> String {
+    let title = labelled_value(content, "Page title:");
+    let url = labelled_value(content, "Page URL:");
+    let selection = labelled_value(content, "Selected page text:");
+
+    let mut parts = Vec::new();
+    if let Some(title) = title {
+        parts.push(format!("web page {title}"));
+    }
+    if let Some(url) = url {
+        parts.push(format!("url {url}"));
+    }
+    if let Some(selection) = selection {
+        parts.push(format!("selected text {selection}"));
+    }
+
+    if parts.is_empty() {
+        summarize(content)
+    } else {
+        summarize(&parts.join("; "))
     }
 }
 
@@ -1826,6 +1895,9 @@ fn labelled_value(content: &str, label: &str) -> Option<String> {
         "Active window title:",
         "Focused control text:",
         "Visible window text:",
+        "Page title:",
+        "Page URL:",
+        "Selected page text:",
         "\n- ",
     ]
     .into_iter()
@@ -2023,9 +2095,9 @@ mod tests {
     use super::{
         capture_attributes, classify_capture, format_uuid_bytes, is_iso8601_utc_timestamp,
         is_json_object_like, is_uuid_v4_like, iso8601_utc_from_ms, labelled_value,
-        protocol_nodes_json, query_tokens, summarize, summarize_capture,
-        summarize_windows_activity, windows_activity_attributes, IdentityStore, ProtocolGraphEdge,
-        ProtocolMemoryNode, SqliteMemoryBackend,
+        protocol_nodes_json, query_tokens, summarize, summarize_capture, summarize_web_capture,
+        summarize_windows_activity, web_capture_attributes, windows_activity_attributes,
+        IdentityStore, ProtocolGraphEdge, ProtocolMemoryNode, SqliteMemoryBackend,
     };
     use crate::crypto::is_protected_text;
     use crate::embedding::{
@@ -2177,6 +2249,20 @@ mod tests {
         assert_eq!(
             attributes,
             "{\"application\":\"Code.exe\",\"window_title\":\"Identity\",\"focused_text\":\"Search files\",\"first_visible_text\":\"Identity note\"}"
+        );
+    }
+
+    #[test]
+    fn web_capture_summary_and_attributes_extract_page_context() {
+        let content = "Page title: Identity local capture Page URL: https://example.test/notes Selected page text: Use selected text only for explicit page context.";
+
+        assert_eq!(
+            summarize_web_capture(content),
+            "web page Identity local capture; url https://example.test/notes; selected text Use selected text only for explicit page context."
+        );
+        assert_eq!(
+            web_capture_attributes(content),
+            "{\"page_title\":\"Identity local capture\",\"page_url\":\"https://example.test/notes\"}"
         );
     }
 
@@ -2543,6 +2629,65 @@ mod tests {
             summary,
             "UI activity in Code.exe; window Identity; focus Search files"
         );
+    }
+
+    #[test]
+    fn summarize_capture_uses_source_specific_web_path() {
+        let summary = summarize_capture(
+            "local-proxy:text/markdown",
+            "Page title: Identity local capture Page URL: https://example.test/notes Selected page text: Context quality improves with selected page text.",
+        );
+
+        assert_eq!(
+            summary,
+            "web page Identity local capture; url https://example.test/notes; selected text Context quality improves with selected page text."
+        );
+    }
+
+    #[test]
+    fn lists_recent_web_captures_by_domain_only() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-recent-web-capture-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 41,
+                captured_event_id: 41,
+                source: "local-proxy:text/markdown".to_string(),
+                cleaned_content: "Page title: Useful page Page URL: https://example.test Selected page text: Explicit selected page context.".to_string(),
+                content_hash: "hash41".to_string(),
+                cleaned_at_ms: 1,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 42,
+                captured_event_id: 42,
+                source: "windows-ui:foreground-window".to_string(),
+                cleaned_content:
+                    "Active application: msedge.exe Active window title: Google Gemini".to_string(),
+                content_hash: "hash42".to_string(),
+                cleaned_at_ms: 1,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+
+        let recent = store.recent_web_captures(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].domain_context, "local.web.capture");
+        assert!(recent[0].summary.contains("web page Useful page"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

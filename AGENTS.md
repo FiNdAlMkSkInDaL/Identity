@@ -39,6 +39,7 @@ Current responsibility:
 - Create `~/.identity/transit.db`.
 - Store captured raw text events in a local SQLite transit buffer.
 - Capture bounded local inputs through manual CLI, token-protected loopback HTTP, Windows foreground-window capture, and filesystem watching.
+- Capture explicit user-selected browser/page text through an opt-in `capture-page` loopback helper or generated bookmarklet; do not make browser DOM capture ambient or automatic.
 - Report capture-adapter readiness through the centralized `capture.rs` health boundary rather than duplicating status logic in CLI code.
 - Refuse broad or sensitive filesystem watch roots by default; require an explicit unsafe development flag before watching the home directory, ledger workspace, credentials directories, AppData, Windows, or Program Files.
 - Process queued captures through an idle-gated local pipeline.
@@ -55,6 +56,7 @@ Current responsibility:
 - Report and repair legacy plaintext development rows through `doctor` and `protect-at-rest`.
 - Redact duplicate transit content after successful local `.me` promotion.
 - Run the default local context daemon through `start`, which enables loopback capture, the idle-gated pipeline, bounded active-window metadata capture, and the global `Ctrl+Shift+I` clipboard hotkey.
+- Include bounded recent selected-page memory in hotkey context only for browser/agent surfaces, after normal profile/query memory search and under the same dedupe and budget rules.
 - Keep the default build lean: filesystem vector blobs plus SQLite fallback are the normal vector backend. LanceDB/Arrow are opt-in only through `--features lancedb-backend`.
 - Keep Windows active-window deep UI Automation/MSAA text extraction opt-in only through `IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT=1`; the default daemon captures stable foreground application/title metadata because the deep native path can access-violate when launched hidden.
 
@@ -68,6 +70,7 @@ These are current implementation facts, not wishlist items:
 - `.\start-identity-hidden.cmd` starts the same default daemon as a hidden background process.
 - `.\scripts\test-identity-hotkey.ps1` is the local end-to-end self-test. It starts a temporary hidden daemon, checks `/health`, simulates `Ctrl+Shift+I`, verifies an `IDENTITY-CONTEXT-BLOCK` lands on the clipboard, restores the clipboard, and stops the temporary daemon.
 - The default hotkey is `Ctrl+Shift+I`, copy-only. `--paste-on-hotkey` remains opt-in and must never press Enter.
+- Browser/page capture is opt-in and user-triggered. `capture-page` sends selected text, title, and URL to the existing token-protected loopback `/capture` endpoint; `capture-page --from-clipboard` can read an `IDENTITY-PAGE-CAPTURE` envelope from the local clipboard; `capture-page --promote-now` may process and promote only the just-queued explicit capture for immediate hotkey context; `browser-capture-clipboard-bookmarklet` is the preferred no-token browser bridge and only copies `window.getSelection()` plus title and URL to the clipboard. `browser-capture-bookmarklet` remains available for direct loopback posting but prompts for the capture token in page context.
 - Long-running daemon logging paths must be non-panicking. Do not use raw `println!`/`eprintln!` in daemon hot paths where broken hidden-process stdout/stderr handles could kill the process.
 - The default release build intentionally excludes LanceDB/Arrow. Measured lean default release size was about 2.2 MB versus about 29.8 MB with the previous LanceDB-default build. Do not re-enable `lancedb-backend` by default without explicit human approval.
 - The Codex in-app Browser plugin may fail on this Windows desktop with an `AttachConsole failed` / `windows sandbox failed: spawn setup refresh` error before it opens a tab. Treat that as a Codex desktop Browser bridge issue, not as proof that `identityd` is broken. Prefer the local `/health` endpoint and `scripts/test-identity-hotkey.ps1` for daemon verification.
@@ -355,7 +358,8 @@ Phase 2 V0 hotkey context injection is implemented. Future work should preserve 
 3. **Validate daemon behavior locally.** Run `.\scripts\test-identity-hotkey.ps1` after any hotkey, clipboard, active-window, daemon, or startup change. It is the canonical local V0 smoke test.
 4. **Measure bloat.** Run `cargo tree -p identityd --edges normal`, `cargo test -p identityd`, and `cargo build --release -p identityd`; check `(Get-Item target/release/identityd.exe).Length`. The default binary target remains under 15 MB.
 5. **Keep active-window capture safe.** Do not enable deep Windows UI Automation/MSAA text extraction by default. The safe default is foreground app and title metadata; deeper text extraction is only for explicit local debugging with `IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT=1`.
-6. **Update `docs/system-map.md`, `README.md`, and this file** whenever command defaults, runtime boundaries, dependency defaults, daemon state transitions, or capture surfaces change.
+6. **Keep browser/page capture explicit.** Prefer the clipboard-envelope bridge: browser copies selected page text/title/URL, then local `capture-page --from-clipboard` authorizes through the workspace token. Do not add headless browsers, browser automation runtimes, full DOM scraping, or ambient browser surveillance.
+7. **Update `docs/system-map.md`, `README.md`, and this file** whenever command defaults, runtime boundaries, dependency defaults, daemon state transitions, or capture surfaces change.
 
 Current V0 definition of done: `context-now --preview` prints, `context-now --copy` writes clipboard, `start` runs the default local context daemon, and pressing `Ctrl+Shift+I` inside Gemini/Codex/Antigravity copies a compact context block with active-window metadata and relevant memory excerpts when available. No dashboard. No Tauri. No network. Binary and RAM budgets remain hard constraints.
 

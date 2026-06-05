@@ -126,53 +126,36 @@ pub fn build_identity_context(
     }
 
     let mut facts = Vec::new();
-    if !query_terms.is_empty() {
-        if let Ok(store) = IdentityStore::open(paths) {
-            let mut raw_memories = Vec::new();
-            for term in &query_terms {
-                if let Ok(results) = store.search(term, limit) {
-                    raw_memories.extend(results);
+    if let Ok(store) = IdentityStore::open(paths) {
+        let mut seen_uids = std::collections::HashSet::new();
+        let mut searched_memories = Vec::new();
+
+        for term in &query_terms {
+            if let Ok(results) = store.search(term, limit) {
+                for result in results {
+                    if seen_uids.insert(result.node.node_uid.clone()) {
+                        searched_memories.push(result.node);
+                    }
                 }
             }
+        }
 
-            // Deduplicate by node_uid
-            let mut seen_uids = std::collections::HashSet::new();
-            let mut unique_memories = Vec::new();
-            for res in raw_memories {
-                if seen_uids.insert(res.node.node_uid.clone()) {
-                    unique_memories.push(res.node);
-                }
-            }
+        let mut total_chars = 0;
+        let mut seen_facts = std::collections::HashSet::new();
+        append_memory_facts(
+            searched_memories,
+            &mut facts,
+            &mut seen_facts,
+            &mut total_chars,
+        );
 
-            // Format, filter, deduplicate repeated facts, and limit.
-            let mut total_chars = 0;
-            let mut seen_facts = std::collections::HashSet::new();
-            for node in unique_memories {
-                // Check memory fact against security blacklist
-                if security_block(&node.summary).is_some() {
-                    continue;
-                }
-
-                let sanitized = node.summary.replace('\n', " ").trim().to_string();
-                // Truncate individual fact (max 320 chars)
-                let truncated = if sanitized.chars().count() > 320 {
-                    let mut s: String = sanitized.chars().take(320).collect();
-                    s.push_str("...");
-                    s
-                } else {
-                    sanitized
-                };
-                let fact_key = normalize_fact_key(&truncated);
-                if fact_key.is_empty() || !seen_facts.insert(fact_key) {
-                    continue;
-                }
-
-                // Enforce budget limits (max total 1200 chars)
-                if total_chars + truncated.len() > 1200 {
-                    break;
-                }
-                total_chars += truncated.len();
-                facts.push(truncated);
+        if should_include_recent_page_context(snapshot, profile_name.as_deref()) {
+            if let Ok(recent_pages) = store.recent_web_captures(limit.min(3)) {
+                let recent_pages = recent_pages
+                    .into_iter()
+                    .filter(|node| seen_uids.insert(node.node_uid.clone()))
+                    .collect::<Vec<_>>();
+                append_memory_facts(recent_pages, &mut facts, &mut seen_facts, &mut total_chars);
             }
         }
     }
@@ -202,6 +185,68 @@ pub fn build_identity_context(
         guardrails,
         facts,
     })
+}
+
+fn append_memory_facts(
+    nodes: Vec<crate::identity::MemoryNode>,
+    facts: &mut Vec<String>,
+    seen_facts: &mut std::collections::HashSet<String>,
+    total_chars: &mut usize,
+) {
+    for node in nodes {
+        if security_block(&node.summary).is_some() {
+            continue;
+        }
+
+        let sanitized = node.summary.replace('\n', " ").trim().to_string();
+        let truncated = if sanitized.chars().count() > 320 {
+            let mut s: String = sanitized.chars().take(320).collect();
+            s.push_str("...");
+            s
+        } else {
+            sanitized
+        };
+        let fact_key = normalize_fact_key(&truncated);
+        if fact_key.is_empty() || !seen_facts.insert(fact_key) {
+            continue;
+        }
+
+        if *total_chars + truncated.len() > 1200 {
+            break;
+        }
+        *total_chars += truncated.len();
+        facts.push(truncated);
+    }
+}
+
+fn should_include_recent_page_context(
+    snapshot: &ContextSnapshot,
+    profile_name: Option<&str>,
+) -> bool {
+    if profile_name.is_some() {
+        return true;
+    }
+
+    let process = snapshot.process_name.to_ascii_lowercase();
+    let title = snapshot.window_title.to_ascii_lowercase();
+
+    [
+        "chrome",
+        "msedge",
+        "edge",
+        "firefox",
+        "brave",
+        "browser",
+        "arc",
+        "gemini",
+        "chatgpt",
+        "codex",
+        "claude",
+        "antigravity",
+        "perplexity",
+    ]
+    .iter()
+    .any(|needle| process.contains(needle) || title.contains(needle))
 }
 
 fn stable_hash_hex(bytes: &[u8]) -> String {
@@ -360,6 +405,39 @@ mod tests {
             ctx.facts[0],
             "UI activity in msedge.exe; window Google Gemini"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_context_includes_recent_selected_page_capture() {
+        let root = std::env::temp_dir().join("identity-context-recent-page-test");
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let cleaned = CleanedEvent {
+            id: 9,
+            captured_event_id: 9,
+            source: "local-proxy:text/markdown".to_string(),
+            cleaned_content: "Page title: Identity manifesto Page URL: https://example.test/manifesto Selected page text: Identity must stay local-first, lean, and user-owned.".to_string(),
+            content_hash: "hash-page".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        store.insert_memory_from_cleaned(&cleaned).unwrap();
+
+        let snap = ContextSnapshot {
+            process_name: "msedge.exe".to_string(),
+            window_title: "Google Gemini".to_string(),
+            focused_text: None,
+        };
+
+        let ctx = build_identity_context(&paths, &snap, None, 3).unwrap();
+        assert!(ctx.facts.iter().any(|fact| {
+            fact.contains("web page Identity manifesto")
+                && fact.contains("local-first, lean, and user-owned")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }

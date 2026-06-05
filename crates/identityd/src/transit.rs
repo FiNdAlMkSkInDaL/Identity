@@ -231,6 +231,24 @@ impl TransitBuffer {
         self.get_events_by_ids(&ids)
     }
 
+    pub fn claim_queued_id(&self, id: i64) -> Result<Option<TransitEvent>, TransitError> {
+        self.repair_stale_processing(DEFAULT_PROCESSING_LEASE_MS)?;
+
+        let claimed_at_ms = now_ms()?;
+        let changed = self.conn.execute(
+            "UPDATE captured_events
+             SET status = 'processing', claimed_at_ms = ?1, error = NULL
+             WHERE id = ?2 AND status = 'queued'",
+            params![claimed_at_ms, id],
+        )?;
+
+        if changed == 0 {
+            return Ok(None);
+        }
+
+        Ok(self.get_events_by_ids(&[id])?.into_iter().next())
+    }
+
     pub fn repair_stale_processing(
         &self,
         lease_timeout_ms: i64,
@@ -501,6 +519,26 @@ impl TransitBuffer {
             .into_iter()
             .map(decrypt_cleaned_event)
             .collect()
+    }
+
+    pub fn cleaned_pending_for_capture(
+        &self,
+        captured_event_id: i64,
+    ) -> Result<Option<CleanedEvent>, TransitError> {
+        let result = self.conn.query_row(
+            "SELECT id, captured_event_id, source, cleaned_content, content_hash, cleaned_at_ms, promoted_at_ms
+             FROM cleaned_events
+             WHERE captured_event_id = ?1
+               AND promoted_at_ms IS NULL",
+            [captured_event_id],
+            cleaned_event_from_row,
+        );
+
+        match result {
+            Ok(event) => Ok(Some(decrypt_cleaned_event(event)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn mark_cleaned_promoted(&self, id: i64) -> Result<(), TransitError> {

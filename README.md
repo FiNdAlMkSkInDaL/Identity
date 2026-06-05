@@ -58,6 +58,12 @@ cargo run -p identityd -- init
 cargo run -p identityd -- --root C:\Temp\identity-dev doctor
 cargo run -p identityd -- ingest --source manual --content "User prefers local-first systems."
 cargo run -p identityd -- capture-active-window
+cargo run -p identityd -- capture-page --title "Identity notes" --url "https://example.test/notes" --text "Selected page text to remember."
+cargo run -p identityd -- capture-page --title "Identity notes" --url "https://example.test/notes" --stdin
+cargo run -p identityd -- capture-page --from-clipboard
+cargo run -p identityd -- capture-page --from-clipboard --promote-now
+cargo run -p identityd -- browser-capture-bookmarklet
+cargo run -p identityd -- browser-capture-clipboard-bookmarklet
 cargo run -p identityd -- watch-active-window --interval-ms 1000
 cargo run -p identityd -- list
 cargo run -p identityd -- stats
@@ -222,6 +228,43 @@ accepts headers up to 16KB, accepts capture bodies up to 1MB, and only accepts
 textual media types: `text/plain`, `text/html`, `text/markdown`,
 `application/json`, `application/x-ndjson`, `application/xml`, and
 `application/xhtml+xml`.
+
+For explicit browser/page context, `capture-page` is a CLI-friendly loopback
+helper. It accepts only user-provided selected text plus optional page title and
+URL, validates the assembled payload locally, reads the workspace capture token,
+and posts to the same token-protected `/capture` endpoint:
+
+```powershell
+$selection = Get-Clipboard
+cargo run -p identityd -- capture-page --title "Identity notes" --url "https://example.test/notes" --text $selection
+Get-Clipboard | cargo run -p identityd -- capture-page --title "Identity notes" --url "https://example.test/notes" --stdin
+```
+
+The safer browser bridge is `browser-capture-clipboard-bookmarklet`: it prints a
+tiny bookmarklet that copies only the selected page text, title, and URL into an
+`IDENTITY-PAGE-CAPTURE` clipboard envelope. It never sends a network request and
+never asks for the capture token inside page JavaScript. After using it, run:
+
+```powershell
+cargo run -p identityd -- capture-page --from-clipboard
+```
+
+Add `--promote-now` when the selected page should be available to the next
+hotkey context immediately. This processes and promotes only the capture that
+was just queued, rather than draining unrelated transit backlog; the default
+daemon path remains idle-gated.
+
+`browser-capture-bookmarklet` prints a tiny bookmarklet for selected browser
+text. The bookmarklet prompts for the local capture token on each use, sends only
+`window.getSelection()` plus page title and URL, and relies on `/capture` for
+token auth, CORS preflight, textual media-type enforcement, the 1MB body budget,
+and the shared deterministic safety blacklist. It is user-triggered only; it does
+not perform ambient DOM watching or full-page scraping.
+
+When `Ctrl+Shift+I` is pressed inside a browser or agent chat surface, the
+context builder can add a bounded handful of recent selected-page captures after
+normal profile/query memory search. This improves context quality for generic
+window titles without making browser capture automatic.
 
 All capture paths share the same transit safety gate before SQLite persistence:
 capture content is capped at 1MB, source labels are capped at 2048 bytes, and

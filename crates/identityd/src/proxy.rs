@@ -124,6 +124,7 @@ async fn handle_connection(
 
     let response = match request {
         HttpRequest::Health => HttpResponse::ok_json(r#"{"status":"ok"}"#),
+        HttpRequest::CorsPreflight => HttpResponse::cors_preflight(),
         HttpRequest::Capture { content_type, body } => {
             if !supported_capture_content_type(&content_type) {
                 HttpResponse::unsupported_media_type(
@@ -168,6 +169,7 @@ async fn handle_connection(
 
 enum HttpRequest {
     Health,
+    CorsPreflight,
     Capture { content_type: String, body: String },
     Unauthorized,
     PayloadTooLarge,
@@ -181,6 +183,13 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
+    fn cors_preflight() -> Self {
+        Self {
+            status: "204 No Content",
+            body: String::new(),
+        }
+    }
+
     fn ok_json(body: &str) -> Self {
         Self {
             status: "200 OK",
@@ -225,7 +234,7 @@ impl HttpResponse {
 
     fn as_bytes(&self) -> Vec<u8> {
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: X-Identity-Capture-Token, Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 600\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}",
             status = self.status,
             length = self.body.len(),
             body = self.body
@@ -332,6 +341,11 @@ fn parse_request(
 
     if request_line.starts_with("GET /health ") {
         return Ok(HttpRequest::Health);
+    }
+
+    if request_line.starts_with("OPTIONS /capture ") || request_line.starts_with("OPTIONS /health ")
+    {
+        return Ok(HttpRequest::CorsPreflight);
     }
 
     if request_line.starts_with("POST /capture ") {
@@ -560,6 +574,11 @@ mod tests {
         let parsed = parse_request(req, header_end, req.len(), "abc123").unwrap();
         assert!(matches!(parsed, HttpRequest::Unauthorized));
 
+        let req = b"OPTIONS /capture HTTP/1.1\r\nOrigin: https://example.test\r\nAccess-Control-Request-Headers: x-identity-capture-token, content-type\r\n\r\n";
+        let header_end = find_header_end(req).unwrap();
+        let parsed = parse_request(req, header_end, req.len(), "abc123").unwrap();
+        assert!(matches!(parsed, HttpRequest::CorsPreflight));
+
         let req = b"POST /capture HTTP/1.1\r\nContent-Type: text/plain\r\nX-Identity-Capture-Token: abc123\r\nContent-Length: 4\r\n\r\nrust";
         let header_end = find_header_end(req).unwrap();
         let parsed = parse_request(req, header_end, req.len(), "abc123").unwrap();
@@ -636,5 +655,17 @@ mod tests {
             super::capture_source_for_content_type("text/markdown"),
             "local-proxy:text/markdown"
         );
+    }
+
+    #[test]
+    fn cors_preflight_response_allows_bookmarklet_headers_without_auth() {
+        let response = super::HttpResponse::cors_preflight();
+        let bytes = String::from_utf8(response.as_bytes()).unwrap();
+
+        assert!(bytes.starts_with("HTTP/1.1 204 No Content"));
+        assert!(
+            bytes.contains("Access-Control-Allow-Headers: X-Identity-Capture-Token, Content-Type")
+        );
+        assert!(bytes.contains("Access-Control-Allow-Private-Network: true"));
     }
 }

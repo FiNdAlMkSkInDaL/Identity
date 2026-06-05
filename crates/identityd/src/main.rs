@@ -2,6 +2,11 @@ use identityd::activity::{
     capture_active_window_once, watch_active_window_until_shutdown, DEFAULT_ACTIVITY_POLL_MS,
 };
 use identityd::bootstrap::{bootstrap_onnx_artifact, print_bootstrap_guidance};
+use identityd::browser_capture::{
+    bookmarklet as browser_capture_bookmarklet,
+    clipboard_bookmarklet as browser_capture_clipboard_bookmarklet, format_page_capture,
+    page_capture_from_clipboard_text, post_page_capture, PageCaptureInput,
+};
 use identityd::capture::capture_adapter_health;
 use identityd::context_builder::build_identity_context;
 use identityd::context_snapshot::{capture_context_snapshot, ContextSnapshot};
@@ -20,7 +25,8 @@ use identityd::filesystem::{
 };
 use identityd::identity::IdentityStore;
 use identityd::processor::{
-    pipeline_once_if_idle, process_once, process_once_if_idle, promote_once,
+    pipeline_once_if_idle, process_capture, process_once, process_once_if_idle, promote_capture,
+    promote_once,
 };
 use identityd::project_profile::{find_matching_profile, load_profiles};
 use identityd::proxy::LocalCaptureServer;
@@ -32,7 +38,7 @@ use identityd::transit::{TransitBuffer, TransitSourceFamilyCounts, DEFAULT_PROCE
 use identityd::workspace::IdentityPaths;
 use std::env;
 use std::error::Error;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
@@ -96,6 +102,79 @@ async fn run() -> Result<(), Box<dyn Error>> {
         "capture-active-window" => {
             let id = capture_active_window_once(&paths)?;
             println!("queued active window capture #{id}");
+        }
+        "capture-page" => {
+            let addr = read_flag(&raw_args, "--addr")
+                .unwrap_or_else(|| "127.0.0.1:8080".to_string())
+                .parse::<SocketAddr>()?;
+            ensure_loopback_addr(addr, false)?;
+            let clipboard_input = if has_flag(&raw_args, "--from-clipboard") {
+                Some(page_capture_from_clipboard_text(
+                    &identityd::clipboard::get_clipboard_text()?,
+                ))
+            } else {
+                None
+            };
+            let selected_text = if let Some(input) = clipboard_input.as_ref() {
+                input.selected_text.clone()
+            } else {
+                read_page_capture_text(&raw_args)?
+            };
+            let input = PageCaptureInput {
+                title: read_flag(&raw_args, "--title").or_else(|| {
+                    clipboard_input
+                        .as_ref()
+                        .and_then(|input| input.title.clone())
+                }),
+                url: read_flag(&raw_args, "--url")
+                    .or_else(|| clipboard_input.as_ref().and_then(|input| input.url.clone())),
+                selected_text,
+            };
+
+            if has_flag(&raw_args, "--dry-run") {
+                let body = format_page_capture(&input)?;
+                println!("{body}");
+            } else {
+                let result = post_page_capture(&paths, addr, &input).await?;
+                let mut promotion = None;
+                if has_flag(&raw_args, "--promote-now") {
+                    let captured_id = result
+                        .captured_id
+                        .ok_or("capture endpoint did not return captured id for --promote-now")?;
+                    let processed = process_capture(&paths, captured_id)?;
+                    let promoted = promote_capture(&paths, captured_id)?;
+                    promotion = Some((processed, promoted));
+                }
+                println!(
+                    "queued browser page capture via loopback: status={} bytes_sent={} captured_id={} response={}",
+                    result.status_code,
+                    result.bytes_sent,
+                    result
+                        .captured_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    result.body
+                );
+                if let Some((processed, promoted)) = promotion {
+                    println!(
+                        "immediate page promotion: processed={} promoted={} redacted={} failed={}",
+                        processed.processed,
+                        promoted.promoted,
+                        promoted.redacted,
+                        processed.failed + promoted.failed
+                    );
+                }
+            }
+        }
+        "browser-capture-bookmarklet" => {
+            let addr = read_flag(&raw_args, "--addr")
+                .unwrap_or_else(|| "127.0.0.1:8080".to_string())
+                .parse::<SocketAddr>()?;
+            ensure_loopback_addr(addr, false)?;
+            println!("{}", browser_capture_bookmarklet(addr)?);
+        }
+        "browser-capture-clipboard-bookmarklet" => {
+            println!("{}", browser_capture_clipboard_bookmarklet());
         }
         "watch-active-window" => {
             let interval_ms = read_flag(&raw_args, "--interval-ms")
@@ -1307,6 +1386,21 @@ fn optional_string(value: Option<&str>) -> String {
     value.unwrap_or("unavailable").to_string()
 }
 
+fn read_page_capture_text(args: &[String]) -> Result<String, Box<dyn Error>> {
+    if has_flag(args, "--stdin") {
+        let mut content = String::new();
+        std::io::stdin().read_to_string(&mut content)?;
+        return Ok(content);
+    }
+
+    read_flag(args, "--text")
+        .or_else(|| read_flag(args, "--content"))
+        .ok_or_else(|| {
+            "capture-page command requires --text <selected text>, --content <selected text>, --stdin, or --from-clipboard"
+                .into()
+        })
+}
+
 fn read_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|window| window[0] == flag)
@@ -1352,7 +1446,7 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  start [--paste-on-hotkey] [--hotkey-combo ctrl+shift+i]\n  ingest --source <source> --content <text>\n  capture-active-window\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  context-now [--preview] [--copy] [--limit 3]\n  project-profile-list\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root] [--hotkey] [--hotkey-combo <combo>] [--paste-on-hotkey]"
+        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  start [--paste-on-hotkey] [--hotkey-combo ctrl+shift+i]\n  ingest --source <source> --content <text>\n  capture-active-window\n  capture-page --title <title> --url <url> (--text <selected text> | --stdin | --from-clipboard) [--dry-run] [--promote-now] [--addr 127.0.0.1:8080]\n  browser-capture-bookmarklet [--addr 127.0.0.1:8080]\n  browser-capture-clipboard-bookmarklet\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  context-now [--preview] [--copy] [--limit 3]\n  project-profile-list\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root] [--hotkey] [--hotkey-combo <combo>] [--paste-on-hotkey]"
     );
 }
 

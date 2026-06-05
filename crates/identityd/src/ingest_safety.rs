@@ -118,6 +118,12 @@ fn validate_content(content: &str) -> Result<(), IngestSafetyError> {
         ));
     }
 
+    if contains_sensitive_page_url(&lower) {
+        return Err(IngestSafetyError::BlockedContent(
+            "secret-bearing page URL".to_string(),
+        ));
+    }
+
     if contains_luhn_number(content) {
         return Err(IngestSafetyError::BlockedContent(
             "payment-card-like number".to_string(),
@@ -160,6 +166,33 @@ fn contains_known_secret_prefix(input: &str) -> bool {
                 || lower.starts_with("asiaj")
                 || lower.starts_with("asii")
         })
+}
+
+fn contains_sensitive_page_url(lower: &str) -> bool {
+    if !lower.contains("page url:") {
+        return false;
+    }
+
+    [
+        ".env",
+        "/.ssh/",
+        "\\.ssh\\",
+        "/.aws/",
+        "\\.aws\\",
+        "/.azure/",
+        "\\.azure\\",
+        "/.gnupg/",
+        "\\.gnupg\\",
+        "credentials",
+        "known_hosts",
+        "authorized_keys",
+        "secrets.json",
+        "secrets.toml",
+        "secrets.yaml",
+        "secrets.yml",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn contains_luhn_number(input: &str) -> bool {
@@ -262,6 +295,20 @@ mod tests {
         assert!(validate_capture("manual", "card 4111 1111 1111 1111").is_err());
         assert!(validate_capture("manual", "card 4111-1111-1111-1111").is_err());
         assert!(validate_capture("manual", "latitude=10 longitude=20").is_err());
+    }
+
+    #[test]
+    fn blocks_sensitive_browser_page_urls() {
+        assert!(validate_capture(
+            "local-proxy:text/markdown",
+            "Page title: env Page URL: https://example.test/.env Selected page text: plain text"
+        )
+        .is_err());
+        assert!(validate_capture(
+            "local-proxy:text/markdown",
+            "Page title: creds Page URL: https://example.test/.aws/credentials Selected page text: plain text"
+        )
+        .is_err());
     }
 
     #[test]

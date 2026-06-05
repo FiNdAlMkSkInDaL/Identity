@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod bootstrap;
+pub mod browser_capture;
 pub mod capture;
 pub mod clipboard;
 pub mod context_builder;
