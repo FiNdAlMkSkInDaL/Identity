@@ -30,6 +30,7 @@ pub struct CapturePostResult {
 #[derive(Debug)]
 pub enum BrowserCaptureError {
     EmptySelection,
+    MissingClipboardEnvelope,
     OversizedCapture,
     UnsafeCapture(IngestSafetyError),
     Workspace(WorkspaceError),
@@ -42,6 +43,10 @@ impl fmt::Display for BrowserCaptureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptySelection => write!(f, "browser page capture requires selected text"),
+            Self::MissingClipboardEnvelope => write!(
+                f,
+                "clipboard does not contain an IDENTITY-PAGE-CAPTURE envelope; use browser-capture-clipboard-bookmarklet first, or pass manual text with --stdin/--text"
+            ),
             Self::OversizedCapture => write!(f, "browser page capture exceeds 1MB transit budget"),
             Self::UnsafeCapture(error) => write!(f, "{error}"),
             Self::Workspace(error) => write!(f, "{error}"),
@@ -83,7 +88,7 @@ pub fn format_page_capture(input: &PageCaptureInput) -> Result<String, BrowserCa
     let url = input
         .url
         .as_deref()
-        .map(|value| normalize_field(value, MAX_URL_CHARS))
+        .map(normalize_url_field)
         .filter(|value| !value.is_empty());
     let selected_text = normalize_selected_text(&input.selected_text);
 
@@ -145,43 +150,37 @@ pub fn bookmarklet(addr: SocketAddr) -> Result<String, BrowserCaptureError> {
 
     let endpoint = format!("http://{addr}/capture");
     Ok(format!(
-        "javascript:(async()=>{{const k=prompt('Identity capture token from ~/.identity/capture.token');if(!k)return;const s=String(window.getSelection()).trim();if(!s){{alert('Select page text before capturing.');return;}}const c=(v,n)=>String(v||'').replace(/\\s+/g,' ').trim().slice(0,n);const b=`Page title: ${{c(document.title,512)}}\\nPage URL: ${{c(location.href,2048)}}\\nSelected page text:\\n${{s}}`;try{{const r=await fetch('{endpoint}',{{method:'POST',headers:{{'X-Identity-Capture-Token':k.trim(),'Content-Type':'text/markdown'}},body:b}});alert(r.ok?'Identity captured selected page text.':'Identity capture failed: '+await r.text());}}catch(e){{alert('Identity capture failed: '+e);}}}})()"
+        "javascript:(async()=>{{const k=prompt('Identity capture token from ~/.identity/capture.token');if(!k)return;const s=String(window.getSelection()).trim();if(!s){{alert('Select page text before capturing.');return;}}const c=(v,n)=>String(v||'').replace(/\\s+/g,' ').trim().slice(0,n);const u=v=>{{const x=c(v,2048).replace(/[?#].*$/,'').replace(/\\/$/,'');return /^https?:\\/\\//i.test(x)?x:'';}};const p=u(location.href);const b=`Page title: ${{c(document.title,512)}}\\n`+(p?`Page URL: ${{p}}\\n`:'')+`Selected page text:\\n${{s}}`;try{{const r=await fetch('{endpoint}',{{method:'POST',headers:{{'X-Identity-Capture-Token':k.trim(),'Content-Type':'text/markdown'}},body:b}});alert(r.ok?'Identity captured selected page text.':'Identity capture failed: '+await r.text());}}catch(e){{alert('Identity capture failed: '+e);}}}})()"
     ))
 }
 
 pub fn clipboard_bookmarklet() -> String {
     format!(
-        "javascript:(()=>{{const s=String(window.getSelection()).trim();if(!s){{alert('Select page text before copying.');return;}}const c=(v,n)=>String(v||'').replace(/\\s+/g,' ').trim().slice(0,n);const b=`{start}\\nPage title: ${{c(document.title,512)}}\\nPage URL: ${{c(location.href,2048)}}\\nSelected page text:\\n${{s}}\\n{end}`;const t=document.createElement('textarea');t.value=b;t.setAttribute('readonly','');t.style.position='fixed';t.style.left='-9999px';document.body.appendChild(t);t.select();let ok=false;try{{ok=document.execCommand('copy');}}catch(_e){{ok=false;}}document.body.removeChild(t);alert(ok?'Identity page capture copied. Run identityd capture-page --from-clipboard.':'Copy failed. Use the network bookmarklet or manual capture-page command.');}})()",
+        "javascript:(()=>{{const s=String(window.getSelection()).trim();if(!s){{alert('Select page text before copying.');return;}}const c=(v,n)=>String(v||'').replace(/\\s+/g,' ').trim().slice(0,n);const u=v=>{{const x=c(v,2048).replace(/[?#].*$/,'').replace(/\\/$/,'');return /^https?:\\/\\//i.test(x)?x:'';}};const p=u(location.href);const b=`{start}\\nPage title: ${{c(document.title,512)}}\\n`+(p?`Page URL: ${{p}}\\n`:'')+`Selected page text:\\n${{s}}\\n{end}`;const t=document.createElement('textarea');t.value=b;t.setAttribute('readonly','');t.style.position='fixed';t.style.left='-9999px';document.body.appendChild(t);t.select();let ok=false;try{{ok=document.execCommand('copy');}}catch(_e){{ok=false;}}document.body.removeChild(t);alert(ok?'Identity page capture copied. Run identityd capture-page --from-clipboard.':'Copy failed. Use the network bookmarklet or manual capture-page command.');}})()",
         start = CLIPBOARD_CAPTURE_START,
         end = CLIPBOARD_CAPTURE_END
     )
 }
 
-pub fn page_capture_from_clipboard_text(text: &str) -> PageCaptureInput {
+pub fn page_capture_from_clipboard_text(
+    text: &str,
+) -> Result<PageCaptureInput, BrowserCaptureError> {
     let trimmed = text.trim();
     if !trimmed.starts_with(CLIPBOARD_CAPTURE_START) {
-        return PageCaptureInput {
-            title: None,
-            url: None,
-            selected_text: trimmed.to_string(),
-        };
+        return Err(BrowserCaptureError::MissingClipboardEnvelope);
     }
 
-    let without_start = trimmed
+    let body = trimmed
         .strip_prefix(CLIPBOARD_CAPTURE_START)
         .unwrap_or(trimmed)
         .trim_start();
-    let body = without_start
-        .split(CLIPBOARD_CAPTURE_END)
-        .next()
-        .unwrap_or(without_start)
-        .trim();
+    let body = envelope_body_without_end_marker(body).trim();
 
-    PageCaptureInput {
-        title: labelled_value(body, "Page title:"),
-        url: labelled_value(body, "Page URL:"),
-        selected_text: labelled_value(body, "Selected page text:").unwrap_or_default(),
-    }
+    Ok(PageCaptureInput {
+        title: envelope_header_value(body, "Page title:"),
+        url: envelope_header_value(body, "Page URL:"),
+        selected_text: envelope_selection(body).unwrap_or_default(),
+    })
 }
 
 async fn post_capture_body(
@@ -316,6 +315,17 @@ fn normalize_field(input: &str, max_chars: usize) -> String {
         .collect::<String>()
 }
 
+fn normalize_url_field(input: &str) -> String {
+    let compact = normalize_field(input, MAX_URL_CHARS);
+    let lower = compact.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return String::new();
+    }
+
+    let end = compact.find(['?', '#']).unwrap_or_else(|| compact.len());
+    compact[..end].trim_end_matches('/').to_string()
+}
+
 fn normalize_selected_text(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut blank_lines = 0_u8;
@@ -378,21 +388,42 @@ fn collapse_whitespace(input: &str) -> String {
     compact
 }
 
-fn labelled_value(content: &str, label: &str) -> Option<String> {
-    let start = content.find(label)? + label.len();
-    let remainder = content[start..].trim_start();
-    let next_label_offset = ["Page title:", "Page URL:", "Selected page text:"]
-        .into_iter()
-        .filter(|candidate| *candidate != label)
-        .filter_map(|candidate| remainder.find(candidate))
-        .min()
-        .unwrap_or(remainder.len());
-    let value = remainder[..next_label_offset].trim();
+fn envelope_header_value(content: &str, label: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let value = line.trim().strip_prefix(label)?.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
 
-    if value.is_empty() {
+fn envelope_body_without_end_marker(content: &str) -> &str {
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        if line.trim() == CLIPBOARD_CAPTURE_END {
+            return content[..offset].trim_end_matches(['\r', '\n']);
+        }
+        offset += line.len();
+    }
+
+    if content.trim() == CLIPBOARD_CAPTURE_END {
+        ""
+    } else {
+        content
+    }
+}
+
+fn envelope_selection(content: &str) -> Option<String> {
+    let label = "Selected page text:";
+    let start = content.find(label)? + label.len();
+    let value = content[start..].trim_start_matches([' ', '\t', '\r', '\n']);
+
+    if value.trim().is_empty() {
         None
     } else {
-        Some(value.to_string())
+        Some(value.trim().to_string())
     }
 }
 
@@ -400,7 +431,7 @@ fn labelled_value(content: &str, label: &str) -> Option<String> {
 mod tests {
     use super::{
         bookmarklet, captured_id_from_response, clipboard_bookmarklet, format_page_capture,
-        page_capture_from_clipboard_text, PageCaptureInput,
+        page_capture_from_clipboard_text, BrowserCaptureError, PageCaptureInput,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -417,6 +448,44 @@ mod tests {
         assert!(body.contains("Page URL: https://example.test/page"));
         assert!(body.contains("Selected page text:\nUse selected text only."));
         assert!(!body.contains("  "));
+    }
+
+    #[test]
+    fn strips_page_url_query_and_fragment_before_persistence() {
+        let body = format_page_capture(&PageCaptureInput {
+            title: Some("Identity notes".to_string()),
+            url: Some(
+                "https://example.test/notes/?access_token=secret-session-token#private".to_string(),
+            ),
+            selected_text: "Selected page text stays explicit.".to_string(),
+        })
+        .unwrap();
+
+        assert!(body.contains("Page URL: https://example.test/notes"));
+        assert!(!body.contains("access_token"));
+        assert!(!body.contains("secret-session-token"));
+        assert!(!body.contains("#private"));
+    }
+
+    #[test]
+    fn drops_non_web_page_urls_before_persistence() {
+        for url in [
+            "file:///C:/Users/example/Documents/private-note.html",
+            "chrome://settings/passwords",
+            "about:blank",
+            "data:text/html,secret",
+        ] {
+            let body = format_page_capture(&PageCaptureInput {
+                title: Some("Local page".to_string()),
+                url: Some(url.to_string()),
+                selected_text: "Selected text remains explicit.".to_string(),
+            })
+            .unwrap();
+
+            assert!(body.contains("Page title: Local page"));
+            assert!(body.contains("Selected page text:\nSelected text remains explicit."));
+            assert!(!body.contains("Page URL:"));
+        }
     }
 
     #[test]
@@ -452,6 +521,10 @@ mod tests {
         assert!(script.contains("X-Identity-Capture-Token"));
         assert!(script.contains("prompt("));
         assert!(script.contains("k.trim()"));
+        assert!(script.contains("replace(/[?#].*$/"));
+        assert!(script.contains("/^https?:\\/\\//i.test(x)?x:''"));
+        assert!(script.contains("const p=u(location.href)"));
+        assert!(script.contains("p?`Page URL:"));
         assert!(!script.contains("document.body.innerText"));
     }
 
@@ -463,6 +536,10 @@ mod tests {
         assert!(script.contains("window.getSelection()"));
         assert!(script.contains("[IDENTITY-PAGE-CAPTURE]"));
         assert!(script.contains("document.execCommand('copy')"));
+        assert!(script.contains("replace(/[?#].*$/"));
+        assert!(script.contains("/^https?:\\/\\//i.test(x)?x:''"));
+        assert!(script.contains("const p=u(location.href)"));
+        assert!(script.contains("p?`Page URL:"));
         assert!(!script.contains("fetch("));
         assert!(!script.contains("X-Identity-Capture-Token"));
     }
@@ -471,16 +548,45 @@ mod tests {
     fn parses_page_capture_clipboard_envelope() {
         let input = page_capture_from_clipboard_text(
             "[IDENTITY-PAGE-CAPTURE]\nPage title: Identity notes\nPage URL: https://example.test/notes\nSelected page text:\nLocal-first selected text.\n[IDENTITY-PAGE-CAPTURE-END]",
-        );
+        )
+        .unwrap();
 
         assert_eq!(input.title.as_deref(), Some("Identity notes"));
         assert_eq!(input.url.as_deref(), Some("https://example.test/notes"));
         assert_eq!(input.selected_text, "Local-first selected text.");
 
-        let plain = page_capture_from_clipboard_text("plain selected text");
-        assert_eq!(plain.title, None);
-        assert_eq!(plain.url, None);
-        assert_eq!(plain.selected_text, "plain selected text");
+        assert!(matches!(
+            page_capture_from_clipboard_text("plain selected text"),
+            Err(BrowserCaptureError::MissingClipboardEnvelope)
+        ));
+    }
+
+    #[test]
+    fn clipboard_envelope_preserves_label_like_selected_text() {
+        let input = page_capture_from_clipboard_text(
+            "[IDENTITY-PAGE-CAPTURE]\nPage title: Parser notes\nPage URL: https://example.test/parser\nSelected page text:\nThis selected text mentions Page URL: https://inside.example and Page title: not metadata.\n[IDENTITY-PAGE-CAPTURE-END]",
+        )
+        .unwrap();
+
+        assert_eq!(input.title.as_deref(), Some("Parser notes"));
+        assert_eq!(input.url.as_deref(), Some("https://example.test/parser"));
+        assert_eq!(
+            input.selected_text,
+            "This selected text mentions Page URL: https://inside.example and Page title: not metadata."
+        );
+    }
+
+    #[test]
+    fn clipboard_envelope_preserves_inline_end_marker_text() {
+        let input = page_capture_from_clipboard_text(
+            "[IDENTITY-PAGE-CAPTURE]\nPage title: Marker notes\nPage URL: https://example.test/marker\nSelected page text:\nThis selected text mentions [IDENTITY-PAGE-CAPTURE-END] inline and should keep going.\n[IDENTITY-PAGE-CAPTURE-END]",
+        )
+        .unwrap();
+
+        assert_eq!(
+            input.selected_text,
+            "This selected text mentions [IDENTITY-PAGE-CAPTURE-END] inline and should keep going."
+        );
     }
 
     #[test]

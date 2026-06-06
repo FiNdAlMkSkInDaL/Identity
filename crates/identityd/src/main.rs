@@ -28,7 +28,7 @@ use identityd::processor::{
     pipeline_once_if_idle, process_capture, process_once, process_once_if_idle, promote_capture,
     promote_once,
 };
-use identityd::project_profile::{find_matching_profile, load_profiles};
+use identityd::project_profile::{find_matching_profile, find_profile_by_name, load_profiles};
 use identityd::proxy::LocalCaptureServer;
 use identityd::resource::{
     current_process_resources, memory_budget_status, IDLE_MEMORY_TARGET_BYTES,
@@ -111,7 +111,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let clipboard_input = if has_flag(&raw_args, "--from-clipboard") {
                 Some(page_capture_from_clipboard_text(
                     &identityd::clipboard::get_clipboard_text()?,
-                ))
+                )?)
             } else {
                 None
             };
@@ -1085,7 +1085,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let snapshot =
                 capture_context_snapshot().unwrap_or_else(|_| ContextSnapshot::default());
             let profiles = load_profiles(&paths)?;
-            let matched_profile = find_matching_profile(&profiles, &snapshot);
+            let matched_profile = if let Some(project_name) = read_flag(&raw_args, "--project") {
+                Some(
+                    find_profile_by_name(&profiles, &project_name)
+                        .ok_or_else(|| format!("project profile not found: {project_name}"))?,
+                )
+            } else {
+                find_matching_profile(&profiles, &snapshot)
+            };
             let context =
                 build_identity_context(&paths, &snapshot, matched_profile.as_ref(), limit)?;
 
@@ -1446,7 +1453,59 @@ fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<()
 
 fn print_help() {
     println!(
-        "identityd\n\nGlobal:\n  --root <folder>    Use a specific Identity workspace root\n\nCommands:\n  init\n  start [--paste-on-hotkey] [--hotkey-combo ctrl+shift+i]\n  ingest --source <source> --content <text>\n  capture-active-window\n  capture-page --title <title> --url <url> (--text <selected text> | --stdin | --from-clipboard) [--dry-run] [--promote-now] [--addr 127.0.0.1:8080]\n  browser-capture-bookmarklet [--addr 127.0.0.1:8080]\n  browser-capture-clipboard-bookmarklet\n  watch-active-window [--interval-ms 1000]\n  list\n  stats\n  capture-sources\n  doctor [--lease-ms 300000]\n  repair-transit [--lease-ms 300000]\n  protect-at-rest [--limit 100]\n  redact-transit-content [--limit 100]\n  cleaned-list [--limit 10]\n  memory-list [--limit 10]\n  memory-stats\n  embedding-runtime-health\n  embedding-active-health\n  onnx-runtime-health\n  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n  embedding-bootstrap [--model-dir <path>]\n  memory-export [--limit 10]\n  memory-protocol-health\n  repair-protocol-schema [--limit 100]\n  repair-memory-vectors [--limit 100]\n  memory-search --query <text> [--limit 5]\n  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n  memory-edges-list [--limit 10]\n  memory-edge-decay [--limit 100]\n  memory-graph-health\n  context-now [--preview] [--copy] [--limit 3]\n  project-profile-list\n  slice-preview --intent <text> [--limit 3]\n  prompt-package --intent <text> --prompt <text> [--limit 3]\n  process-once [--limit 10]\n  process-idle-once [--limit 10] [--idle-ms 5000]\n  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n  promote-once [--limit 10]\n  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root] [--hotkey] [--hotkey-combo <combo>] [--paste-on-hotkey]"
+        concat!(
+            "identityd\n\n",
+            "Global:\n",
+            "  --root <folder>    Use a specific Identity workspace root\n\n",
+            "Commands:\n",
+            "  init\n",
+            "  start [--paste-on-hotkey] [--hotkey-combo ctrl+shift+i]\n",
+            "  ingest --source <source> --content <text>\n",
+            "  capture-active-window\n",
+            "  capture-page --title <title> --url <url> (--text <selected text> | --stdin | --from-clipboard) [--dry-run] [--promote-now] [--addr 127.0.0.1:8080]\n",
+            "  browser-capture-bookmarklet [--addr 127.0.0.1:8080]\n",
+            "  browser-capture-clipboard-bookmarklet\n",
+            "  watch-active-window [--interval-ms 1000]\n",
+            "  list\n",
+            "  stats\n",
+            "  capture-sources\n",
+            "  doctor [--lease-ms 300000]\n",
+            "  repair-transit [--lease-ms 300000]\n",
+            "  protect-at-rest [--limit 100]\n",
+            "  redact-transit-content [--limit 100]\n",
+            "  cleaned-list [--limit 10]\n",
+            "  memory-list [--limit 10]\n",
+            "  memory-stats\n",
+            "  embedding-runtime-health\n",
+            "  embedding-active-health\n",
+            "  onnx-runtime-health\n",
+            "  embedding-tokenizer-health [--vocab-path <vocab.txt>]\n",
+            "  embedding-tokenize --text <text> [--vocab-path <vocab.txt>] [--max-tokens 256]\n",
+            "  embedding-onnx-run --text <text> [--model-path <file.onnx>] [--vocab-path <vocab.txt>] [--max-tokens 256]\n",
+            "  embedding-manifest-write --model-path <file.onnx> --model-id <id> [--force]\n",
+            "  embedding-bootstrap [--model-dir <path>]\n",
+            "  memory-export [--limit 10]\n",
+            "  memory-protocol-health\n",
+            "  repair-protocol-schema [--limit 100]\n",
+            "  repair-memory-vectors [--limit 100]\n",
+            "  memory-search --query <text> [--limit 5]\n",
+            "  memory-edge-add --source-id <id> --target-id <id> --relationship <type> [--weight 1.0]\n",
+            "  memory-edges-list [--limit 10]\n",
+            "  memory-edge-decay [--limit 100]\n",
+            "  memory-graph-health\n",
+            "  context-now [--preview] [--copy] [--project <name>] [--limit 3]\n",
+            "  project-profile-list\n",
+            "  slice-preview --intent <text> [--limit 3]\n",
+            "  prompt-package --intent <text> --prompt <text> [--limit 3]\n",
+            "  process-once [--limit 10]\n",
+            "  process-idle-once [--limit 10] [--idle-ms 5000]\n",
+            "  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n",
+            "  pipeline-loop [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000]\n",
+            "  promote-once [--limit 10]\n",
+            "  serve [--addr 127.0.0.1:8080] [--allow-non-loopback]\n",
+            "  watch --path <folder> [--non-recursive] [--poll] [--allow-unsafe-watch-root]\n",
+            "  daemon [--addr 127.0.0.1:8080] [--process-limit 10] [--promote-limit 10] [--idle-ms 5000] [--interval-ms 2000] [--watch-path <folder>] [--watch-active-window] [--activity-interval-ms 1000] [--non-recursive] [--allow-non-loopback] [--allow-unsafe-watch-root] [--hotkey] [--hotkey-combo <combo>] [--paste-on-hotkey]"
+        )
     );
 }
 

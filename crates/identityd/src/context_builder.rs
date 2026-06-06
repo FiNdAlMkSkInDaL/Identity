@@ -5,6 +5,8 @@ use crate::slice::security_block;
 use crate::workspace::IdentityPaths;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const RECENT_PAGE_CONTEXT_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
 #[derive(Debug)]
 pub struct IdentityContext {
     pub session_token: String,
@@ -111,6 +113,7 @@ pub fn build_identity_context(
             return Err(ContextBuildError::Blocked(block));
         }
     }
+    let now = current_epoch_ms()?;
 
     // 2. Fetch facts from vector memory store
     let mut query_terms = Vec::new();
@@ -149,10 +152,11 @@ pub fn build_identity_context(
             &mut total_chars,
         );
 
-        if should_include_recent_page_context(snapshot, profile_name.as_deref()) {
-            if let Ok(recent_pages) = store.recent_web_captures(limit.min(3)) {
+        if should_include_recent_page_context(snapshot) {
+            if let Ok(recent_pages) = store.recent_selected_page_captures(limit.min(3)) {
                 let recent_pages = recent_pages
                     .into_iter()
+                    .filter(|node| is_fresh_recent_page_context(node, now))
                     .filter(|node| seen_uids.insert(node.node_uid.clone()))
                     .collect::<Vec<_>>();
                 append_memory_facts(recent_pages, &mut facts, &mut seen_facts, &mut total_chars);
@@ -161,10 +165,6 @@ pub fn build_identity_context(
     }
 
     // 3. Generate session token and expiry
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ContextBuildError::ClockBeforeUnixEpoch)?
-        .as_millis() as i64;
     let seed_input = format!(
         "{}:{}:{}:{}",
         snapshot.process_name,
@@ -219,34 +219,58 @@ fn append_memory_facts(
     }
 }
 
-fn should_include_recent_page_context(
-    snapshot: &ContextSnapshot,
-    profile_name: Option<&str>,
-) -> bool {
-    if profile_name.is_some() {
-        return true;
-    }
+fn current_epoch_ms() -> Result<i64, ContextBuildError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ContextBuildError::ClockBeforeUnixEpoch)?
+        .as_millis() as i64)
+}
 
+fn is_fresh_recent_page_context(node: &crate::identity::MemoryNode, now_ms: i64) -> bool {
+    now_ms.saturating_sub(node.created_at_ms) <= RECENT_PAGE_CONTEXT_MAX_AGE_MS
+}
+
+fn should_include_recent_page_context(snapshot: &ContextSnapshot) -> bool {
     let process = snapshot.process_name.to_ascii_lowercase();
     let title = snapshot.window_title.to_ascii_lowercase();
+
+    is_browser_process(&process) || is_agent_surface(&process) || is_agent_surface(&title)
+}
+
+fn is_browser_process(process: &str) -> bool {
+    let normalized = process
+        .trim()
+        .trim_end_matches(".exe")
+        .trim_end_matches(".app");
 
     [
         "chrome",
         "msedge",
-        "edge",
+        "microsoftedge",
         "firefox",
         "brave",
+        "bravebrowser",
         "browser",
         "arc",
+        "opera",
+        "vivaldi",
+    ]
+    .contains(&normalized)
+}
+
+fn is_agent_surface(value: &str) -> bool {
+    [
+        "google gemini",
         "gemini",
         "chatgpt",
+        "chat.openai",
         "codex",
         "claude",
         "antigravity",
         "perplexity",
     ]
     .iter()
-    .any(|needle| process.contains(needle) || title.contains(needle))
+    .any(|needle| value.contains(needle))
 }
 
 fn stable_hash_hex(bytes: &[u8]) -> String {
@@ -274,6 +298,7 @@ mod tests {
     use crate::project_profile::ProjectProfile;
     use crate::transit::CleanedEvent;
     use crate::workspace::IdentityPaths;
+    use rusqlite::params;
     use std::fs;
 
     #[test]
@@ -426,6 +451,17 @@ mod tests {
             promoted_at_ms: None,
         };
         store.insert_memory_from_cleaned(&cleaned).unwrap();
+        let generic_web = CleanedEvent {
+            id: 10,
+            captured_event_id: 10,
+            source: "local-proxy:text/plain".to_string(),
+            cleaned_content: "Generic loopback capture should stay out of selected page fallback."
+                .to_string(),
+            content_hash: "hash-generic-web".to_string(),
+            cleaned_at_ms: 2,
+            promoted_at_ms: None,
+        };
+        store.insert_memory_from_cleaned(&generic_web).unwrap();
 
         let snap = ContextSnapshot {
             process_name: "msedge.exe".to_string(),
@@ -438,7 +474,119 @@ mod tests {
             fact.contains("web page Identity manifesto")
                 && fact.contains("local-first, lean, and user-owned")
         }));
+        assert!(!ctx
+            .facts
+            .iter()
+            .any(|fact| fact.contains("Generic loopback capture")));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_context_ignores_stale_recent_selected_page_capture() {
+        let root = std::env::temp_dir().join("identity-context-stale-page-test");
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let node_id = store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 31,
+                captured_event_id: 31,
+                source: "local-proxy:text/markdown".to_string(),
+                cleaned_content: "Page title: Old page\nPage URL: https://example.test/old\nSelected page text:\nStale selected page context should remain searchable but not automatic.".to_string(),
+                content_hash: "hash-stale-page".to_string(),
+                cleaned_at_ms: 1,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+        drop(store);
+
+        let stale_ms = current_epoch_ms().unwrap() - RECENT_PAGE_CONTEXT_MAX_AGE_MS - 1000;
+        let conn = rusqlite::Connection::open(&paths.identity_db).unwrap();
+        conn.execute(
+            "UPDATE memory_nodes SET created_at_ms = ?1 WHERE id = ?2",
+            params![stale_ms, node_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let snap = ContextSnapshot {
+            process_name: "msedge.exe".to_string(),
+            window_title: "Plain browser notes".to_string(),
+            focused_text: None,
+        };
+        let profile = ProjectProfile {
+            name: "empty-query".to_string(),
+            window_filters: Vec::new(),
+            guardrails: Vec::new(),
+            memory_query_terms: Vec::new(),
+        };
+
+        let ctx = build_identity_context(&paths, &snap, Some(&profile), 3).unwrap();
+        assert!(!ctx
+            .facts
+            .iter()
+            .any(|fact| fact.contains("Stale selected page context")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_profile_alone_does_not_include_recent_selected_page_capture() {
+        let project_surface = ContextSnapshot {
+            process_name: "code.exe".to_string(),
+            window_title: "identity workspace".to_string(),
+            focused_text: None,
+        };
+        let browser_surface = ContextSnapshot {
+            process_name: "code.exe".to_string(),
+            window_title: "Google Gemini".to_string(),
+            focused_text: None,
+        };
+
+        assert!(!should_include_recent_page_context(&project_surface));
+        assert!(should_include_recent_page_context(&browser_surface));
+    }
+
+    #[test]
+    fn page_context_surface_classifier_avoids_short_substring_false_positives() {
+        for title in [
+            "knowledge base notes",
+            "architecture notes",
+            "project edge cases",
+        ] {
+            let snap = ContextSnapshot {
+                process_name: "code.exe".to_string(),
+                window_title: title.to_string(),
+                focused_text: None,
+            };
+            assert!(
+                !should_include_recent_page_context(&snap),
+                "unexpected page-context fallback for title {title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_context_surface_classifier_allows_known_browser_processes_and_agent_titles() {
+        for process in ["msedge.exe", "chrome", "firefox.exe", "arc.exe"] {
+            let snap = ContextSnapshot {
+                process_name: process.to_string(),
+                window_title: "Plain project notes".to_string(),
+                focused_text: None,
+            };
+            assert!(
+                should_include_recent_page_context(&snap),
+                "expected browser process {process:?} to allow recent page context"
+            );
+        }
+
+        let agent_title = ContextSnapshot {
+            process_name: "powershell.exe".to_string(),
+            window_title: "Google Gemini - Identity page capture smoke test".to_string(),
+            focused_text: None,
+        };
+        assert!(should_include_recent_page_context(&agent_title));
     }
 }

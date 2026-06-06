@@ -108,6 +108,7 @@ cargo run -p identityd -- watch --path C:\Users\finph\Documents --poll
 .\start-identity.cmd
 .\start-identity-hidden.cmd
 .\scripts\test-identity-hotkey.ps1
+.\scripts\test-identity-page-capture.ps1
 .\target\release\identityd.exe start
 cargo run -p identityd -- context-now --preview
 cargo run -p identityd -- context-now --copy
@@ -232,7 +233,9 @@ textual media types: `text/plain`, `text/html`, `text/markdown`,
 For explicit browser/page context, `capture-page` is a CLI-friendly loopback
 helper. It accepts only user-provided selected text plus optional page title and
 URL, validates the assembled payload locally, reads the workspace capture token,
-and posts to the same token-protected `/capture` endpoint:
+and posts to the same token-protected `/capture` endpoint. Page URLs are stored
+only for `http://` and `https://` pages, without query strings or fragments, to
+avoid persisting local file paths, session tokens, or tracking parameters:
 
 ```powershell
 $selection = Get-Clipboard
@@ -249,6 +252,10 @@ never asks for the capture token inside page JavaScript. After using it, run:
 cargo run -p identityd -- capture-page --from-clipboard
 ```
 
+`--from-clipboard` accepts only that `IDENTITY-PAGE-CAPTURE` envelope. To capture
+plain clipboard text manually, pipe it through `--stdin` or pass it with `--text`
+instead; this keeps accidental clipboard contents out of the page-capture path.
+
 Add `--promote-now` when the selected page should be available to the next
 hotkey context immediately. This processes and promotes only the capture that
 was just queued, rather than draining unrelated transit backlog; the default
@@ -261,10 +268,16 @@ token auth, CORS preflight, textual media-type enforcement, the 1MB body budget,
 and the shared deterministic safety blacklist. It is user-triggered only; it does
 not perform ambient DOM watching or full-page scraping.
 
-When `Ctrl+Shift+I` is pressed inside a browser or agent chat surface, the
-context builder can add a bounded handful of recent selected-page captures after
-normal profile/query memory search. This improves context quality for generic
-window titles without making browser capture automatic.
+When `Ctrl+Shift+I` is pressed inside a known browser process or an agent chat
+surface with an explicit agent title marker, the context builder can add a
+bounded handful of recent selected-page captures after normal profile/query
+memory search. This improves context quality for generic window titles without
+making browser capture automatic. Automatic selected-page fallback is limited to
+captures from the last 24 hours; older page captures remain searchable local
+memory but are not injected just because the user is in a browser or agent
+surface. Generic loopback web captures remain searchable local memory, but they
+are not used by this recent selected-page fallback unless they carry the
+explicit `Selected page text:` capture shape.
 
 All capture paths share the same transit safety gate before SQLite persistence:
 capture content is capped at 1MB, source labels are capped at 2048 bytes, and
@@ -284,4 +297,4 @@ policy enforcement, reports each local capture adapter status plus protected
 source-family counts, and reports whether any legacy plaintext fields still need
 `protect-at-rest`.
 
-`start` is the simplest local context entrypoint. It runs the loopback capture server, idle-gated clean/promote pipeline, bounded foreground-window capture, and a global `Ctrl+Shift+I` hotkey that copies a compact sanitized context block to the clipboard. `start-identity.cmd` runs it visibly in the current terminal; closing that terminal also stops the daemon. `start-identity-hidden.cmd` starts the same default daemon in a hidden background process. `scripts\test-identity-hotkey.ps1` starts a temporary daemon, simulates `Ctrl+Shift+I`, verifies the clipboard receives an Identity context block, and restores the previous clipboard text. On Windows, default active-window capture records the foreground executable and title; set `IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT=1` only for local debugging of deeper UI Automation/MSAA text extraction. `daemon` remains the lower-level phase 1/2 orchestration entrypoint: it runs the loopback capture server and idle-gated pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path`, bounded foreground-window capture with `--watch-active-window`, and hotkey capture with `--hotkey`. On Windows the filesystem watcher stays on the native event path. `--watch-path` uses the same safe-root policy as `watch`.
+`context-now --project <name>` explicitly selects a named local project profile instead of relying on active-window matching. `start` is the simplest local context entrypoint. It runs the loopback capture server, idle-gated clean/promote pipeline, bounded foreground-window capture, and a global `Ctrl+Shift+I` hotkey that copies a compact sanitized context block to the clipboard. `start-identity.cmd` runs it visibly in the current terminal; closing that terminal also stops the daemon. `start-identity-hidden.cmd` starts the same default daemon in a hidden background process. `scripts\test-identity-hotkey.ps1` starts a temporary daemon, simulates `Ctrl+Shift+I`, verifies the clipboard receives an Identity context block, and restores the previous clipboard text. `scripts\test-identity-page-capture.ps1` starts a temporary loopback capture server on an ephemeral local port, verifies plain clipboard text is rejected by `capture-page --from-clipboard`, copies an `IDENTITY-PAGE-CAPTURE` envelope to the clipboard, runs `capture-page --from-clipboard --promote-now`, verifies the selected page memory is searchable, temporarily gives the test terminal a browser/agent-like title, and verifies `context-now --preview --project tfl-central` includes that selected page context in the temporary `.me` store. On Windows, default active-window capture records the foreground executable and title; set `IDENTITYD_ENABLE_DEEP_ACTIVE_WINDOW_TEXT=1` only for local debugging of deeper UI Automation/MSAA text extraction. `daemon` remains the lower-level phase 1/2 orchestration entrypoint: it runs the loopback capture server and idle-gated pipeline in one process, and it can optionally add a shutdown-aware filesystem watcher with `--watch-path`, bounded foreground-window capture with `--watch-active-window`, and hotkey capture with `--hotkey`. On Windows the filesystem watcher stays on the native event path. `--watch-path` uses the same safe-root policy as `watch`.

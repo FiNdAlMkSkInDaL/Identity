@@ -46,6 +46,19 @@ pub fn find_matching_profile(
     None
 }
 
+/// Find a profile by explicit user-provided name.
+pub fn find_profile_by_name(profiles: &[ProjectProfile], name: &str) -> Option<ProjectProfile> {
+    let requested = name.trim();
+    if requested.is_empty() {
+        return None;
+    }
+
+    profiles
+        .iter()
+        .find(|profile| profile.name.eq_ignore_ascii_case(requested))
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +113,31 @@ mod tests {
             focused_text: None,
         };
         assert_eq!(find_matching_profile(&profiles, &snap3), None);
+    }
+
+    #[test]
+    fn test_profile_lookup_by_explicit_name() {
+        let profiles = vec![
+            ProjectProfile {
+                name: "tfl-central".to_string(),
+                window_filters: vec!["tfl".to_string()],
+                guardrails: vec![],
+                memory_query_terms: vec![],
+            },
+            ProjectProfile {
+                name: "rust-dev".to_string(),
+                window_filters: vec!["rust".to_string()],
+                guardrails: vec![],
+                memory_query_terms: vec![],
+            },
+        ];
+
+        assert_eq!(
+            find_profile_by_name(&profiles, " TFL-CENTRAL ").map(|profile| profile.name),
+            Some("tfl-central".to_string())
+        );
+        assert_eq!(find_profile_by_name(&profiles, "missing"), None);
+        assert_eq!(find_profile_by_name(&profiles, "   "), None);
     }
 
     #[test]

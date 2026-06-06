@@ -272,6 +272,26 @@ impl IdentityStore {
             .list_recent_by_domain("local.web.capture", limit)
     }
 
+    pub fn recent_selected_page_captures(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MemoryNode>, IdentityError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let scan_limit = limit.saturating_mul(16).clamp(16, 100);
+        let candidates = self
+            .backend
+            .list_recent_by_domain("local.web.capture", scan_limit)?;
+
+        Ok(candidates
+            .into_iter()
+            .filter(is_selected_page_capture)
+            .take(limit as usize)
+            .collect())
+    }
+
     pub fn export_recent_protocol_json(&self, limit: u32) -> Result<String, IdentityError> {
         let candidates =
             self.backend
@@ -1636,10 +1656,10 @@ fn windows_activity_attributes(content: &str) -> String {
 fn web_capture_attributes(content: &str) -> String {
     let mut fields = Vec::new();
 
-    if let Some(title) = labelled_value(content, "Page title:") {
+    if let Some(title) = web_capture_header_value(content, "Page title:") {
         fields.push(json_field("page_title", &title));
     }
-    if let Some(url) = labelled_value(content, "Page URL:") {
+    if let Some(url) = web_capture_header_value(content, "Page URL:") {
         fields.push(json_field("page_url", &url));
     }
 
@@ -1837,9 +1857,9 @@ fn summarize_capture(source: &str, content: &str) -> String {
 }
 
 fn summarize_web_capture(content: &str) -> String {
-    let title = labelled_value(content, "Page title:");
-    let url = labelled_value(content, "Page URL:");
-    let selection = labelled_value(content, "Selected page text:");
+    let title = web_capture_header_value(content, "Page title:");
+    let url = web_capture_header_value(content, "Page URL:");
+    let selection = web_capture_selection(content);
 
     let mut parts = Vec::new();
     if let Some(title) = title {
@@ -1857,6 +1877,59 @@ fn summarize_web_capture(content: &str) -> String {
     } else {
         summarize(&parts.join("; "))
     }
+}
+
+fn is_selected_page_capture(node: &MemoryNode) -> bool {
+    web_capture_selection(&node.raw_text).is_some()
+        && (web_capture_header_value(&node.raw_text, "Page title:").is_some()
+            || web_capture_header_value(&node.raw_text, "Page URL:").is_some())
+}
+
+fn web_capture_header_value(content: &str, label: &str) -> Option<String> {
+    let metadata = content
+        .find("Selected page text:")
+        .map(|offset| &content[..offset])
+        .unwrap_or(content);
+
+    let start = metadata.find(label)? + label.len();
+    let remainder = metadata[start..].trim_start();
+    let next_label_offset = ["Page title:", "Page URL:"]
+        .into_iter()
+        .filter(|candidate| *candidate != label)
+        .filter_map(|candidate| remainder.find(candidate))
+        .min()
+        .unwrap_or(remainder.len());
+
+    let value = remainder[..next_label_offset].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn web_capture_selection(content: &str) -> Option<String> {
+    let label = "Selected page text:";
+    let start = content.find(label)? + label.len();
+    let value = content[start..].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(collapse_summary_whitespace(value))
+    }
+}
+
+fn collapse_summary_whitespace(value: &str) -> String {
+    let mut compact = String::with_capacity(value.len());
+
+    for part in value.split_whitespace() {
+        if !compact.is_empty() {
+            compact.push(' ');
+        }
+        compact.push_str(part);
+    }
+
+    compact
 }
 
 fn summarize_windows_activity(content: &str) -> String {
@@ -2094,10 +2167,11 @@ fn fill_random_bytes(_bytes: &mut [u8]) -> std::io::Result<()> {
 mod tests {
     use super::{
         capture_attributes, classify_capture, format_uuid_bytes, is_iso8601_utc_timestamp,
-        is_json_object_like, is_uuid_v4_like, iso8601_utc_from_ms, labelled_value,
-        protocol_nodes_json, query_tokens, summarize, summarize_capture, summarize_web_capture,
-        summarize_windows_activity, web_capture_attributes, windows_activity_attributes,
-        IdentityStore, ProtocolGraphEdge, ProtocolMemoryNode, SqliteMemoryBackend,
+        is_json_object_like, is_selected_page_capture, is_uuid_v4_like, iso8601_utc_from_ms,
+        labelled_value, protocol_nodes_json, query_tokens, summarize, summarize_capture,
+        summarize_web_capture, summarize_windows_activity, web_capture_attributes,
+        windows_activity_attributes, IdentityStore, MemoryNode, ProtocolGraphEdge,
+        ProtocolMemoryNode, SqliteMemoryBackend,
     };
     use crate::crypto::is_protected_text;
     use crate::embedding::{
@@ -2264,6 +2338,48 @@ mod tests {
             web_capture_attributes(content),
             "{\"page_title\":\"Identity local capture\",\"page_url\":\"https://example.test/notes\"}"
         );
+    }
+
+    #[test]
+    fn web_capture_summary_preserves_label_like_selected_text() {
+        let content = "Page title: Parser notes\nPage URL: https://example.test/parser\nSelected page text:\nThis selected text mentions Page URL: https://inside.example and Page title: not metadata.";
+
+        assert_eq!(
+            summarize_web_capture(content),
+            "web page Parser notes; url https://example.test/parser; selected text This selected text mentions Page URL: https://inside.example and Page title: not metadata."
+        );
+        assert_eq!(
+            web_capture_attributes(content),
+            "{\"page_title\":\"Parser notes\",\"page_url\":\"https://example.test/parser\"}"
+        );
+    }
+
+    #[test]
+    fn web_capture_metadata_ignores_labels_inside_selection() {
+        let content =
+            "Selected page text:\nPage title: not metadata\nPage URL: https://inside.example";
+
+        assert_eq!(
+            summarize_web_capture(content),
+            "selected text Page title: not metadata Page URL: https://inside.example"
+        );
+        assert_eq!(web_capture_attributes(content), "{}");
+        assert!(!is_selected_page_capture(&MemoryNode {
+            id: 1,
+            node_uid: "00000000-0000-4000-8000-000000000001".to_string(),
+            cleaned_event_id: 1,
+            source: "local-proxy:text/markdown".to_string(),
+            domain_context: "local.web.capture".to_string(),
+            entity_type: "WEB_CONTENT".to_string(),
+            summary: summarize_web_capture(content),
+            structured_attributes: "{}".to_string(),
+            raw_text: content.to_string(),
+            content_hash: "hash".to_string(),
+            created_at_ms: 0,
+            created_at_utc: "1970-01-01T00:00:00.000Z".to_string(),
+            last_accessed_ms: 0,
+            last_accessed_utc: "1970-01-01T00:00:00.000Z".to_string(),
+        }));
     }
 
     #[test]
@@ -2685,6 +2801,54 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].domain_context, "local.web.capture");
         assert!(recent[0].summary.contains("web page Useful page"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lists_recent_selected_page_captures_only() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-selected-page-capture-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 51,
+                captured_event_id: 51,
+                source: "local-proxy:text/markdown".to_string(),
+                cleaned_content: "Page title: Useful page\nPage URL: https://example.test\nSelected page text:\nExplicit selected page context.".to_string(),
+                content_hash: "hash51".to_string(),
+                cleaned_at_ms: 1,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 52,
+                captured_event_id: 52,
+                source: "local-proxy:text/plain".to_string(),
+                cleaned_content: "Generic loopback capture that is not selected page context."
+                    .to_string(),
+                content_hash: "hash52".to_string(),
+                cleaned_at_ms: 2,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+
+        let all_web = store.recent_web_captures(10).unwrap();
+        assert_eq!(all_web.len(), 2);
+
+        let selected_pages = store.recent_selected_page_captures(10).unwrap();
+        assert_eq!(selected_pages.len(), 1);
+        assert!(selected_pages[0].summary.contains("web page Useful page"));
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
