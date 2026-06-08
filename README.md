@@ -100,6 +100,17 @@ cargo run -p identityd -- memory-edge-add --source-id 1 --target-id 2 --relation
 cargo run -p identityd -- memory-edge-decay --limit 100
 cargo run -p identityd -- slice-preview --intent "draft outreach using local context"
 cargo run -p identityd -- prompt-package --intent "draft outreach using local context" --prompt "Write the message."
+cargo run -p identityd -- agent-delta-list --limit 10
+cargo run -p identityd -- agent-delta-list --review-only --limit 10
+cargo run -p identityd -- agent-delta-list --source follow-up --limit 10
+cargo run -p identityd -- agent-delta-list --entity "Acme Capital" --limit 10
+cargo run -p identityd -- agent-delta-list --state PAID --limit 10
+cargo run -p identityd -- agent-delta-preview --source follow-up --text "Sent follow-up to Acme Capital. Confirmation reference: MSG-42"
+cargo run -p identityd -- agent-delta-preview --candidate-json-stdin
+cargo run -p identityd -- agent-delta-commit --source follow-up --text "Sent follow-up to Acme Capital. Confirmation reference: MSG-42"
+cargo run -p identityd -- agent-delta-commit --candidate-json-stdin
+cargo run -p identityd -- agent-delta-commit --json --source follow-up --text "Sent follow-up to Acme Capital. Confirmation reference: MSG-42"
+cargo run -p identityd -- agent-delta-commit --source follow-up --allow-sensitive --text "Paid invoice for Acme Capital. Receipt reference: INV-42"
 cargo run -p identityd -- serve
 cargo run -p identityd -- watch --path C:\Users\finph\Documents
 cargo run -p identityd -- watch --path C:\Users\finph\Documents --poll
@@ -279,10 +290,75 @@ surface. Generic loopback web captures remain searchable local memory, but they
 are not used by this recent selected-page fallback unless they carry the
 explicit `Selected page text:` capture shape.
 
+Before formatting the compact context block, the builder searches active project
+profile memory terms together with the current window title, then applies a cheap
+deterministic freshness/source-diversity ranking pass. Repeated foreground-window
+title memories are collapsed to one useful fact, while distinct project/profile
+memory hits and eligible recent selected-page captures can still share the
+bounded context budget. Eligible selected-page fallback is capped so it cannot
+monopolize fact slots when non-page facts are available, and one source domain
+cannot consume every slot on the first pass when another eligible domain is
+present; that domain cap relaxes only to fill slots that would otherwise stay
+empty. This ranking uses only local normalized text, source domain, and
+timestamps; it does not call a model or expand capture scope. If a high-ranked
+fact does not fit the remaining character budget, the builder keeps scanning for
+shorter later facts instead of ending the context list early.
+
 All capture paths share the same transit safety gate before SQLite persistence:
 capture content is capped at 1MB, source labels are capped at 2048 bytes, and
 deterministic secret, credential, payment-card, routing, and precise-location
 markers are rejected.
+
+Phase 3 feedback-loop work starts with an explicit local delta boundary rather
+than an ambient watcher. `agent-delta-preview` accepts outcome text through
+`--text`, `--content`, or `--stdin`, applies the same deterministic safety gate
+plus the outbound security blacklist, and emits a bounded structured JSON
+candidate with `schema_version`, outcome state, summary, obvious entities,
+key/value attributes, `requires_review`, and any review-required categories. It
+can also validate a reviewed candidate through `--candidate-json <json>` or
+`--candidate-json-stdin`, rejecting unknown fields and unsafe content.
+`agent-delta-commit` performs the same extraction or candidate-JSON validation,
+validates the candidate against the local delta schema, and writes only that
+validated candidate into local `.me` memory through the existing embedding,
+vector mirror, and at-rest protection path.
+Sources are normalized as bounded lowercase slugs under the `agent-delta:`
+prefix and committed memories are classified as `agent.outcome/AGENT_DELTA`.
+Finance, health, legal identity, and private-communication outcome markers fail
+closed unless `--allow-sensitive` is passed after review. Repeating the same
+committed delta reuses a stable local
+cleaned-event id so duplicate detection returns the existing memory node before
+embedding/vector writes and retries do not bloat memory or spend unnecessary
+local inference work. After commit, a bounded deterministic reconciliation pass
+links the agent outcome to recent local memories that mention the same extracted
+entity with `OUTCOME_FOR` / `UPDATED_BY` graph edges, and links newer matching
+outcome deltas to older ones with `SUPERSEDES` / `SUPERSEDED_BY`. If two
+same-entity outcome deltas share an attribute key with a changed value, the graph
+also records `ATTRIBUTE_CONFLICTS_WITH` / `ATTRIBUTE_REPLACED_BY` edges so the
+change is explicit without deleting either state; `memory-graph-health` reports
+agent-delta node, outcome-edge, conflict-edge, and supersession-edge counts for
+quick local inspection. When a newer outcome supersedes an older same-entity outcome, the
+reconciliation transaction also applies the documented short/long edge-weight
+decay formula to the older delta's outgoing non-supersession edges, so stale
+outcome evidence fades without deleting local history. Committed delta nodes use concise
+source-specific summary tokens and structured attributes for outcome state,
+source, summary, entities, review categories, and extracted delta attributes, so
+local search/export remains useful without exposing raw session logs.
+`agent-delta-commit` reports the protocol-facing node id for the committed
+memory, not the local SQLite row id, and includes `write_status=created` or
+`write_status=existing` so duplicate retries are visible without extra writes;
+passing `--json` returns the same bounded protocol-facing commit result as JSON.
+`agent-delta-list` emits recent committed deltas as bounded JSON with
+protocol-facing node ids, UTC timestamps, source, outcome state, extracted
+entities, extracted delta attributes, summary, and structured attributes, plus
+top-level `requires_review` and review-category fields; it does not include raw
+text, hashes, vector blobs, scores, or internal SQLite row ids.
+Use `--review-only` to show only committed deltas that require explicit review,
+`--source <label>` to inspect one normalized `agent-delta:` source, and
+`--entity <name>` to inspect deltas for one extracted entity, and
+`--state <STATE>` to inspect one outcome state such as `SENT`, `PAID`, or
+`FAILED`. Its requested limit is hard-capped at 100 rows to keep inspection cheap. This is not a session watcher and it does not observe
+browser/API activity automatically; it is the smallest explicit write-back
+primitive for tested agent outcomes.
 
 Use `doctor` as the Phase 1 readiness check. It reports raw queue/vector health,
 primary vector mirror health, explicit Phase 1 markers, and a

@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod context_builder;
 pub mod context_snapshot;
 pub mod crypto;
+pub mod delta;
 pub mod embedding;
 pub mod filesystem;
 pub mod hotkey;

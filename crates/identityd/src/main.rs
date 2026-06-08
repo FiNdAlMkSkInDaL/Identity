@@ -11,6 +11,7 @@ use identityd::capture::capture_adapter_health;
 use identityd::context_builder::build_identity_context;
 use identityd::context_snapshot::{capture_context_snapshot, ContextSnapshot};
 use identityd::crypto::protection_backend;
+use identityd::delta::{agent_delta_from_json, extract_agent_delta, normalize_agent_delta_source};
 use identityd::embedding::{
     active_embedding_health, embedding_artifact_health_for_model_path,
     onnx_runtime_health_for_artifact, probe_embedding_latency, run_onnx_embedding_file,
@@ -402,8 +403,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
             println!("vector_store_backend={}", memory.vector_store_backend);
             let graph = store.graph_health()?;
+            println!("graph_agent_delta_nodes={}", graph.agent_delta_nodes);
             println!("graph_edges={}", graph.edge_count);
             println!("graph_orphans={}", graph.orphan_count);
+            println!("graph_outcome_edges={}", graph.outcome_edges);
+            println!("graph_conflict_edges={}", graph.conflict_edges);
+            println!("graph_supersession_edges={}", graph.supersession_edges);
             println!("graph_decayed_edges={}", graph.decayed_edges);
             println!(
                 "content_unprotected_transit_fields={}",
@@ -1067,8 +1072,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let health = store.graph_health()?;
 
             println!("graph_nodes={}", health.node_count);
+            println!("graph_agent_delta_nodes={}", health.agent_delta_nodes);
             println!("graph_edges={}", health.edge_count);
             println!("graph_orphans={}", health.orphan_count);
+            println!("graph_outcome_edges={}", health.outcome_edges);
+            println!("graph_conflict_edges={}", health.conflict_edges);
+            println!("graph_supersession_edges={}", health.supersession_edges);
             println!("graph_decayed_edges={}", health.decayed_edges);
         }
         "context-now" => {
@@ -1149,6 +1158,83 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let package = build_prompt_package(&paths, &intent, &prompt, limit)?;
 
             println!("{package}");
+        }
+        "agent-delta-list" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let review_only = has_flag(&raw_args, "--review-only");
+            let source_filter = read_flag(&raw_args, "--source")
+                .map(|source| normalize_agent_delta_source(Some(&source)));
+            let entity_filter = read_flag(&raw_args, "--entity");
+            let state_filter = read_flag(&raw_args, "--state");
+            let store = IdentityStore::open(&paths)?;
+
+            println!(
+                "{}",
+                store.export_recent_agent_deltas_json_filtered(
+                    limit,
+                    review_only,
+                    source_filter.as_deref(),
+                    entity_filter.as_deref(),
+                    state_filter.as_deref(),
+                )?
+            );
+        }
+        "agent-delta-preview" => {
+            let delta = read_agent_delta_candidate(&raw_args)?;
+
+            println!("{}", delta.to_json()?);
+        }
+        "agent-delta-commit" => {
+            let json_output = has_flag(&raw_args, "--json");
+            let delta = read_agent_delta_candidate(&raw_args)?;
+            if delta.requires_review() && !has_flag(&raw_args, "--allow-sensitive") {
+                return Err(format!(
+                    "agent delta requires explicit review for categories: {}; rerun with --allow-sensitive after confirming this write-back should be stored locally",
+                    delta.review_required_categories.join(",")
+                )
+                .into());
+            }
+            let cleaned = delta.to_cleaned_event()?;
+            let store = IdentityStore::open(&paths)?;
+            let existing_node_id = store.node_uid_for_cleaned_event(cleaned.id)?;
+            let memory_id = store.insert_memory_from_cleaned(&cleaned)?;
+            let write_status = if existing_node_id.is_some() {
+                "existing"
+            } else {
+                "created"
+            };
+            let node_id = match existing_node_id {
+                Some(node_id) => node_id,
+                None => store
+                    .node_uid_for_memory_id(memory_id)?
+                    .ok_or("committed agent delta is missing a protocol node id")?,
+            };
+
+            if json_output {
+                let output = serde_json::json!({
+                    "node_id": node_id,
+                    "write_status": write_status,
+                    "source": delta.source,
+                    "outcome_state": delta.outcome_state,
+                    "requires_review": delta.requires_review(),
+                    "review_required_categories": delta.review_required_categories,
+                    "summary": delta.summary,
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!(
+                    "committed agent delta: node_id={} write_status={} source={} outcome_state={} review_required={} summary={}",
+                    node_id,
+                    write_status,
+                    delta.source,
+                    delta.outcome_state,
+                    if delta.requires_review() { "yes" } else { "no" },
+                    delta.summary
+                );
+            }
         }
         "process-once" => {
             let limit = read_flag(&raw_args, "--limit")
@@ -1404,6 +1490,39 @@ fn read_page_capture_text(args: &[String]) -> Result<String, Box<dyn Error>> {
         .or_else(|| read_flag(args, "--content"))
         .ok_or_else(|| {
             "capture-page command requires --text <selected text>, --content <selected text>, --stdin, or --from-clipboard"
+            .into()
+        })
+}
+
+fn read_agent_delta_candidate(
+    args: &[String],
+) -> Result<identityd::delta::AgentDelta, Box<dyn Error>> {
+    if let Some(candidate_json) = read_flag(args, "--candidate-json") {
+        return Ok(agent_delta_from_json(&candidate_json)?);
+    }
+
+    if has_flag(args, "--candidate-json-stdin") {
+        let mut candidate_json = String::new();
+        std::io::stdin().read_to_string(&mut candidate_json)?;
+        return Ok(agent_delta_from_json(&candidate_json)?);
+    }
+
+    let source = read_flag(args, "--source");
+    let text = read_agent_delta_text(args)?;
+    Ok(extract_agent_delta(&text, source.as_deref())?)
+}
+
+fn read_agent_delta_text(args: &[String]) -> Result<String, Box<dyn Error>> {
+    if has_flag(args, "--stdin") {
+        let mut content = String::new();
+        std::io::stdin().read_to_string(&mut content)?;
+        return Ok(content);
+    }
+
+    read_flag(args, "--text")
+        .or_else(|| read_flag(args, "--content"))
+        .ok_or_else(|| {
+            "agent-delta command requires --text <outcome text>, --content <outcome text>, --stdin, --candidate-json <json>, or --candidate-json-stdin"
                 .into()
         })
 }
@@ -1497,6 +1616,9 @@ fn print_help() {
             "  project-profile-list\n",
             "  slice-preview --intent <text> [--limit 3]\n",
             "  prompt-package --intent <text> --prompt <text> [--limit 3]\n",
+            "  agent-delta-list [--limit 10] [--review-only] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
+            "  agent-delta-preview (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>]\n",
+            "  agent-delta-commit (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>] [--allow-sensitive] [--json]\n",
             "  process-once [--limit 10]\n",
             "  process-idle-once [--limit 10] [--idle-ms 5000]\n",
             "  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n",

@@ -3,9 +3,14 @@ use crate::identity::IdentityStore;
 use crate::project_profile::ProjectProfile;
 use crate::slice::security_block;
 use crate::workspace::IdentityPaths;
+use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RECENT_PAGE_CONTEXT_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+const CONTEXT_FACT_CHAR_BUDGET: usize = 1200;
+const CONTEXT_FACT_MAX_CHARS: usize = 320;
+const MAX_ACTIVITY_WINDOW_FACTS: usize = 1;
+const MAX_SELECTED_PAGE_FACTS: usize = 3;
 
 #[derive(Debug)]
 pub struct IdentityContext {
@@ -123,34 +128,36 @@ pub fn build_identity_context(
     if let Some(p) = profile {
         profile_name = Some(p.name.clone());
         guardrails.extend(p.guardrails.iter().cloned());
-        query_terms.extend(p.memory_query_terms.iter().cloned());
-    } else if !snapshot.window_title.is_empty() {
-        query_terms.push(snapshot.window_title.clone());
+        for term in &p.memory_query_terms {
+            push_query_term(&mut query_terms, term);
+        }
+    }
+    push_query_term(&mut query_terms, &snapshot.window_title);
+
+    if query_terms.is_empty() && !snapshot.process_name.is_empty() {
+        push_query_term(&mut query_terms, &snapshot.process_name);
     }
 
     let mut facts = Vec::new();
     if let Ok(store) = IdentityStore::open(paths) {
         let mut seen_uids = std::collections::HashSet::new();
-        let mut searched_memories = Vec::new();
+        let mut candidates = Vec::new();
+        let mut sequence = 0usize;
 
         for term in &query_terms {
             if let Ok(results) = store.search(term, limit) {
                 for result in results {
                     if seen_uids.insert(result.node.node_uid.clone()) {
-                        searched_memories.push(result.node);
+                        candidates.push(ContextFactCandidate {
+                            node: result.node,
+                            origin: CandidateOrigin::Search(result.score),
+                            sequence,
+                        });
+                        sequence += 1;
                     }
                 }
             }
         }
-
-        let mut total_chars = 0;
-        let mut seen_facts = std::collections::HashSet::new();
-        append_memory_facts(
-            searched_memories,
-            &mut facts,
-            &mut seen_facts,
-            &mut total_chars,
-        );
 
         if should_include_recent_page_context(snapshot) {
             if let Ok(recent_pages) = store.recent_selected_page_captures(limit.min(3)) {
@@ -159,9 +166,18 @@ pub fn build_identity_context(
                     .filter(|node| is_fresh_recent_page_context(node, now))
                     .filter(|node| seen_uids.insert(node.node_uid.clone()))
                     .collect::<Vec<_>>();
-                append_memory_facts(recent_pages, &mut facts, &mut seen_facts, &mut total_chars);
+                for node in recent_pages {
+                    candidates.push(ContextFactCandidate {
+                        node,
+                        origin: CandidateOrigin::RecentSelectedPage,
+                        sequence,
+                    });
+                    sequence += 1;
+                }
             }
         }
+
+        facts = rank_memory_facts(candidates, limit);
     }
 
     // 3. Generate session token and expiry
@@ -187,35 +203,350 @@ pub fn build_identity_context(
     })
 }
 
-fn append_memory_facts(
-    nodes: Vec<crate::identity::MemoryNode>,
-    facts: &mut Vec<String>,
-    seen_facts: &mut std::collections::HashSet<String>,
-    total_chars: &mut usize,
-) {
-    for node in nodes {
-        if security_block(&node.summary).is_some() {
+#[derive(Debug)]
+struct ContextFactCandidate {
+    node: crate::identity::MemoryNode,
+    origin: CandidateOrigin,
+    sequence: usize,
+}
+
+#[derive(Debug)]
+enum CandidateOrigin {
+    Search(u32),
+    RecentSelectedPage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextSourceKind {
+    SelectedPage,
+    WebCapture,
+    ActivityWindow,
+    Other,
+}
+
+#[derive(Debug)]
+struct PreparedFact {
+    text: String,
+    fact_key: String,
+    source_key: String,
+    domain_key: String,
+    kind: ContextSourceKind,
+    score: u32,
+    created_at_ms: i64,
+    sequence: usize,
+}
+
+fn rank_memory_facts(candidates: Vec<ContextFactCandidate>, limit: u32) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut prepared = candidates
+        .into_iter()
+        .filter_map(prepare_fact)
+        .collect::<Vec<_>>();
+
+    prepared.sort_by(compare_prepared_facts);
+    let has_non_selected_page_fact = prepared
+        .iter()
+        .any(|fact| fact.kind != ContextSourceKind::SelectedPage);
+    let selected_page_limit = selected_page_fact_limit(limit, has_non_selected_page_fact);
+    let domain_limit = domain_fact_limit(limit, has_diverse_domains(&prepared));
+
+    let mut facts = Vec::new();
+    let mut total_chars = 0usize;
+    let mut activity_window_facts = 0usize;
+    let mut selected_page_facts = 0usize;
+    let mut seen_facts = std::collections::HashSet::new();
+    let mut seen_activity_sources = std::collections::HashSet::new();
+    let mut domain_counts = std::collections::HashMap::<String, usize>::new();
+    let mut domain_deferred = Vec::new();
+
+    for fact in prepared {
+        if seen_facts.contains(&fact.fact_key) {
             continue;
         }
 
-        let sanitized = node.summary.replace('\n', " ").trim().to_string();
-        let truncated = if sanitized.chars().count() > 320 {
-            let mut s: String = sanitized.chars().take(320).collect();
-            s.push_str("...");
-            s
-        } else {
-            sanitized
-        };
-        let fact_key = normalize_fact_key(&truncated);
-        if fact_key.is_empty() || !seen_facts.insert(fact_key) {
+        if total_chars + fact.text.len() > CONTEXT_FACT_CHAR_BUDGET {
             continue;
         }
 
-        if *total_chars + truncated.len() > 1200 {
+        if !source_quotas_allow(
+            &fact,
+            selected_page_facts,
+            selected_page_limit,
+            activity_window_facts,
+            &seen_activity_sources,
+        ) {
+            continue;
+        }
+
+        if domain_counts
+            .get(&fact.domain_key)
+            .copied()
+            .unwrap_or_default()
+            >= domain_limit
+        {
+            domain_deferred.push(fact);
+            continue;
+        }
+
+        accept_prepared_fact(
+            fact,
+            &mut facts,
+            &mut total_chars,
+            &mut seen_facts,
+            &mut seen_activity_sources,
+            &mut domain_counts,
+            &mut activity_window_facts,
+            &mut selected_page_facts,
+        );
+
+        if facts.len() >= limit as usize {
             break;
         }
-        *total_chars += truncated.len();
-        facts.push(truncated);
+    }
+
+    if facts.len() < limit as usize {
+        for fact in domain_deferred {
+            if seen_facts.contains(&fact.fact_key) {
+                continue;
+            }
+
+            if total_chars + fact.text.len() > CONTEXT_FACT_CHAR_BUDGET {
+                continue;
+            }
+
+            if !source_quotas_allow(
+                &fact,
+                selected_page_facts,
+                selected_page_limit,
+                activity_window_facts,
+                &seen_activity_sources,
+            ) {
+                continue;
+            }
+
+            accept_prepared_fact(
+                fact,
+                &mut facts,
+                &mut total_chars,
+                &mut seen_facts,
+                &mut seen_activity_sources,
+                &mut domain_counts,
+                &mut activity_window_facts,
+                &mut selected_page_facts,
+            );
+
+            if facts.len() >= limit as usize {
+                break;
+            }
+        }
+    }
+
+    facts
+}
+
+fn source_quotas_allow(
+    fact: &PreparedFact,
+    selected_page_facts: usize,
+    selected_page_limit: usize,
+    activity_window_facts: usize,
+    seen_activity_sources: &std::collections::HashSet<String>,
+) -> bool {
+    if fact.kind == ContextSourceKind::SelectedPage && selected_page_facts >= selected_page_limit {
+        return false;
+    }
+
+    if fact.kind == ContextSourceKind::ActivityWindow {
+        if activity_window_facts >= MAX_ACTIVITY_WINDOW_FACTS {
+            return false;
+        }
+        if seen_activity_sources.contains(&fact.source_key) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn accept_prepared_fact(
+    fact: PreparedFact,
+    facts: &mut Vec<String>,
+    total_chars: &mut usize,
+    seen_facts: &mut std::collections::HashSet<String>,
+    seen_activity_sources: &mut std::collections::HashSet<String>,
+    domain_counts: &mut std::collections::HashMap<String, usize>,
+    activity_window_facts: &mut usize,
+    selected_page_facts: &mut usize,
+) {
+    if fact.kind == ContextSourceKind::SelectedPage {
+        *selected_page_facts += 1;
+    }
+    if fact.kind == ContextSourceKind::ActivityWindow {
+        *activity_window_facts += 1;
+        seen_activity_sources.insert(fact.source_key);
+    }
+
+    *total_chars += fact.text.len();
+    *domain_counts.entry(fact.domain_key).or_default() += 1;
+    seen_facts.insert(fact.fact_key);
+    facts.push(fact.text);
+}
+
+fn has_diverse_domains(facts: &[PreparedFact]) -> bool {
+    let mut domains = std::collections::HashSet::new();
+    facts
+        .iter()
+        .any(|fact| domains.insert(fact.domain_key.as_str()) && domains.len() > 1)
+}
+
+fn domain_fact_limit(limit: u32, has_diverse_domains: bool) -> usize {
+    let requested = limit as usize;
+    if requested == 0 {
+        return 0;
+    }
+    if has_diverse_domains {
+        requested.saturating_sub(1).max(1)
+    } else {
+        requested
+    }
+}
+
+fn selected_page_fact_limit(limit: u32, has_non_selected_page_fact: bool) -> usize {
+    let requested = limit as usize;
+    if requested == 0 {
+        return 0;
+    }
+    if has_non_selected_page_fact {
+        requested
+            .saturating_sub(1)
+            .clamp(1, MAX_SELECTED_PAGE_FACTS)
+    } else {
+        requested.min(MAX_SELECTED_PAGE_FACTS)
+    }
+}
+
+fn push_query_term(terms: &mut Vec<String>, term: &str) {
+    let trimmed = term.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let key = normalize_fact_key(trimmed);
+    if terms
+        .iter()
+        .any(|existing| normalize_fact_key(existing) == key)
+    {
+        return;
+    }
+    terms.push(trimmed.to_string());
+}
+
+fn prepare_fact(candidate: ContextFactCandidate) -> Option<PreparedFact> {
+    if security_block(&candidate.node.summary).is_some() {
+        return None;
+    }
+
+    let sanitized = candidate.node.summary.replace('\n', " ").trim().to_string();
+    let text = if sanitized.chars().count() > CONTEXT_FACT_MAX_CHARS {
+        let mut truncated: String = sanitized.chars().take(CONTEXT_FACT_MAX_CHARS).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        sanitized
+    };
+    let fact_key = normalize_fact_key(&text);
+    if fact_key.is_empty() {
+        return None;
+    }
+
+    let kind = context_source_kind(&candidate.node);
+    let score = context_fact_score(&candidate.origin, kind);
+    let source_key = source_diversity_key(&candidate.node, &text, kind);
+    let domain_key = normalize_fact_key(&candidate.node.domain_context);
+
+    Some(PreparedFact {
+        text,
+        fact_key,
+        source_key,
+        domain_key,
+        kind,
+        score,
+        created_at_ms: candidate.node.created_at_ms,
+        sequence: candidate.sequence,
+    })
+}
+
+fn compare_prepared_facts(left: &PreparedFact, right: &PreparedFact) -> Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+        .then_with(|| left.sequence.cmp(&right.sequence))
+}
+
+fn context_fact_score(origin: &CandidateOrigin, kind: ContextSourceKind) -> u32 {
+    let base = match origin {
+        CandidateOrigin::Search(score) => score.saturating_add(200),
+        CandidateOrigin::RecentSelectedPage => 700,
+    };
+    let diversity_bonus = match kind {
+        ContextSourceKind::SelectedPage => 80,
+        ContextSourceKind::Other => 40,
+        ContextSourceKind::WebCapture => 20,
+        ContextSourceKind::ActivityWindow => 0,
+    };
+
+    base.saturating_add(diversity_bonus)
+}
+
+fn context_source_kind(node: &crate::identity::MemoryNode) -> ContextSourceKind {
+    if node.domain_context == "local.web.capture" && node.summary.contains("selected text") {
+        ContextSourceKind::SelectedPage
+    } else if node.domain_context == "local.web.capture" {
+        ContextSourceKind::WebCapture
+    } else if node.domain_context == "local.activity.window" {
+        ContextSourceKind::ActivityWindow
+    } else {
+        ContextSourceKind::Other
+    }
+}
+
+fn source_diversity_key(
+    node: &crate::identity::MemoryNode,
+    text: &str,
+    kind: ContextSourceKind,
+) -> String {
+    if kind == ContextSourceKind::ActivityWindow {
+        if let Some(key) = activity_window_key(&node.structured_attributes) {
+            return key;
+        }
+    }
+
+    format!("{}:{}", node.domain_context, normalize_fact_key(text))
+}
+
+fn activity_window_key(structured_attributes: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(structured_attributes).ok()?;
+    let application = value
+        .get("application")
+        .and_then(|field| field.as_str())
+        .unwrap_or("")
+        .trim();
+    let title = value
+        .get("window_title")
+        .and_then(|field| field.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if application.is_empty() && title.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "activity:{}:{}",
+            normalize_fact_key(application),
+            normalize_fact_key(title)
+        ))
     }
 }
 
@@ -304,6 +635,7 @@ mod tests {
     #[test]
     fn test_security_block_active_window() {
         let root = std::env::temp_dir().join("identity-context-security-test");
+        let _ = fs::remove_dir_all(&root);
         let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
@@ -322,6 +654,7 @@ mod tests {
     #[test]
     fn test_context_building_without_profile() {
         let root = std::env::temp_dir().join("identity-context-build-test");
+        let _ = fs::remove_dir_all(&root);
         let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
@@ -358,6 +691,7 @@ mod tests {
     #[test]
     fn test_context_building_with_profile() {
         let root = std::env::temp_dir().join("identity-context-profile-build-test");
+        let _ = fs::remove_dir_all(&root);
         let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
@@ -397,8 +731,66 @@ mod tests {
     }
 
     #[test]
+    fn context_with_profile_also_searches_active_window_title() {
+        let root = std::env::temp_dir().join("identity-context-profile-window-query-test");
+        let _ = fs::remove_dir_all(&root);
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 1,
+                captured_event_id: 1,
+                source: "manual".to_string(),
+                cleaned_content: "Project profile memory should remain available.".to_string(),
+                content_hash: "hash-profile-query".to_string(),
+                cleaned_at_ms: 1,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 2,
+                captured_event_id: 2,
+                source: "manual".to_string(),
+                cleaned_content: "Oyster refund active-window memory should also appear."
+                    .to_string(),
+                content_hash: "hash-window-query".to_string(),
+                cleaned_at_ms: 2,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+
+        let snap = ContextSnapshot {
+            process_name: "code.exe".to_string(),
+            window_title: "Oyster refund workspace".to_string(),
+            focused_text: None,
+        };
+        let profile = ProjectProfile {
+            name: "identity".to_string(),
+            window_filters: Vec::new(),
+            guardrails: Vec::new(),
+            memory_query_terms: vec!["Project profile memory".to_string()],
+        };
+
+        let ctx = build_identity_context(&paths, &snap, Some(&profile), 3).unwrap();
+        assert!(ctx
+            .facts
+            .iter()
+            .any(|fact| fact.contains("Project profile memory")));
+        assert!(ctx
+            .facts
+            .iter()
+            .any(|fact| fact.contains("Oyster refund active-window memory")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn test_context_deduplicates_repeated_fact_text() {
         let root = std::env::temp_dir().join("identity-context-dedup-test");
+        let _ = fs::remove_dir_all(&root);
         let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
@@ -435,8 +827,249 @@ mod tests {
     }
 
     #[test]
+    fn context_ranking_collapses_repeated_window_memories_without_starving_diverse_facts() {
+        let root = std::env::temp_dir().join("identity-context-diversity-test");
+        let _ = fs::remove_dir_all(&root);
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        for id in 1..=3 {
+            store
+                .insert_memory_from_cleaned(&CleanedEvent {
+                    id,
+                    captured_event_id: id,
+                    source: "windows-ui:active-window".to_string(),
+                    cleaned_content: format!(
+                        "Active application: msedge.exe\nActive window title: Google Gemini\nFocused control text: repeated focus {id}"
+                    ),
+                    content_hash: format!("hash-window-{id}"),
+                    cleaned_at_ms: id,
+                    promoted_at_ms: None,
+                })
+                .unwrap();
+        }
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 10,
+                captured_event_id: 10,
+                source: "manual".to_string(),
+                cleaned_content:
+                    "Identity diversity project fact should stay in the context block.".to_string(),
+                content_hash: "hash-project-fact".to_string(),
+                cleaned_at_ms: 10,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 11,
+                captured_event_id: 11,
+                source: "local-proxy:text/markdown".to_string(),
+                cleaned_content: "Page title: Identity diversity notes\nPage URL: https://example.test/diversity\nSelected page text:\nSelected page context should survive the diversity ranking.".to_string(),
+                content_hash: "hash-selected-diverse".to_string(),
+                cleaned_at_ms: 11,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+
+        let snap = ContextSnapshot {
+            process_name: "msedge.exe".to_string(),
+            window_title: "Google Gemini".to_string(),
+            focused_text: None,
+        };
+        let profile = ProjectProfile {
+            name: "identity".to_string(),
+            window_filters: vec!["identity".to_string()],
+            guardrails: vec!["Keep the context local and scoped.".to_string()],
+            memory_query_terms: vec![
+                "Google Gemini".to_string(),
+                "Identity diversity".to_string(),
+            ],
+        };
+
+        let ctx = build_identity_context(&paths, &snap, Some(&profile), 3).unwrap();
+        let window_fact_count = ctx
+            .facts
+            .iter()
+            .filter(|fact| fact.contains("UI activity in msedge.exe"))
+            .count();
+
+        assert_eq!(window_fact_count, 1);
+        assert!(ctx
+            .facts
+            .iter()
+            .any(|fact| fact.contains("Identity diversity project fact")));
+        assert!(ctx
+            .facts
+            .iter()
+            .any(|fact| fact.contains("Selected page context should survive")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_ranking_keeps_selected_page_fallback_from_monopolizing_fact_slots() {
+        let root = std::env::temp_dir().join("identity-context-selected-page-quota-test");
+        let _ = fs::remove_dir_all(&root);
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        for id in 1..=3 {
+            store
+                .insert_memory_from_cleaned(&CleanedEvent {
+                    id,
+                    captured_event_id: id,
+                    source: "local-proxy:text/markdown".to_string(),
+                    cleaned_content: format!(
+                        "Page title: Page {id}\nPage URL: https://example.test/page-{id}\nSelected page text:\nFresh selected page fallback {id}."
+                    ),
+                    content_hash: format!("hash-page-quota-{id}"),
+                    cleaned_at_ms: id,
+                    promoted_at_ms: None,
+                })
+                .unwrap();
+        }
+        store
+            .insert_memory_from_cleaned(&CleanedEvent {
+                id: 10,
+                captured_event_id: 10,
+                source: "manual".to_string(),
+                cleaned_content: "Profile-specific quota memory must not be crowded out."
+                    .to_string(),
+                content_hash: "hash-profile-quota".to_string(),
+                cleaned_at_ms: 10,
+                promoted_at_ms: None,
+            })
+            .unwrap();
+
+        let snap = ContextSnapshot {
+            process_name: "chrome.exe".to_string(),
+            window_title: "Google Gemini".to_string(),
+            focused_text: None,
+        };
+        let profile = ProjectProfile {
+            name: "identity".to_string(),
+            window_filters: Vec::new(),
+            guardrails: Vec::new(),
+            memory_query_terms: vec!["Profile-specific quota memory".to_string()],
+        };
+
+        let ctx = build_identity_context(&paths, &snap, Some(&profile), 3).unwrap();
+        let selected_page_count = ctx
+            .facts
+            .iter()
+            .filter(|fact| fact.contains("Fresh selected page fallback"))
+            .count();
+
+        assert!(selected_page_count <= 2);
+        assert!(ctx
+            .facts
+            .iter()
+            .any(|fact| fact.contains("Profile-specific quota memory")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_ranking_keeps_one_domain_from_monopolizing_when_another_domain_is_available() {
+        let mut candidates = Vec::new();
+        for id in 1..=3 {
+            candidates.push(test_context_candidate(
+                id,
+                &format!("Manual profile memory fact {id}."),
+                "local.capture",
+                300,
+            ));
+        }
+        candidates.push(test_context_candidate(
+            4,
+            "Filesystem project document fact.",
+            "local.filesystem",
+            100,
+        ));
+
+        let facts = rank_memory_facts(candidates, 3);
+        let manual_count = facts
+            .iter()
+            .filter(|fact| fact.contains("Manual profile memory fact"))
+            .count();
+
+        assert_eq!(facts.len(), 3);
+        assert_eq!(manual_count, 2);
+        assert!(facts
+            .iter()
+            .any(|fact| fact == "Filesystem project document fact."));
+    }
+
+    #[test]
+    fn context_ranking_relaxes_domain_cap_to_fill_slots_when_other_domain_does_not_fit() {
+        let long_tail = "budget filler ".repeat(40);
+        let mut candidates = Vec::new();
+
+        for id in 1..=3 {
+            candidates.push(test_context_candidate(
+                id,
+                &format!("Manual long budget fact {id}: {long_tail}"),
+                "local.capture",
+                300,
+            ));
+        }
+        candidates.push(test_context_candidate(
+            4,
+            "Manual short fallback fact.",
+            "local.capture",
+            250,
+        ));
+        candidates.push(test_context_candidate(
+            5,
+            &format!("Filesystem oversized alternate fact: {long_tail}"),
+            "local.filesystem",
+            100,
+        ));
+
+        let facts = rank_memory_facts(candidates, 4);
+
+        assert_eq!(facts.len(), 4);
+        assert!(facts
+            .iter()
+            .any(|fact| fact == "Manual short fallback fact."));
+        assert!(!facts
+            .iter()
+            .any(|fact| fact.contains("Filesystem oversized alternate fact")));
+    }
+
+    #[test]
+    fn context_ranking_skips_oversized_fact_to_pack_shorter_later_fact() {
+        let long_tail = "budget filler ".repeat(40);
+        let mut candidates = Vec::new();
+
+        for id in 1..=4 {
+            candidates.push(test_context_candidate(
+                id,
+                &format!("Budget packing long fact {id}: {long_tail}"),
+                "local.capture",
+                100,
+            ));
+        }
+        candidates.push(test_context_candidate(
+            0,
+            "Tiny budget packing fact.",
+            "local.capture",
+            100,
+        ));
+
+        let facts = rank_memory_facts(candidates, 5);
+
+        assert_eq!(facts.len(), 4);
+        assert!(facts.iter().any(|fact| fact == "Tiny budget packing fact."));
+    }
+
+    #[test]
     fn browser_context_includes_recent_selected_page_capture() {
         let root = std::env::temp_dir().join("identity-context-recent-page-test");
+        let _ = fs::remove_dir_all(&root);
         let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
@@ -485,6 +1118,7 @@ mod tests {
     #[test]
     fn browser_context_ignores_stale_recent_selected_page_capture() {
         let root = std::env::temp_dir().join("identity-context-stale-page-test");
+        let _ = fs::remove_dir_all(&root);
         let paths = IdentityPaths::from_root(root.clone());
         paths.ensure().unwrap();
 
@@ -588,5 +1222,33 @@ mod tests {
             focused_text: None,
         };
         assert!(should_include_recent_page_context(&agent_title));
+    }
+
+    fn test_context_candidate(
+        id: i64,
+        summary: &str,
+        domain_context: &str,
+        score: u32,
+    ) -> ContextFactCandidate {
+        ContextFactCandidate {
+            node: crate::identity::MemoryNode {
+                id,
+                node_uid: format!("00000000-0000-4000-8000-{id:012}"),
+                cleaned_event_id: id,
+                source: "test".to_string(),
+                domain_context: domain_context.to_string(),
+                entity_type: "DOCUMENT".to_string(),
+                summary: summary.to_string(),
+                structured_attributes: "{}".to_string(),
+                raw_text: summary.to_string(),
+                content_hash: format!("hash-{id}"),
+                created_at_ms: id,
+                created_at_utc: "1970-01-01T00:00:00.000Z".to_string(),
+                last_accessed_ms: id,
+                last_accessed_utc: "1970-01-01T00:00:00.000Z".to_string(),
+            },
+            origin: CandidateOrigin::Search(score),
+            sequence: id as usize,
+        }
     }
 }

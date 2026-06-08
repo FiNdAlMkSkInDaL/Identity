@@ -7,9 +7,13 @@ use crate::embedding::{
 use crate::transit::CleanedEvent;
 use crate::vector_store::{VectorStore, VectorStoreError};
 use crate::workspace::IdentityPaths;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const AGENT_DELTA_RECONCILE_SCAN_LIMIT: u32 = 200;
+const AGENT_DELTA_RECONCILE_LINK_LIMIT: usize = 4;
+const AGENT_DELTA_LIST_MAX_LIMIT: u32 = 100;
 
 #[derive(Debug)]
 pub struct MemoryNode {
@@ -151,8 +155,12 @@ pub struct EdgeDecaySummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphHealth {
     pub node_count: i64,
+    pub agent_delta_nodes: i64,
     pub edge_count: i64,
     pub orphan_count: i64,
+    pub outcome_edges: i64,
+    pub conflict_edges: i64,
+    pub supersession_edges: i64,
     pub decayed_edges: i64,
 }
 
@@ -231,6 +239,10 @@ impl IdentityStore {
     }
 
     pub fn insert_memory_from_cleaned(&self, cleaned: &CleanedEvent) -> Result<i64, IdentityError> {
+        if let Some(existing_id) = self.backend.memory_id_for_cleaned_event(cleaned.id)? {
+            return Ok(existing_id);
+        }
+
         let created_at_ms = now_ms()?;
         let summary = summarize_capture(&cleaned.source, &cleaned.cleaned_content);
         let structured_attributes = capture_attributes(&cleaned.source, &cleaned.cleaned_content);
@@ -260,11 +272,81 @@ impl IdentityStore {
             3,
             0.5,
         )?;
+        if record.source.starts_with("agent-delta:") {
+            self.backend.link_agent_delta_entities(
+                id,
+                &record.raw_text,
+                AGENT_DELTA_RECONCILE_LINK_LIMIT,
+            )?;
+        }
         Ok(id)
     }
 
     pub fn list_recent(&self, limit: u32) -> Result<Vec<MemoryNode>, IdentityError> {
         self.backend.list_recent(limit)
+    }
+
+    pub fn node_uid_for_memory_id(&self, id: i64) -> Result<Option<String>, IdentityError> {
+        self.backend.node_uid_for_memory_id(id)
+    }
+
+    pub fn node_uid_for_cleaned_event(
+        &self,
+        cleaned_event_id: i64,
+    ) -> Result<Option<String>, IdentityError> {
+        self.backend.node_uid_for_cleaned_event(cleaned_event_id)
+    }
+
+    pub fn export_recent_agent_deltas_json(&self, limit: u32) -> Result<String, IdentityError> {
+        self.export_recent_agent_deltas_json_filtered(limit, false, None, None, None)
+    }
+
+    pub fn export_recent_agent_deltas_json_filtered(
+        &self,
+        limit: u32,
+        review_only: bool,
+        source_filter: Option<&str>,
+        entity_filter: Option<&str>,
+        state_filter: Option<&str>,
+    ) -> Result<String, IdentityError> {
+        let limit = limit.min(AGENT_DELTA_LIST_MAX_LIMIT);
+        let scan_limit = if review_only
+            || source_filter.is_some()
+            || entity_filter.is_some()
+            || state_filter.is_some()
+        {
+            AGENT_DELTA_LIST_MAX_LIMIT
+        } else {
+            limit
+        };
+        let nodes = self.backend.list_recent_agent_deltas(scan_limit)?;
+        let nodes = if review_only
+            || source_filter.is_some()
+            || entity_filter.is_some()
+            || state_filter.is_some()
+        {
+            nodes
+                .into_iter()
+                .filter(|node| {
+                    let source_matches = source_filter
+                        .map(|source| node.source == source)
+                        .unwrap_or(true);
+                    let entity_matches = entity_filter
+                        .map(|entity| agent_delta_has_entity(&node.raw_text, entity))
+                        .unwrap_or(true);
+                    let state_matches = state_filter
+                        .map(|state| agent_delta_has_outcome_state(&node.raw_text, state))
+                        .unwrap_or(true);
+                    let review_matches =
+                        !review_only || !agent_delta_review_categories(&node.raw_text).is_empty();
+                    source_matches && entity_matches && state_matches && review_matches
+                })
+                .take(limit as usize)
+                .collect::<Vec<_>>()
+        } else {
+            nodes
+        };
+        Ok(agent_delta_nodes_json(&nodes))
     }
 
     pub fn recent_web_captures(&self, limit: u32) -> Result<Vec<MemoryNode>, IdentityError> {
@@ -553,6 +635,45 @@ impl SqliteMemoryBackend {
         }
     }
 
+    fn memory_id_for_cleaned_event(
+        &self,
+        cleaned_event_id: i64,
+    ) -> Result<Option<i64>, IdentityError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM memory_nodes WHERE cleaned_event_id = ?1",
+                [cleaned_event_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(IdentityError::from)
+    }
+
+    fn node_uid_for_memory_id(&self, id: i64) -> Result<Option<String>, IdentityError> {
+        self.conn
+            .query_row(
+                "SELECT node_uid FROM memory_nodes WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(IdentityError::from)
+    }
+
+    fn node_uid_for_cleaned_event(
+        &self,
+        cleaned_event_id: i64,
+    ) -> Result<Option<String>, IdentityError> {
+        self.conn
+            .query_row(
+                "SELECT node_uid FROM memory_nodes WHERE cleaned_event_id = ?1",
+                [cleaned_event_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(IdentityError::from)
+    }
+
     fn sync_vector_store(
         &self,
         vector_store: &VectorStore,
@@ -622,6 +743,22 @@ impl SqliteMemoryBackend {
         )?;
 
         let rows = statement.query_map(params![domain_context, limit as i64], map_memory_node)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(decrypt_memory_node)
+            .collect()
+    }
+
+    fn list_recent_agent_deltas(&self, limit: u32) -> Result<Vec<MemoryNode>, IdentityError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, created_at_ms, created_at_utc, last_accessed_ms, last_accessed_utc
+             FROM memory_nodes
+             WHERE domain_context = 'agent.outcome' AND entity_type = 'AGENT_DELTA'
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = statement.query_map([limit as i64], map_memory_node)?;
         rows.collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .map(decrypt_memory_node)
@@ -982,53 +1119,13 @@ impl SqliteMemoryBackend {
         relationship_type: &str,
         edge_weight: f64,
     ) -> Result<GraphEdge, IdentityError> {
-        let now = now_ms()?;
-        let relationship = relationship_type.trim();
-
-        if source_node_id <= 0 || target_node_id <= 0 {
-            return Err(IdentityError::InvalidGraphEdge(
-                "node ids must be positive persisted memory node ids".to_string(),
-            ));
-        }
-
-        if source_node_id == target_node_id {
-            return Err(IdentityError::InvalidGraphEdge(
-                "self edges are not allowed".to_string(),
-            ));
-        }
-
-        if relationship.is_empty() || relationship.len() > 64 {
-            return Err(IdentityError::InvalidGraphEdge(
-                "relationship type must be 1..=64 bytes".to_string(),
-            ));
-        }
-
-        if !edge_weight.is_finite() {
-            return Err(IdentityError::InvalidGraphEdge(
-                "edge weight must be finite".to_string(),
-            ));
-        }
-
-        let weight = edge_weight.clamp(0.0, 1.0);
-
-        self.conn.execute(
-            "INSERT INTO graph_edges
-                (source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(source_node_id, target_node_id, relationship_type) DO UPDATE SET
-                edge_weight = excluded.edge_weight,
-                updated_at_ms = excluded.updated_at_ms",
-            params![source_node_id, target_node_id, relationship, weight, now, now],
-        )?;
-
-        self.conn.query_row(
-            "SELECT id, source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms
-             FROM graph_edges
-             WHERE source_node_id = ?1 AND target_node_id = ?2 AND relationship_type = ?3",
-            (source_node_id, target_node_id, relationship),
-            map_graph_edge,
+        upsert_edge_on_connection(
+            &self.conn,
+            source_node_id,
+            target_node_id,
+            relationship_type,
+            edge_weight,
         )
-        .map_err(IdentityError::from)
     }
 
     fn link_similar_nodes(
@@ -1082,6 +1179,75 @@ impl SqliteMemoryBackend {
             self.upsert_edge(other_id, node_id, reverse_rel, similarity.clamp(0.0, 1.0))?;
         }
 
+        Ok(())
+    }
+
+    fn link_agent_delta_entities(
+        &self,
+        node_id: i64,
+        delta_text: &str,
+        max_links: usize,
+    ) -> Result<(), IdentityError> {
+        if max_links == 0 {
+            return Ok(());
+        }
+
+        let entities = agent_delta_entities(delta_text);
+        if entities.is_empty() {
+            return Ok(());
+        }
+        let attributes = agent_delta_attribute_pairs(delta_text);
+
+        let mut matches = self
+            .list_recent(AGENT_DELTA_RECONCILE_SCAN_LIMIT)?
+            .into_iter()
+            .filter(|node| node.id != node_id)
+            .filter(|node| agent_delta_matches_node(&entities, node))
+            .map(|node| {
+                let priority = if node.domain_context == "agent.outcome" {
+                    1
+                } else {
+                    0
+                };
+                (priority, node)
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+                .then_with(|| right.1.id.cmp(&left.1.id))
+        });
+
+        let now = now_ms()?;
+        let tx = self.conn.unchecked_transaction()?;
+
+        for (_, node) in matches.into_iter().take(max_links) {
+            if node.domain_context == "agent.outcome" {
+                upsert_edge_on_connection(&tx, node_id, node.id, "SUPERSEDES", 0.95)?;
+                upsert_edge_on_connection(&tx, node.id, node_id, "SUPERSEDED_BY", 0.95)?;
+                if agent_delta_attributes_conflict(
+                    &attributes,
+                    &agent_delta_attribute_pairs(&node.raw_text),
+                ) {
+                    upsert_edge_on_connection(
+                        &tx,
+                        node_id,
+                        node.id,
+                        "ATTRIBUTE_CONFLICTS_WITH",
+                        0.9,
+                    )?;
+                    upsert_edge_on_connection(&tx, node.id, node_id, "ATTRIBUTE_REPLACED_BY", 0.9)?;
+                }
+                decay_superseded_agent_delta_edges_on_connection(&tx, node.id, now)?;
+            } else {
+                upsert_edge_on_connection(&tx, node_id, node.id, "OUTCOME_FOR", 0.9)?;
+                upsert_edge_on_connection(&tx, node.id, node_id, "UPDATED_BY", 0.9)?;
+            }
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -1143,10 +1309,7 @@ impl SqliteMemoryBackend {
 
         for edge in &edges {
             let delta_ms = now.saturating_sub(edge.updated_at_ms);
-            let delta_hours = (delta_ms as f64) / (3600.0 * 1000.0);
-
-            let alpha = if delta_hours < 24.0 { 0.1 } else { 0.4 };
-            let new_weight = (edge.edge_weight * (1.0 - alpha)).clamp(0.0, 1.0);
+            let new_weight = decayed_edge_weight(edge.edge_weight, delta_ms);
 
             if (new_weight - edge.edge_weight).abs() > 1e-9 {
                 self.conn.execute(
@@ -1182,6 +1345,12 @@ impl SqliteMemoryBackend {
         let node_count = self
             .conn
             .query_row("SELECT COUNT(*) FROM memory_nodes", [], |row| row.get(0))?;
+        let agent_delta_nodes = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_nodes
+             WHERE domain_context = 'agent.outcome' AND entity_type = 'AGENT_DELTA'",
+            [],
+            |row| row.get(0),
+        )?;
         let edge_count = self
             .conn
             .query_row("SELECT COUNT(*) FROM graph_edges", [], |row| row.get(0))?;
@@ -1196,11 +1365,33 @@ impl SqliteMemoryBackend {
             [],
             |row| row.get(0),
         )?;
+        let conflict_edges = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges
+             WHERE relationship_type IN ('ATTRIBUTE_CONFLICTS_WITH', 'ATTRIBUTE_REPLACED_BY')",
+            [],
+            |row| row.get(0),
+        )?;
+        let outcome_edges = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges
+             WHERE relationship_type IN ('OUTCOME_FOR', 'UPDATED_BY')",
+            [],
+            |row| row.get(0),
+        )?;
+        let supersession_edges = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_edges
+             WHERE relationship_type IN ('SUPERSEDES', 'SUPERSEDED_BY')",
+            [],
+            |row| row.get(0),
+        )?;
 
         Ok(GraphHealth {
             node_count,
+            agent_delta_nodes,
             edge_count,
             orphan_count,
+            outcome_edges,
+            conflict_edges,
+            supersession_edges,
             decayed_edges,
         })
     }
@@ -1517,6 +1708,41 @@ fn map_memory_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryNode> {
     })
 }
 
+fn agent_delta_entities(delta_text: &str) -> Vec<String> {
+    delta_text
+        .lines()
+        .filter_map(|line| labelled_value(line, "Entity:"))
+        .map(|entity| normalize_reconcile_text(&entity))
+        .filter(|entity| !entity.is_empty())
+        .fold(Vec::<String>::new(), |mut entities, entity| {
+            if !entities.iter().any(|existing| existing == &entity) {
+                entities.push(entity);
+            }
+            entities
+        })
+}
+
+fn agent_delta_matches_node(entities: &[String], node: &MemoryNode) -> bool {
+    if entities.is_empty() {
+        return false;
+    }
+
+    let summary = normalize_reconcile_text(&node.summary);
+    let raw_text = normalize_reconcile_text(&node.raw_text);
+
+    entities
+        .iter()
+        .any(|entity| summary.contains(entity) || raw_text.contains(entity))
+}
+
+fn normalize_reconcile_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
 fn decrypt_memory_node(mut node: MemoryNode) -> Result<MemoryNode, IdentityError> {
     node.source = unprotect_text(&node.source)?;
     node.summary = unprotect_text(&node.summary)?;
@@ -1579,13 +1805,119 @@ fn map_graph_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphEdge> {
     })
 }
 
+fn upsert_edge_on_connection(
+    conn: &Connection,
+    source_node_id: i64,
+    target_node_id: i64,
+    relationship_type: &str,
+    edge_weight: f64,
+) -> Result<GraphEdge, IdentityError> {
+    let now = now_ms()?;
+    let relationship = relationship_type.trim();
+
+    if source_node_id <= 0 || target_node_id <= 0 {
+        return Err(IdentityError::InvalidGraphEdge(
+            "node ids must be positive persisted memory node ids".to_string(),
+        ));
+    }
+
+    if source_node_id == target_node_id {
+        return Err(IdentityError::InvalidGraphEdge(
+            "self edges are not allowed".to_string(),
+        ));
+    }
+
+    if relationship.is_empty() || relationship.len() > 64 {
+        return Err(IdentityError::InvalidGraphEdge(
+            "relationship type must be 1..=64 bytes".to_string(),
+        ));
+    }
+
+    if !edge_weight.is_finite() {
+        return Err(IdentityError::InvalidGraphEdge(
+            "edge weight must be finite".to_string(),
+        ));
+    }
+
+    let weight = edge_weight.clamp(0.0, 1.0);
+
+    conn.execute(
+        "INSERT INTO graph_edges
+            (source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(source_node_id, target_node_id, relationship_type) DO UPDATE SET
+            edge_weight = excluded.edge_weight,
+            updated_at_ms = excluded.updated_at_ms",
+        params![source_node_id, target_node_id, relationship, weight, now, now],
+    )?;
+
+    conn.query_row(
+        "SELECT id, source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms
+         FROM graph_edges
+         WHERE source_node_id = ?1 AND target_node_id = ?2 AND relationship_type = ?3",
+        (source_node_id, target_node_id, relationship),
+        map_graph_edge,
+    )
+    .map_err(IdentityError::from)
+}
+
+fn decay_superseded_agent_delta_edges_on_connection(
+    conn: &Connection,
+    source_node_id: i64,
+    now: i64,
+) -> Result<usize, IdentityError> {
+    let edges = {
+        let mut statement = conn.prepare(
+            "SELECT id, source_node_id, target_node_id, relationship_type, edge_weight, created_at_ms, updated_at_ms
+             FROM graph_edges
+             WHERE source_node_id = ?1
+             ORDER BY updated_at_ms DESC, id DESC",
+        )?;
+        let rows = statement.query_map([source_node_id], map_graph_edge)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut decayed = 0;
+
+    for edge in edges {
+        if matches!(
+            edge.relationship_type.as_str(),
+            "SUPERSEDES" | "SUPERSEDED_BY" | "ATTRIBUTE_CONFLICTS_WITH" | "ATTRIBUTE_REPLACED_BY"
+        ) {
+            continue;
+        }
+
+        let delta_ms = now.saturating_sub(edge.updated_at_ms);
+        let new_weight = decayed_edge_weight(edge.edge_weight, delta_ms);
+        if (new_weight - edge.edge_weight).abs() <= 1e-9 {
+            continue;
+        }
+
+        conn.execute(
+            "UPDATE graph_edges SET edge_weight = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![new_weight, now, edge.id],
+        )?;
+        decayed += 1;
+    }
+
+    Ok(decayed)
+}
+
+fn decayed_edge_weight(edge_weight: f64, delta_ms: i64) -> f64 {
+    let delta_hours = (delta_ms as f64) / (3600.0 * 1000.0);
+    let alpha = if delta_hours < 24.0 { 0.1 } else { 0.4 };
+    (edge_weight * (1.0 - alpha)).clamp(0.0, 1.0)
+}
+
 struct CaptureClassification {
     domain_context: &'static str,
     entity_type: &'static str,
 }
 
 fn edge_relationship_from_source(source: &str) -> &'static str {
-    if source.starts_with("windows-ui:") {
+    if source.starts_with("agent-delta:") {
+        "UPDATES"
+    } else if source.starts_with("windows-ui:") {
         "RELATED_TO"
     } else if source.starts_with("filesystem:") {
         "DOCUMENTS"
@@ -1597,7 +1929,12 @@ fn edge_relationship_from_source(source: &str) -> &'static str {
 }
 
 fn classify_capture(source: &str) -> CaptureClassification {
-    if source.starts_with("windows-ui:") {
+    if source.starts_with("agent-delta:") {
+        CaptureClassification {
+            domain_context: "agent.outcome",
+            entity_type: "AGENT_DELTA",
+        }
+    } else if source.starts_with("windows-ui:") {
         CaptureClassification {
             domain_context: "local.activity.window",
             entity_type: "USER_INTERFACE",
@@ -1621,13 +1958,143 @@ fn classify_capture(source: &str) -> CaptureClassification {
 }
 
 fn capture_attributes(source: &str, content: &str) -> String {
-    if source.starts_with("windows-ui:") {
+    if source.starts_with("agent-delta:") {
+        agent_delta_attributes(content)
+    } else if source.starts_with("windows-ui:") {
         windows_activity_attributes(content)
     } else if source.starts_with("local-proxy:") {
         web_capture_attributes(content)
     } else {
         "{}".to_string()
     }
+}
+
+fn agent_delta_attributes(content: &str) -> String {
+    let mut output = String::from("{");
+    let mut needs_comma = false;
+
+    if let Some(outcome_state) = labelled_value(content, "Outcome state:") {
+        push_json_string_field(&mut output, "outcome_state", &outcome_state, needs_comma);
+        needs_comma = true;
+    }
+    if let Some(delta_source) = labelled_value(content, "Delta source:") {
+        push_json_string_field(&mut output, "delta_source", &delta_source, needs_comma);
+        needs_comma = true;
+    }
+    if let Some(summary) = labelled_value(content, "Summary:") {
+        push_json_string_field(&mut output, "summary", &summary, needs_comma);
+        needs_comma = true;
+    }
+    let entities = agent_delta_entity_values(content);
+    if !entities.is_empty() {
+        push_json_string_array_field(&mut output, "entities", &entities, needs_comma);
+        needs_comma = true;
+    }
+    let review_categories = agent_delta_review_categories(content);
+    if !review_categories.is_empty() {
+        push_json_string_array_field(
+            &mut output,
+            "review_required_categories",
+            &review_categories,
+            needs_comma,
+        );
+        needs_comma = true;
+    }
+    let attributes = agent_delta_attribute_pairs(content);
+    if !attributes.is_empty() {
+        push_json_object_field(&mut output, "delta_attributes", &attributes, needs_comma);
+    }
+
+    output.push('}');
+    output
+}
+
+fn agent_delta_entity_values(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| line.strip_prefix("Entity:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn agent_delta_has_entity(content: &str, expected: &str) -> bool {
+    let expected = normalize_entity_filter(expected);
+    if expected.is_empty() {
+        return true;
+    }
+
+    agent_delta_entity_values(content)
+        .iter()
+        .any(|entity| normalize_entity_filter(entity) == expected)
+}
+
+fn normalize_entity_filter(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn agent_delta_has_outcome_state(content: &str, expected: &str) -> bool {
+    let expected = normalize_outcome_state_filter(expected);
+    if expected.is_empty() {
+        return true;
+    }
+
+    labelled_value(content, "Outcome state:")
+        .map(|state| normalize_outcome_state_filter(&state) == expected)
+        .unwrap_or(false)
+}
+
+fn normalize_outcome_state_filter(value: &str) -> String {
+    value.trim().replace('-', "_").to_ascii_uppercase()
+}
+
+fn agent_delta_review_categories(content: &str) -> Vec<String> {
+    labelled_value(content, "Review required categories:")
+        .map(|categories| {
+            categories
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn agent_delta_attribute_pairs(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| line.strip_prefix("Attribute "))
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .collect()
+}
+
+fn agent_delta_attributes_conflict(
+    current: &[(String, String)],
+    previous: &[(String, String)],
+) -> bool {
+    current.iter().any(|(current_key, current_value)| {
+        previous.iter().any(|(previous_key, previous_value)| {
+            current_key == previous_key
+                && normalize_attribute_value(current_value)
+                    != normalize_attribute_value(previous_value)
+        })
+    })
+}
+
+fn normalize_attribute_value(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn windows_activity_attributes(content: &str) -> String {
@@ -1674,6 +2141,54 @@ fn json_field(key: &str, value: &str) -> String {
     format!("\"{}\":\"{}\"", key, json_escape(value))
 }
 
+fn push_json_string_array_field(
+    output: &mut String,
+    key: &str,
+    values: &[String],
+    needs_comma: bool,
+) {
+    if needs_comma {
+        output.push(',');
+    }
+    output.push('"');
+    output.push_str(&json_escape(key));
+    output.push_str("\":[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('"');
+        output.push_str(&json_escape(value));
+        output.push('"');
+    }
+    output.push(']');
+}
+
+fn push_json_object_field(
+    output: &mut String,
+    key: &str,
+    values: &[(String, String)],
+    needs_comma: bool,
+) {
+    if needs_comma {
+        output.push(',');
+    }
+    output.push('"');
+    output.push_str(&json_escape(key));
+    output.push_str("\":{");
+    for (index, (field, value)) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('"');
+        output.push_str(&json_escape(field));
+        output.push_str("\":\"");
+        output.push_str(&json_escape(value));
+        output.push('"');
+    }
+    output.push('}');
+}
+
 fn json_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
 
@@ -1704,6 +2219,61 @@ fn protocol_nodes_json(nodes: &[ProtocolMemoryNode]) -> String {
             output.push(',');
         }
         output.push_str(&protocol_node_json(node));
+    }
+
+    output.push(']');
+    output
+}
+
+fn agent_delta_nodes_json(nodes: &[MemoryNode]) -> String {
+    let mut output = String::from("[");
+
+    for (index, node) in nodes.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_string_field(&mut output, "node_id", &node.node_uid, false);
+        push_json_string_field(&mut output, "timestamp_created", &node.created_at_utc, true);
+        push_json_string_field(
+            &mut output,
+            "timestamp_last_accessed",
+            &node.last_accessed_utc,
+            true,
+        );
+        push_json_string_field(&mut output, "source", &node.source, true);
+        let outcome_state = labelled_value(&node.raw_text, "Outcome state:")
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        push_json_string_field(&mut output, "outcome_state", &outcome_state, true);
+        push_json_string_array_field(
+            &mut output,
+            "entities",
+            &agent_delta_entity_values(&node.raw_text),
+            true,
+        );
+        push_json_object_field(
+            &mut output,
+            "delta_attributes",
+            &agent_delta_attribute_pairs(&node.raw_text),
+            true,
+        );
+        push_json_string_field(&mut output, "summary", &node.summary, true);
+        let review_categories = agent_delta_review_categories(&node.raw_text);
+        output.push_str(",\"requires_review\":");
+        output.push_str(if review_categories.is_empty() {
+            "false"
+        } else {
+            "true"
+        });
+        push_json_string_array_field(
+            &mut output,
+            "review_required_categories",
+            &review_categories,
+            true,
+        );
+        output.push_str(",\"structured_attributes\":");
+        output.push_str(normalized_json_object(&node.structured_attributes));
+        output.push('}');
     }
 
     output.push(']');
@@ -1754,7 +2324,7 @@ fn push_json_string_field(output: &mut String, key: &str, value: &str, needs_com
 
 fn normalized_json_object(value: &str) -> &str {
     let trimmed = value.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+    if is_json_object_like(trimmed) {
         trimmed
     } else {
         "{}"
@@ -1843,16 +2413,43 @@ fn is_iso8601_utc_timestamp(value: &str) -> bool {
 
 fn is_json_object_like(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.starts_with('{') && trimmed.ends_with('}')
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|value| value.is_object())
+        .unwrap_or(false)
 }
 
 fn summarize_capture(source: &str, content: &str) -> String {
-    if source.starts_with("windows-ui:") {
+    if source.starts_with("agent-delta:") {
+        summarize_agent_delta(content)
+    } else if source.starts_with("windows-ui:") {
         summarize_windows_activity(content)
     } else if source.starts_with("local-proxy:") {
         summarize_web_capture(content)
     } else {
         summarize(content)
+    }
+}
+
+fn summarize_agent_delta(content: &str) -> String {
+    let outcome = labelled_value(content, "Outcome state:");
+    let summary = labelled_value(content, "Summary:");
+    let entities = agent_delta_entity_values(content);
+    let mut parts = Vec::new();
+
+    if let Some(outcome) = outcome {
+        parts.push(format!("agent outcome {outcome}"));
+    }
+    if let Some(summary) = summary {
+        parts.push(summary);
+    }
+    if !entities.is_empty() {
+        parts.push(format!("entities {}", entities.join(", ")));
+    }
+
+    if parts.is_empty() {
+        summarize(content)
+    } else {
+        summarize(&parts.join("; "))
     }
 }
 
@@ -1971,6 +2568,12 @@ fn labelled_value(content: &str, label: &str) -> Option<String> {
         "Page title:",
         "Page URL:",
         "Selected page text:",
+        "Outcome state:",
+        "Delta source:",
+        "Summary:",
+        "Entity:",
+        "Attribute ",
+        "Review required categories:",
         "\n- ",
     ]
     .into_iter()
@@ -2168,12 +2771,13 @@ mod tests {
     use super::{
         capture_attributes, classify_capture, format_uuid_bytes, is_iso8601_utc_timestamp,
         is_json_object_like, is_selected_page_capture, is_uuid_v4_like, iso8601_utc_from_ms,
-        labelled_value, protocol_nodes_json, query_tokens, summarize, summarize_capture,
-        summarize_web_capture, summarize_windows_activity, web_capture_attributes,
-        windows_activity_attributes, IdentityStore, MemoryNode, ProtocolGraphEdge,
-        ProtocolMemoryNode, SqliteMemoryBackend,
+        labelled_value, protocol_nodes_json, query_tokens, summarize, summarize_agent_delta,
+        summarize_capture, summarize_web_capture, summarize_windows_activity,
+        web_capture_attributes, windows_activity_attributes, IdentityStore, MemoryNode,
+        ProtocolGraphEdge, ProtocolMemoryNode, SqliteMemoryBackend,
     };
     use crate::crypto::is_protected_text;
+    use crate::delta::extract_agent_delta;
     use crate::embedding::{
         ActiveEmbeddingHealth, EmbeddingArtifactHealth, EmbeddingEngine, EMBEDDING_DIM,
         EMBEDDING_MODEL_ID, EMBEDDING_ONNX_MODEL_PATH_ENV, EMBEDDING_RUNTIME_ENV,
@@ -2228,6 +2832,725 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_memory_insert_skips_vector_rewrite() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-duplicate-fast-path-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let cleaned = CleanedEvent {
+            id: 43,
+            captured_event_id: 7,
+            source: "test".to_string(),
+            cleaned_content: "Duplicate detection runs before vectorization.".to_string(),
+            content_hash: "hash-duplicate-fast-path".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+
+        let first = store.insert_memory_from_cleaned(&cleaned).unwrap();
+        let vector_path = paths
+            .vector_store_dir
+            .join(format!("node-{first:020}.f32le"));
+        assert!(vector_path.exists());
+        fs::remove_file(&vector_path).unwrap();
+
+        let second = store.insert_memory_from_cleaned(&cleaned).unwrap();
+
+        assert_eq!(first, second);
+        assert!(
+            !vector_path.exists(),
+            "duplicate insert should return before vector rewrite"
+        );
+        assert_eq!(
+            store.vector_mirror_health().unwrap().primary_missing_count,
+            1
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_commit_is_idempotent_by_stable_delta_hash() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-dedupe-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let first_delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap();
+        let second_delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap();
+        let first_cleaned = first_delta.to_cleaned_event().unwrap();
+        let second_cleaned = second_delta.to_cleaned_event().unwrap();
+
+        let first = store.insert_memory_from_cleaned(&first_cleaned).unwrap();
+        let second = store.insert_memory_from_cleaned(&second_cleaned).unwrap();
+        let memories = store.list_recent(10).unwrap();
+
+        assert_eq!(first_cleaned.id, second_cleaned.id);
+        assert_eq!(first, second);
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].domain_context, "agent.outcome");
+        assert_eq!(memories[0].entity_type, "AGENT_DELTA");
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn memory_node_uid_lookup_returns_protocol_id_not_row_id() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-node-uid-lookup-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let memory_id = store.insert_memory_from_cleaned(&delta).unwrap();
+        let node_uid = store.node_uid_for_memory_id(memory_id).unwrap().unwrap();
+        let dedupe_node_uid = store.node_uid_for_cleaned_event(delta.id).unwrap().unwrap();
+
+        assert_ne!(node_uid, memory_id.to_string());
+        assert_eq!(node_uid, dedupe_node_uid);
+        assert!(is_uuid_v4_like(&node_uid));
+        assert!(store
+            .node_uid_for_memory_id(memory_id + 10_000)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .node_uid_for_cleaned_event(delta.id - 10_000)
+            .unwrap()
+            .is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_omits_raw_and_internal_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let context = CleanedEvent {
+            id: 88,
+            captured_event_id: 8,
+            source: "manual".to_string(),
+            cleaned_content: "Acme Capital background context should not appear in delta list."
+                .to_string(),
+            content_hash: "hash-agent-delta-list-context".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        store.insert_memory_from_cleaned(&context).unwrap();
+        let delta = extract_agent_delta(
+            "Sent follow-up to Acme Capital. Confirmation reference: MSG-42",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let delta_id = store.insert_memory_from_cleaned(&delta).unwrap();
+        let delta_node = store
+            .list_recent(10)
+            .unwrap()
+            .into_iter()
+            .find(|node| node.id == delta_id)
+            .unwrap();
+
+        let json = store.export_recent_agent_deltas_json(10).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["node_id"], delta_node.node_uid);
+        assert_eq!(deltas[0]["source"], "agent-delta:follow-up");
+        assert_eq!(deltas[0]["requires_review"], false);
+        assert_eq!(
+            deltas[0]["review_required_categories"],
+            serde_json::json!([])
+        );
+        assert_eq!(deltas[0]["structured_attributes"]["outcome_state"], "SENT");
+        assert!(deltas[0].get("id").is_none());
+        assert!(deltas[0].get("cleaned_event_id").is_none());
+        assert!(deltas[0].get("content_hash").is_none());
+        assert!(deltas[0].get("vector_embedding").is_none());
+        assert!(deltas[0].get("raw_text").is_none());
+        assert!(!json.contains("Agent outcome delta"));
+        assert!(!json.contains("background context should not appear"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_surfaces_review_categories() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-review-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let delta = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&delta).unwrap();
+
+        let json = store.export_recent_agent_deltas_json(10).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed[0]["requires_review"], true);
+        assert_eq!(
+            parsed[0]["review_required_categories"],
+            serde_json::json!(["finance"])
+        );
+        assert_eq!(parsed[0]["outcome_state"], "PAID");
+        assert_eq!(parsed[0]["entities"], serde_json::json!(["Acme Capital"]));
+        assert_eq!(
+            parsed[0]["delta_attributes"],
+            serde_json::json!({"receipt_reference": "INV-42"})
+        );
+        assert_eq!(
+            parsed[0]["structured_attributes"]["review_required_categories"],
+            serde_json::json!(["finance"])
+        );
+        assert_eq!(
+            parsed[0]["structured_attributes"]["delta_attributes"],
+            parsed[0]["delta_attributes"]
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_filters_review_only_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-review-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let normal =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let review = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&normal).unwrap();
+        store.insert_memory_from_cleaned(&review).unwrap();
+
+        let json = store
+            .export_recent_agent_deltas_json_filtered(10, true, None, None, None)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["source"], "agent-delta:billing");
+        assert_eq!(deltas[0]["requires_review"], true);
+        assert_eq!(
+            deltas[0]["review_required_categories"],
+            serde_json::json!(["finance"])
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_filters_by_source() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-source-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let follow_up = extract_agent_delta(
+            "Sent follow-up to Acme Capital. Confirmation reference: MSG-42",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let billing = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&follow_up).unwrap();
+        store.insert_memory_from_cleaned(&billing).unwrap();
+
+        let json = store
+            .export_recent_agent_deltas_json_filtered(
+                10,
+                false,
+                Some("agent-delta:follow-up"),
+                None,
+                None,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["source"], "agent-delta:follow-up");
+        assert_eq!(deltas[0]["requires_review"], false);
+        assert_eq!(
+            deltas[0]["delta_attributes"],
+            serde_json::json!({"confirmation_reference": "MSG-42"})
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_filters_by_entity() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-entity-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let acme = extract_agent_delta("Sent follow-up to Acme Capital.", Some("follow-up"))
+            .unwrap()
+            .to_cleaned_event()
+            .unwrap();
+        let orbit = extract_agent_delta("Sent follow-up to Orbit Partners.", Some("follow-up"))
+            .unwrap()
+            .to_cleaned_event()
+            .unwrap();
+        store.insert_memory_from_cleaned(&acme).unwrap();
+        store.insert_memory_from_cleaned(&orbit).unwrap();
+
+        let json = store
+            .export_recent_agent_deltas_json_filtered(
+                10,
+                false,
+                None,
+                Some(" acme  capital "),
+                None,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["entities"], serde_json::json!(["Acme Capital"]));
+        assert_eq!(
+            deltas[0]["structured_attributes"]["entities"],
+            deltas[0]["entities"]
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_filters_by_outcome_state() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-state-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let sent = extract_agent_delta("Sent follow-up to Acme Capital.", Some("follow-up"))
+            .unwrap()
+            .to_cleaned_event()
+            .unwrap();
+        let paid = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&sent).unwrap();
+        store.insert_memory_from_cleaned(&paid).unwrap();
+
+        let json = store
+            .export_recent_agent_deltas_json_filtered(10, false, None, None, Some("paid"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["outcome_state"], "PAID");
+        assert_eq!(
+            deltas[0]["structured_attributes"]["outcome_state"],
+            deltas[0]["outcome_state"]
+        );
+        assert_eq!(deltas[0]["source"], "agent-delta:billing");
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_falls_back_from_malformed_attributes() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-malformed-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let memory_id = store.insert_memory_from_cleaned(&delta).unwrap();
+        store
+            .backend
+            .conn
+            .execute(
+                "UPDATE memory_nodes SET structured_attributes = '{not-json}' WHERE id = ?1",
+                [memory_id],
+            )
+            .unwrap();
+
+        let json = store.export_recent_agent_deltas_json(10).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed[0]["structured_attributes"], serde_json::json!({}));
+        assert!(!json.contains("{not-json}"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_applies_hard_limit_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-cap-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        for index in 0..105 {
+            let delta = extract_agent_delta(
+                &format!("Updated Acme Capital follow-up status {index}."),
+                Some("follow-up"),
+            )
+            .unwrap()
+            .to_cleaned_event()
+            .unwrap();
+            store.insert_memory_from_cleaned(&delta).unwrap();
+        }
+
+        let json = store.export_recent_agent_deltas_json(500).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 100);
+        assert!(deltas[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("status 104"));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_reconciles_to_matching_entity_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-reconcile-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let context = CleanedEvent {
+            id: 77,
+            captured_event_id: 7,
+            source: "manual".to_string(),
+            cleaned_content: "Acme Capital relationship context for outreach.".to_string(),
+            content_hash: "hash-agent-context".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        let context_id = store.insert_memory_from_cleaned(&context).unwrap();
+        let delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let delta_id = store.insert_memory_from_cleaned(&delta).unwrap();
+
+        let delta_edges = store.get_edges_for_node(delta_id).unwrap();
+        assert!(delta_edges.iter().any(|edge| {
+            edge.source_node_id == delta_id
+                && edge.target_node_id == context_id
+                && edge.relationship_type == "OUTCOME_FOR"
+        }));
+        assert!(delta_edges.iter().any(|edge| {
+            edge.source_node_id == context_id
+                && edge.target_node_id == delta_id
+                && edge.relationship_type == "UPDATED_BY"
+        }));
+        assert_eq!(store.graph_health().unwrap().outcome_edges, 2);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newer_agent_delta_supersedes_prior_delta_for_same_entity() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-supersedes-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let first =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let first_id = store.insert_memory_from_cleaned(&first).unwrap();
+        assert_eq!(store.graph_health().unwrap().agent_delta_nodes, 1);
+        let second = extract_agent_delta(
+            "Completed Acme Capital follow-up and logged next action.",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let second_id = store.insert_memory_from_cleaned(&second).unwrap();
+        assert_eq!(store.graph_health().unwrap().agent_delta_nodes, 2);
+
+        let second_edges = store.get_edges_for_node(second_id).unwrap();
+        assert!(second_edges.iter().any(|edge| {
+            edge.source_node_id == second_id
+                && edge.target_node_id == first_id
+                && edge.relationship_type == "SUPERSEDES"
+        }));
+        assert!(second_edges.iter().any(|edge| {
+            edge.source_node_id == first_id
+                && edge.target_node_id == second_id
+                && edge.relationship_type == "SUPERSEDED_BY"
+        }));
+        assert_eq!(store.graph_health().unwrap().supersession_edges, 2);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn superseded_agent_delta_decays_prior_outcome_edges() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-decay-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let context = CleanedEvent {
+            id: 78,
+            captured_event_id: 8,
+            source: "manual".to_string(),
+            cleaned_content: "Acme Capital relationship context for outreach.".to_string(),
+            content_hash: "hash-agent-decay-context".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        let context_id = store.insert_memory_from_cleaned(&context).unwrap();
+        let first =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let first_id = store.insert_memory_from_cleaned(&first).unwrap();
+
+        let initial_edges = store.get_edges_for_node(first_id).unwrap();
+        let initial_outcome = initial_edges
+            .iter()
+            .find(|edge| {
+                edge.source_node_id == first_id
+                    && edge.target_node_id == context_id
+                    && edge.relationship_type == "OUTCOME_FOR"
+            })
+            .expect("initial outcome edge exists");
+        assert!((initial_outcome.edge_weight - 0.9).abs() < 0.001);
+
+        let second = extract_agent_delta(
+            "Completed Acme Capital follow-up and logged next action.",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let second_id = store.insert_memory_from_cleaned(&second).unwrap();
+        let decayed_edges = store.get_edges_for_node(first_id).unwrap();
+
+        let decayed_outcome = decayed_edges
+            .iter()
+            .find(|edge| {
+                edge.source_node_id == first_id
+                    && edge.target_node_id == context_id
+                    && edge.relationship_type == "OUTCOME_FOR"
+            })
+            .expect("decayed outcome edge exists");
+        assert!((decayed_outcome.edge_weight - 0.81).abs() < 0.001);
+
+        let superseded = decayed_edges
+            .iter()
+            .find(|edge| {
+                edge.source_node_id == first_id
+                    && edge.target_node_id == second_id
+                    && edge.relationship_type == "SUPERSEDED_BY"
+            })
+            .expect("superseded edge exists");
+        assert!((superseded.edge_weight - 0.95).abs() < 0.001);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_agent_delta_attribute_marks_conflict_edges() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-conflict-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let first = extract_agent_delta(
+            "Updated Acme Capital meeting. Meeting time: Monday.",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let first_id = store.insert_memory_from_cleaned(&first).unwrap();
+        let second = extract_agent_delta(
+            "Updated Acme Capital meeting. Meeting time: Tuesday.",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let second_id = store.insert_memory_from_cleaned(&second).unwrap();
+
+        let edges = store.get_edges_for_node(second_id).unwrap();
+        assert!(edges.iter().any(|edge| {
+            edge.source_node_id == second_id
+                && edge.target_node_id == first_id
+                && edge.relationship_type == "ATTRIBUTE_CONFLICTS_WITH"
+                && (edge.edge_weight - 0.9).abs() < 0.001
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.source_node_id == first_id
+                && edge.target_node_id == second_id
+                && edge.relationship_type == "ATTRIBUTE_REPLACED_BY"
+                && (edge.edge_weight - 0.9).abs() < 0.001
+        }));
+        assert_eq!(store.graph_health().unwrap().conflict_edges, 2);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn uuid_formatter_uses_canonical_layout() {
         let uuid = format_uuid_bytes(&[
             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x4d, 0xef, 0x80, 0x12, 0x34, 0x56, 0x78, 0x9a,
@@ -2254,6 +3577,7 @@ mod tests {
         assert!(!is_iso8601_utc_timestamp("2024-12-31 23:59:59"));
         assert!(is_json_object_like("{\"ok\":\"yes\"}"));
         assert!(!is_json_object_like("[\"not-object\"]"));
+        assert!(!is_json_object_like("{not-json}"));
     }
 
     #[test]
@@ -2266,7 +3590,7 @@ mod tests {
             entity_type: "DOCUMENT".to_string(),
             raw_text: "Line one\n\"line two\"".to_string(),
             summary_tokens: "Summary with tab\tmarker".to_string(),
-            structured_attributes: "not-json".to_string(),
+            structured_attributes: "{not-json}".to_string(),
             vector_embedding: vec![0.25, -0.5],
             graph_edges: vec![ProtocolGraphEdge {
                 target_node_id: "00000000-0000-4000-8000-000000000002".to_string(),
@@ -2278,6 +3602,7 @@ mod tests {
         assert!(json.contains("\"raw_text\":\"Line one\\n\\\"line two\\\"\""));
         assert!(json.contains("\"summary_tokens\":\"Summary with tab\\tmarker\""));
         assert!(json.contains("\"structured_attributes\":{}"));
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
         assert!(json.contains("\"vector_embedding\":[0.250000,-0.500000]"));
         assert!(json.contains("\"edge_weight\":1.000000"));
     }
@@ -2614,7 +3939,7 @@ mod tests {
                  SET node_uid = 'bad',
                      created_at_utc = 'bad',
                      last_accessed_utc = 'bad',
-                     structured_attributes = 'bad',
+                     structured_attributes = '{not-json}',
                      vector_embedding = ?1
                  WHERE cleaned_event_id = ?2",
                 params![vec![1_u8, 2, 3], cleaned.id],
@@ -2757,6 +4082,30 @@ mod tests {
         assert_eq!(
             summary,
             "web page Identity local capture; url https://example.test/notes; selected text Context quality improves with selected page text."
+        );
+    }
+
+    #[test]
+    fn summarize_capture_uses_source_specific_agent_delta_path() {
+        let content = "Agent outcome delta\nOutcome state: PAID\nDelta source: agent-delta:billing\nSummary: Paid invoice for Acme Capital.\nEntity: Acme Capital\nAttribute receipt_reference: INV-42\nReview required categories: finance";
+
+        assert_eq!(
+            summarize_agent_delta(content),
+            "agent outcome PAID; Paid invoice for Acme Capital.; entities Acme Capital"
+        );
+        assert_eq!(
+            summarize_capture("agent-delta:billing", content),
+            "agent outcome PAID; Paid invoice for Acme Capital.; entities Acme Capital"
+        );
+    }
+
+    #[test]
+    fn agent_delta_attributes_extract_structured_fields() {
+        let content = "Agent outcome delta\nOutcome state: PAID\nDelta source: agent-delta:billing\nSummary: Paid invoice for Acme Capital.\nEntity: Acme Capital\nAttribute receipt_reference: INV-42\nReview required categories: finance";
+
+        assert_eq!(
+            capture_attributes("agent-delta:billing", content),
+            "{\"outcome_state\":\"PAID\",\"delta_source\":\"agent-delta:billing\",\"summary\":\"Paid invoice for Acme Capital.\",\"entities\":[\"Acme Capital\"],\"review_required_categories\":[\"finance\"],\"delta_attributes\":{\"receipt_reference\":\"INV-42\"}}"
         );
     }
 
@@ -3446,6 +4795,10 @@ mod tests {
 
         let health_before = store.graph_health().unwrap();
         assert_eq!(health_before.node_count, 2);
+        assert_eq!(health_before.agent_delta_nodes, 0);
+        assert_eq!(health_before.outcome_edges, 0);
+        assert_eq!(health_before.conflict_edges, 0);
+        assert_eq!(health_before.supersession_edges, 0);
         assert!(
             health_before.edge_count >= 0,
             "auto-linking may produce edges; got {}",
@@ -3463,8 +4816,12 @@ mod tests {
 
         let health_after = store.graph_health().unwrap();
         assert_eq!(health_after.node_count, 2);
+        assert_eq!(health_after.agent_delta_nodes, 0);
         assert_eq!(health_after.edge_count, health_before.edge_count + 1);
         assert_eq!(health_after.orphan_count, 0);
+        assert_eq!(health_after.outcome_edges, 0);
+        assert_eq!(health_after.conflict_edges, 0);
+        assert_eq!(health_after.supersession_edges, 0);
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
