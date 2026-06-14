@@ -11,7 +11,10 @@ use identityd::capture::capture_adapter_health;
 use identityd::context_builder::build_identity_context;
 use identityd::context_snapshot::{capture_context_snapshot, ContextSnapshot};
 use identityd::crypto::protection_backend;
-use identityd::delta::{agent_delta_from_json, extract_agent_delta, normalize_agent_delta_source};
+use identityd::delta::{
+    agent_delta_from_json, agent_delta_schema_json, agent_delta_validation_json,
+    extract_agent_delta, normalize_agent_delta_source,
+};
 use identityd::embedding::{
     active_embedding_health, embedding_artifact_health_for_model_path,
     onnx_runtime_health_for_artifact, probe_embedding_latency, run_onnx_embedding_file,
@@ -72,6 +75,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let startup_started = Instant::now();
     let raw_args: Vec<String> = env::args().skip(1).collect();
     let command = command_arg(&raw_args).unwrap_or_else(|| "init".to_string());
+    if is_help_request(&raw_args, &command) {
+        print_help();
+        return Ok(());
+    }
 
     let paths = if let Some(root) = read_flag(&raw_args, "--root") {
         IdentityPaths::from_root(PathBuf::from(root))
@@ -1168,7 +1175,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let source_filter = read_flag(&raw_args, "--source")
                 .map(|source| normalize_agent_delta_source(Some(&source)));
             let entity_filter = read_flag(&raw_args, "--entity");
-            let state_filter = read_flag(&raw_args, "--state");
+            let state_filter = read_flag(&raw_args, "--state")
+                .map(|value| normalize_outcome_state_filter(&value))
+                .filter(|value| !value.is_empty());
+            let review_category_filter = read_flag(&raw_args, "--review-category")
+                .map(|value| normalize_review_category_filter(&value))
+                .filter(|value| !value.is_empty());
             let store = IdentityStore::open(&paths)?;
 
             println!(
@@ -1179,8 +1191,83 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     source_filter.as_deref(),
                     entity_filter.as_deref(),
                     state_filter.as_deref(),
+                    review_category_filter.as_deref(),
                 )?
             );
+        }
+        "agent-delta-stats" | "agent-delta-summary" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(100);
+            let review_only = has_flag(&raw_args, "--review-only");
+            let source_filter = read_flag(&raw_args, "--source")
+                .map(|source| normalize_agent_delta_source(Some(&source)));
+            let entity_filter = read_flag(&raw_args, "--entity");
+            let state_filter = read_flag(&raw_args, "--state")
+                .map(|value| normalize_outcome_state_filter(&value))
+                .filter(|value| !value.is_empty());
+            let review_category_filter = read_flag(&raw_args, "--review-category")
+                .map(|value| normalize_review_category_filter(&value))
+                .filter(|value| !value.is_empty());
+            let store = IdentityStore::open(&paths)?;
+
+            println!(
+                "{}",
+                store.export_agent_delta_stats_json_filtered(
+                    limit,
+                    review_only,
+                    source_filter.as_deref(),
+                    entity_filter.as_deref(),
+                    state_filter.as_deref(),
+                    review_category_filter.as_deref(),
+                )?
+            );
+        }
+        "agent-delta-edges" => {
+            let limit = read_flag(&raw_args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(50);
+            let review_only = has_flag(&raw_args, "--review-only");
+            let source_filter = read_flag(&raw_args, "--source")
+                .map(|source| normalize_agent_delta_source(Some(&source)));
+            let entity_filter = read_flag(&raw_args, "--entity");
+            let state_filter = read_flag(&raw_args, "--state")
+                .map(|value| normalize_outcome_state_filter(&value))
+                .filter(|value| !value.is_empty());
+            let review_category_filter = read_flag(&raw_args, "--review-category")
+                .map(|value| normalize_review_category_filter(&value))
+                .filter(|value| !value.is_empty());
+            let node_id_filter = read_flag(&raw_args, "--node-id")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let relationship_filter = read_flag(&raw_args, "--relationship")
+                .map(|value| normalize_relationship_filter(&value))
+                .filter(|value| !value.is_empty());
+            let store = IdentityStore::open(&paths)?;
+
+            println!(
+                "{}",
+                store.export_agent_delta_edges_json_scoped(
+                    limit,
+                    node_id_filter.as_deref(),
+                    relationship_filter.as_deref(),
+                    review_only,
+                    source_filter.as_deref(),
+                    entity_filter.as_deref(),
+                    state_filter.as_deref(),
+                    review_category_filter.as_deref(),
+                )?
+            );
+        }
+        "agent-delta-schema" => {
+            println!("{}", agent_delta_schema_json()?);
+        }
+        "agent-delta-validate" => {
+            let delta = read_agent_delta_candidate(&raw_args)?;
+
+            println!("{}", agent_delta_validation_json(&delta)?);
         }
         "agent-delta-preview" => {
             let delta = read_agent_delta_candidate(&raw_args)?;
@@ -1527,6 +1614,36 @@ fn read_agent_delta_text(args: &[String]) -> Result<String, Box<dyn Error>> {
         })
 }
 
+fn normalize_relationship_filter(value: &str) -> String {
+    value
+        .trim()
+        .replace('-', "_")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_ascii_uppercase()
+}
+
+fn normalize_outcome_state_filter(value: &str) -> String {
+    value
+        .trim()
+        .replace('-', "_")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_ascii_uppercase()
+}
+
+fn normalize_review_category_filter(value: &str) -> String {
+    value
+        .trim()
+        .replace('-', "_")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_ascii_lowercase()
+}
+
 fn read_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|window| window[0] == flag)
@@ -1557,6 +1674,10 @@ fn command_arg(args: &[String]) -> Option<String> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+fn is_help_request(args: &[String], command: &str) -> bool {
+    command == "help" || has_flag(args, "--help") || has_flag(args, "-h")
 }
 
 fn ensure_loopback_addr(addr: SocketAddr, allow_non_loopback: bool) -> Result<(), Box<dyn Error>> {
@@ -1616,7 +1737,11 @@ fn print_help() {
             "  project-profile-list\n",
             "  slice-preview --intent <text> [--limit 3]\n",
             "  prompt-package --intent <text> --prompt <text> [--limit 3]\n",
-            "  agent-delta-list [--limit 10] [--review-only] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
+            "  agent-delta-list [--limit 10] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
+            "  agent-delta-stats [--limit 100] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
+            "  agent-delta-edges [--limit 50] [--node-id <uuid>] [--relationship <type>] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
+            "  agent-delta-schema\n",
+            "  agent-delta-validate (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>]\n",
             "  agent-delta-preview (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>]\n",
             "  agent-delta-commit (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>] [--allow-sensitive] [--json]\n",
             "  process-once [--limit 10]\n",
@@ -2042,9 +2167,11 @@ fn join_f32_prefix(values: &[f32], limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_arg, completion_percent, count_ready, ensure_loopback_addr, optional_string,
-        optional_u64, optional_usize, phase1_embedding_artifact_status,
-        phase1_local_pipeline_status, phase1_next_milestone, phase1_remaining_summary,
+        command_arg, completion_percent, count_ready, ensure_loopback_addr, is_help_request,
+        normalize_outcome_state_filter, normalize_relationship_filter,
+        normalize_review_category_filter, optional_string, optional_u64, optional_usize,
+        phase1_embedding_artifact_status, phase1_local_pipeline_status, phase1_next_milestone,
+        phase1_remaining_summary,
     };
     use std::net::SocketAddr;
 
@@ -2070,6 +2197,47 @@ mod tests {
         ];
 
         assert_eq!(command_arg(&args), Some("doctor".to_string()));
+    }
+
+    #[test]
+    fn help_request_is_detected_before_workspace_setup() {
+        let help = vec!["--help".to_string()];
+        let short = vec!["-h".to_string()];
+        let help_command = vec!["help".to_string()];
+
+        assert!(is_help_request(&help, "init"));
+        assert!(is_help_request(&short, "init"));
+        assert!(is_help_request(&help_command, "help"));
+        assert!(!is_help_request(&["doctor".to_string()], "doctor"));
+    }
+
+    #[test]
+    fn agent_delta_cli_filters_normalize_user_input() {
+        assert_eq!(normalize_outcome_state_filter(" paid "), "PAID");
+        assert_eq!(
+            normalize_outcome_state_filter("private sent"),
+            "PRIVATE_SENT"
+        );
+        assert_eq!(
+            normalize_outcome_state_filter("review-needed"),
+            "REVIEW_NEEDED"
+        );
+        assert_eq!(
+            normalize_relationship_filter(" superseded by "),
+            "SUPERSEDED_BY"
+        );
+        assert_eq!(
+            normalize_relationship_filter("attribute-conflicts-with"),
+            "ATTRIBUTE_CONFLICTS_WITH"
+        );
+        assert_eq!(
+            normalize_review_category_filter(" legal identity "),
+            "legal_identity"
+        );
+        assert_eq!(
+            normalize_review_category_filter("private-communications"),
+            "private_communications"
+        );
     }
 
     #[test]

@@ -132,6 +132,65 @@ pub fn agent_delta_from_json(input: &str) -> Result<AgentDelta, AgentDeltaError>
     Ok(delta)
 }
 
+pub fn agent_delta_schema_json() -> Result<String, AgentDeltaError> {
+    let candidate_template = AgentDelta {
+        schema_version: AGENT_DELTA_SCHEMA_VERSION,
+        source: DEFAULT_AGENT_DELTA_SOURCE.to_string(),
+        outcome_state: "OBSERVED".to_string(),
+        summary: "Brief reviewed outcome summary.".to_string(),
+        entities: vec!["Example Entity".to_string()],
+        attributes: vec![DeltaAttribute {
+            key: "reference".to_string(),
+            value: "optional bounded value".to_string(),
+        }],
+        requires_review: false,
+        review_required_categories: Vec::new(),
+    };
+    let schema = serde_json::json!({
+        "schema_version": AGENT_DELTA_SCHEMA_VERSION,
+        "source_prefix": AGENT_DELTA_SOURCE_PREFIX,
+        "default_source": DEFAULT_AGENT_DELTA_SOURCE,
+        "allowed_outcome_states": ALLOWED_OUTCOME_STATES,
+        "allowed_review_required_categories": ALLOWED_REVIEW_CATEGORIES,
+        "limits": {
+            "max_summary_chars": MAX_DELTA_SUMMARY_CHARS,
+            "max_entities": MAX_DELTA_ENTITIES,
+            "max_entity_chars": MAX_DELTA_ENTITY_CHARS,
+            "max_attributes": MAX_DELTA_ATTRIBUTES,
+            "max_attribute_key_chars": MAX_DELTA_ATTRIBUTE_KEY_CHARS,
+            "max_attribute_value_chars": MAX_DELTA_ATTRIBUTE_VALUE_CHARS,
+            "max_source_label_chars": MAX_DELTA_SOURCE_LABEL_CHARS
+        },
+        "rules": {
+            "source": "agent-delta:<bounded lowercase slug>",
+            "outcome_state": "one of allowed_outcome_states",
+            "attribute_key": "lowercase alphanumeric snake_case",
+            "requires_review": "must be true exactly when review_required_categories is non-empty",
+            "unknown_fields": "rejected"
+        },
+        "candidate_template": candidate_template
+    });
+
+    Ok(serde_json::to_string_pretty(&schema)?)
+}
+
+pub fn agent_delta_validation_json(delta: &AgentDelta) -> Result<String, AgentDeltaError> {
+    delta.validate()?;
+    let output = serde_json::json!({
+        "valid": true,
+        "schema_version": delta.schema_version,
+        "source": delta.source,
+        "outcome_state": delta.outcome_state,
+        "requires_review": delta.requires_review(),
+        "commit_requires_allow_sensitive": delta.requires_review(),
+        "review_required_categories": delta.review_required_categories,
+        "entities_count": delta.entities.len(),
+        "attributes_count": delta.attributes.len()
+    });
+
+    Ok(serde_json::to_string_pretty(&output)?)
+}
+
 impl AgentDelta {
     pub fn validate(&self) -> Result<(), AgentDeltaError> {
         if self.schema_version != AGENT_DELTA_SCHEMA_VERSION {
@@ -717,8 +776,8 @@ fn stable_negative_id(hash_hex: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_delta_from_json, extract_agent_delta, DeltaAttribute, AGENT_DELTA_SCHEMA_VERSION,
-        AGENT_DELTA_SOURCE_PREFIX,
+        agent_delta_from_json, agent_delta_schema_json, agent_delta_validation_json,
+        extract_agent_delta, DeltaAttribute, AGENT_DELTA_SCHEMA_VERSION, AGENT_DELTA_SOURCE_PREFIX,
     };
 
     #[test]
@@ -839,6 +898,65 @@ mod tests {
             parsed.to_cleaned_event().unwrap().content_hash,
             delta.to_cleaned_event().unwrap().content_hash
         );
+    }
+
+    #[test]
+    fn schema_json_exposes_review_candidate_contract() {
+        let json = agent_delta_schema_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["schema_version"], AGENT_DELTA_SCHEMA_VERSION);
+        assert_eq!(parsed["source_prefix"], AGENT_DELTA_SOURCE_PREFIX);
+        assert!(parsed["allowed_outcome_states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|state| state == "SENT"));
+        assert!(parsed["allowed_review_required_categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|category| category == "finance"));
+        assert_eq!(parsed["rules"]["unknown_fields"], "rejected");
+
+        let template_json =
+            serde_json::to_string(&parsed["candidate_template"]).expect("template serializes");
+        let template = agent_delta_from_json(&template_json).unwrap();
+
+        assert_eq!(template.schema_version, AGENT_DELTA_SCHEMA_VERSION);
+        assert_eq!(template.source, "agent-delta:manual");
+        assert_eq!(template.outcome_state, "OBSERVED");
+        assert!(!template.requires_review());
+    }
+
+    #[test]
+    fn validation_json_reports_safe_bounded_status() {
+        let delta = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap();
+
+        let json = agent_delta_validation_json(&delta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["valid"], true);
+        assert_eq!(parsed["schema_version"], AGENT_DELTA_SCHEMA_VERSION);
+        assert_eq!(parsed["source"], "agent-delta:billing");
+        assert_eq!(parsed["outcome_state"], "PAID");
+        assert_eq!(parsed["requires_review"], true);
+        assert_eq!(parsed["commit_requires_allow_sensitive"], true);
+        assert_eq!(
+            parsed["review_required_categories"],
+            serde_json::json!(["finance"])
+        );
+        assert_eq!(parsed["entities_count"], 1);
+        assert_eq!(parsed["attributes_count"], 1);
+        assert!(parsed.get("summary").is_none());
+        assert!(parsed.get("entities").is_none());
+        assert!(parsed.get("attributes").is_none());
+        assert!(!json.contains("Acme Capital"));
+        assert!(!json.contains("INV-42"));
     }
 
     #[test]

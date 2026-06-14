@@ -54,6 +54,7 @@ The `.me` client would retrieve only the relevant network graph, writing-tone pr
 The first code lives in [crates/identityd](crates/identityd). It is the local daemon core responsible for creating the Identity workspace, writing captured text into the SQLite transit buffer, capturing bounded foreground-window context on Windows including focused-control text, message-based control-text fallback, and a narrow accessibility fallback, cleaning/promoting local captures, and storing prototype `.me` memory vectors locally.
 
 ```powershell
+cargo run -p identityd -- --help
 cargo run -p identityd -- init
 cargo run -p identityd -- --root C:\Temp\identity-dev doctor
 cargo run -p identityd -- ingest --source manual --content "User prefers local-first systems."
@@ -102,9 +103,17 @@ cargo run -p identityd -- slice-preview --intent "draft outreach using local con
 cargo run -p identityd -- prompt-package --intent "draft outreach using local context" --prompt "Write the message."
 cargo run -p identityd -- agent-delta-list --limit 10
 cargo run -p identityd -- agent-delta-list --review-only --limit 10
+cargo run -p identityd -- agent-delta-list --review-category finance --limit 10
 cargo run -p identityd -- agent-delta-list --source follow-up --limit 10
 cargo run -p identityd -- agent-delta-list --entity "Acme Capital" --limit 10
-cargo run -p identityd -- agent-delta-list --state PAID --limit 10
+cargo run -p identityd -- agent-delta-list --state paid --limit 10
+cargo run -p identityd -- agent-delta-stats --limit 100
+cargo run -p identityd -- agent-delta-stats --review-only --review-category finance --source billing --state PAID --limit 100
+cargo run -p identityd -- agent-delta-edges --limit 50
+cargo run -p identityd -- agent-delta-edges --relationship OUTCOME_FOR --limit 50
+cargo run -p identityd -- agent-delta-edges --review-category finance --source billing --state paid --relationship OUTCOME_FOR --limit 50
+cargo run -p identityd -- agent-delta-schema
+cargo run -p identityd -- agent-delta-validate --candidate-json-stdin
 cargo run -p identityd -- agent-delta-preview --source follow-up --text "Sent follow-up to Acme Capital. Confirmation reference: MSG-42"
 cargo run -p identityd -- agent-delta-preview --candidate-json-stdin
 cargo run -p identityd -- agent-delta-commit --source follow-up --text "Sent follow-up to Acme Capital. Confirmation reference: MSG-42"
@@ -128,6 +137,9 @@ cargo run -p identityd -- project-profile-list
 cargo run -p identityd -- daemon --watch-active-window --hotkey --hotkey-combo "Ctrl+Shift+I"
 cargo run -p identityd -- daemon --watch-active-window --hotkey --hotkey-combo "Ctrl+Shift+I" --paste-on-hotkey
 ```
+
+`--help`, `-h`, and `help` print command help before opening or creating a
+workspace, so help inspection is read-only.
 
 `watch` uses Windows filesystem events by default on Windows. Use `--poll` only as
 the conservative fallback. Filesystem capture refuses broad or sensitive roots
@@ -317,6 +329,14 @@ candidate with `schema_version`, outcome state, summary, obvious entities,
 key/value attributes, `requires_review`, and any review-required categories. It
 can also validate a reviewed candidate through `--candidate-json <json>` or
 `--candidate-json-stdin`, rejecting unknown fields and unsafe content.
+`agent-delta-schema` prints the local reviewed-candidate contract as JSON,
+including the schema version, source prefix, allowed outcome states, allowed
+review categories, field limits, validation rules, and a candidate template.
+`agent-delta-validate` accepts the same text or candidate-JSON inputs as preview
+and reports a compact validation JSON object with source, outcome state,
+review-required flags/categories, whether commit would require
+`--allow-sensitive`, and entity/attribute counts, without writing and without
+echoing summaries, entities, attributes, or raw text.
 `agent-delta-commit` performs the same extraction or candidate-JSON validation,
 validates the candidate against the local delta schema, and writes only that
 validated candidate into local `.me` memory through the existing embedding,
@@ -353,10 +373,26 @@ entities, extracted delta attributes, summary, and structured attributes, plus
 top-level `requires_review` and review-category fields; it does not include raw
 text, hashes, vector blobs, scores, or internal SQLite row ids.
 Use `--review-only` to show only committed deltas that require explicit review,
+`--review-category <category>` to inspect one sensitive review category such as
+`finance`, `health`, `legal_identity`, or `private_communications`,
 `--source <label>` to inspect one normalized `agent-delta:` source, and
 `--entity <name>` to inspect deltas for one extracted entity, and
 `--state <STATE>` to inspect one outcome state such as `SENT`, `PAID`, or
-`FAILED`. Its requested limit is hard-capped at 100 rows to keep inspection cheap. This is not a session watcher and it does not observe
+`FAILED`; state filters are normalized at the CLI boundary, so lowercase,
+kebab-case, and whitespace-separated input still maps to the strict stored
+uppercase state labels. Its requested limit is hard-capped at 100 rows to keep
+inspection cheap. `agent-delta-stats` accepts the same bounded filters and emits aggregate
+counts by outcome state, source, and review category, plus a review-required
+count, without summaries, entities, node ids, raw text, hashes, vectors, scores,
+or internal SQLite row ids. `agent-delta-edges` inspects bounded graph edges
+touching committed agent deltas with protocol-facing source and target
+`node_id` values, relationship type, edge weight, and UTC edge timestamps. It
+accepts the same `--review-only`, `--review-category`, `--source`, `--entity`,
+and `--state` filters as list/stats to first scope the committed delta nodes
+locally, then applies graph-specific `--node-id <uuid>` and
+`--relationship <type>` filters. Output is capped at 100 rows, relationship
+filter input is normalized the same way, and it
+omits raw text, summaries, hashes, vectors, scores, and internal SQLite row ids. This is not a session watcher and it does not observe
 browser/API activity automatically; it is the smallest explicit write-back
 primitive for tested agent outcomes.
 

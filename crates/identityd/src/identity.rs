@@ -7,7 +7,8 @@ use crate::embedding::{
 use crate::transit::CleanedEvent;
 use crate::vector_store::{VectorStore, VectorStoreError};
 use crate::workspace::IdentityPaths;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +45,16 @@ pub struct ProtocolGraphEdge {
     pub target_node_id: String,
     pub relationship_type: String,
     pub edge_weight: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolAgentDeltaEdge {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub relationship_type: String,
+    pub edge_weight: f64,
+    pub created_at_utc: String,
+    pub updated_at_utc: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -298,7 +309,7 @@ impl IdentityStore {
     }
 
     pub fn export_recent_agent_deltas_json(&self, limit: u32) -> Result<String, IdentityError> {
-        self.export_recent_agent_deltas_json_filtered(limit, false, None, None, None)
+        self.export_recent_agent_deltas_json_filtered(limit, false, None, None, None, None)
     }
 
     pub fn export_recent_agent_deltas_json_filtered(
@@ -308,45 +319,160 @@ impl IdentityStore {
         source_filter: Option<&str>,
         entity_filter: Option<&str>,
         state_filter: Option<&str>,
+        review_category_filter: Option<&str>,
+    ) -> Result<String, IdentityError> {
+        let nodes = self.recent_agent_delta_nodes_filtered(
+            limit,
+            review_only,
+            source_filter,
+            entity_filter,
+            state_filter,
+            review_category_filter,
+        )?;
+        Ok(agent_delta_nodes_json(&nodes))
+    }
+
+    pub fn export_agent_delta_stats_json_filtered(
+        &self,
+        limit: u32,
+        review_only: bool,
+        source_filter: Option<&str>,
+        entity_filter: Option<&str>,
+        state_filter: Option<&str>,
+        review_category_filter: Option<&str>,
     ) -> Result<String, IdentityError> {
         let limit = limit.min(AGENT_DELTA_LIST_MAX_LIMIT);
-        let scan_limit = if review_only
+        let nodes = self.recent_agent_delta_nodes_filtered(
+            limit,
+            review_only,
+            source_filter,
+            entity_filter,
+            state_filter,
+            review_category_filter,
+        )?;
+        Ok(agent_delta_stats_json(&nodes, limit))
+    }
+
+    pub fn export_agent_delta_edges_json_filtered(
+        &self,
+        limit: u32,
+        node_id_filter: Option<&str>,
+        relationship_filter: Option<&str>,
+    ) -> Result<String, IdentityError> {
+        self.export_agent_delta_edges_json_scoped(
+            limit,
+            node_id_filter,
+            relationship_filter,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn export_agent_delta_edges_json_scoped(
+        &self,
+        limit: u32,
+        node_id_filter: Option<&str>,
+        relationship_filter: Option<&str>,
+        review_only: bool,
+        source_filter: Option<&str>,
+        entity_filter: Option<&str>,
+        state_filter: Option<&str>,
+        review_category_filter: Option<&str>,
+    ) -> Result<String, IdentityError> {
+        let has_delta_filter = review_only
             || source_filter.is_some()
             || entity_filter.is_some()
             || state_filter.is_some()
-        {
+            || review_category_filter.is_some();
+        let delta_node_uids = if has_delta_filter {
+            self.recent_agent_delta_nodes_filtered(
+                AGENT_DELTA_LIST_MAX_LIMIT,
+                review_only,
+                source_filter,
+                entity_filter,
+                state_filter,
+                review_category_filter,
+            )?
+            .into_iter()
+            .map(|node| node.node_uid)
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if has_delta_filter && delta_node_uids.is_empty() {
+            return Ok(agent_delta_edges_json(
+                &[],
+                limit.min(AGENT_DELTA_LIST_MAX_LIMIT),
+            ));
+        }
+
+        let edges = self.backend.list_agent_delta_protocol_edges(
+            limit.min(AGENT_DELTA_LIST_MAX_LIMIT),
+            node_id_filter,
+            relationship_filter,
+            has_delta_filter.then_some(delta_node_uids.as_slice()),
+        )?;
+        Ok(agent_delta_edges_json(
+            &edges,
+            limit.min(AGENT_DELTA_LIST_MAX_LIMIT),
+        ))
+    }
+
+    fn recent_agent_delta_nodes_filtered(
+        &self,
+        limit: u32,
+        review_only: bool,
+        source_filter: Option<&str>,
+        entity_filter: Option<&str>,
+        state_filter: Option<&str>,
+        review_category_filter: Option<&str>,
+    ) -> Result<Vec<MemoryNode>, IdentityError> {
+        let limit = limit.min(AGENT_DELTA_LIST_MAX_LIMIT);
+        let has_filter = review_only
+            || source_filter.is_some()
+            || entity_filter.is_some()
+            || state_filter.is_some()
+            || review_category_filter.is_some();
+        let scan_limit = if has_filter {
             AGENT_DELTA_LIST_MAX_LIMIT
         } else {
             limit
         };
         let nodes = self.backend.list_recent_agent_deltas(scan_limit)?;
-        let nodes = if review_only
-            || source_filter.is_some()
-            || entity_filter.is_some()
-            || state_filter.is_some()
-        {
-            nodes
-                .into_iter()
-                .filter(|node| {
-                    let source_matches = source_filter
-                        .map(|source| node.source == source)
-                        .unwrap_or(true);
-                    let entity_matches = entity_filter
-                        .map(|entity| agent_delta_has_entity(&node.raw_text, entity))
-                        .unwrap_or(true);
-                    let state_matches = state_filter
-                        .map(|state| agent_delta_has_outcome_state(&node.raw_text, state))
-                        .unwrap_or(true);
-                    let review_matches =
-                        !review_only || !agent_delta_review_categories(&node.raw_text).is_empty();
-                    source_matches && entity_matches && state_matches && review_matches
-                })
-                .take(limit as usize)
-                .collect::<Vec<_>>()
-        } else {
-            nodes
-        };
-        Ok(agent_delta_nodes_json(&nodes))
+        if !has_filter {
+            return Ok(nodes);
+        }
+
+        Ok(nodes
+            .into_iter()
+            .filter(|node| {
+                let source_matches = source_filter
+                    .map(|source| node.source == source)
+                    .unwrap_or(true);
+                let entity_matches = entity_filter
+                    .map(|entity| agent_delta_has_entity(&node.raw_text, entity))
+                    .unwrap_or(true);
+                let state_matches = state_filter
+                    .map(|state| agent_delta_has_outcome_state(&node.raw_text, state))
+                    .unwrap_or(true);
+                let review_categories = agent_delta_review_categories(&node.raw_text);
+                let review_matches = !review_only || !review_categories.is_empty();
+                let review_category_matches = review_category_filter
+                    .map(|category| {
+                        agent_delta_has_review_category_in(&review_categories, category)
+                    })
+                    .unwrap_or(true);
+                source_matches
+                    && entity_matches
+                    && state_matches
+                    && review_matches
+                    && review_category_matches
+            })
+            .take(limit as usize)
+            .collect())
     }
 
     pub fn recent_web_captures(&self, limit: u32) -> Result<Vec<MemoryNode>, IdentityError> {
@@ -1302,6 +1428,88 @@ impl SqliteMemoryBackend {
             .map_err(IdentityError::from)
     }
 
+    fn list_agent_delta_protocol_edges(
+        &self,
+        limit: u32,
+        node_id_filter: Option<&str>,
+        relationship_filter: Option<&str>,
+        delta_node_filter: Option<&[String]>,
+    ) -> Result<Vec<ProtocolAgentDeltaEdge>, IdentityError> {
+        let node_id_filter = node_id_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let relationship_filter = relationship_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let delta_node_filter = delta_node_filter
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .map(|node| node.trim().to_string())
+                    .filter(|node| !node.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|nodes| !nodes.is_empty());
+        let mut sql = String::from(
+            "SELECT source.node_uid,
+                    target.node_uid,
+                    edge.relationship_type,
+                    edge.edge_weight,
+                    edge.created_at_ms,
+                    edge.updated_at_ms
+             FROM graph_edges edge
+             JOIN memory_nodes source ON source.id = edge.source_node_id
+             JOIN memory_nodes target ON target.id = edge.target_node_id
+             WHERE (
+                    (source.domain_context = 'agent.outcome' AND source.entity_type = 'AGENT_DELTA')
+                    OR (target.domain_context = 'agent.outcome' AND target.entity_type = 'AGENT_DELTA')
+                   )
+               AND (?2 IS NULL OR source.node_uid = ?2 OR target.node_uid = ?2)
+               AND (?3 IS NULL OR edge.relationship_type = ?3)",
+        );
+        let mut values = vec![
+            Value::Integer(limit as i64),
+            node_id_filter
+                .map(|value| Value::Text(value.to_string()))
+                .unwrap_or(Value::Null),
+            relationship_filter
+                .map(|value| Value::Text(value.to_string()))
+                .unwrap_or(Value::Null),
+        ];
+
+        if let Some(nodes) = &delta_node_filter {
+            let placeholders = (0..nodes.len())
+                .map(|index| format!("?{}", index + 4))
+                .collect::<Vec<_>>()
+                .join(",");
+            sql.push_str(" AND (source.node_uid IN (");
+            sql.push_str(&placeholders);
+            sql.push_str(") OR target.node_uid IN (");
+            sql.push_str(&placeholders);
+            sql.push_str("))");
+            values.extend(nodes.iter().cloned().map(Value::Text));
+        }
+
+        sql.push_str(" ORDER BY edge.updated_at_ms DESC, edge.id DESC LIMIT ?1");
+        let mut statement = self.conn.prepare(&sql)?;
+
+        let rows = statement.query_map(params_from_iter(values), |row| {
+            let created_at_ms = row.get::<_, i64>(4)?;
+            let updated_at_ms = row.get::<_, i64>(5)?;
+            Ok(ProtocolAgentDeltaEdge {
+                source_node_id: row.get(0)?,
+                target_node_id: row.get(1)?,
+                relationship_type: row.get(2)?,
+                edge_weight: row.get(3)?,
+                created_at_utc: iso8601_utc_from_ms(created_at_ms),
+                updated_at_utc: iso8601_utc_from_ms(updated_at_ms),
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(IdentityError::from)
+    }
+
     fn decay_edges(&self, limit: u32) -> Result<EdgeDecaySummary, IdentityError> {
         let now = now_ms()?;
         let edges = self.list_edges(limit)?;
@@ -2066,6 +2274,27 @@ fn agent_delta_review_categories(content: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn agent_delta_has_review_category_in(categories: &[String], expected: &str) -> bool {
+    let expected = normalize_review_category_filter(expected);
+    if expected.is_empty() {
+        return true;
+    }
+
+    categories
+        .iter()
+        .any(|category| normalize_review_category_filter(category) == expected)
+}
+
+fn normalize_review_category_filter(value: &str) -> String {
+    value
+        .trim()
+        .replace('-', "_")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_ascii_lowercase()
+}
+
 fn agent_delta_attribute_pairs(content: &str) -> Vec<(String, String)> {
     content
         .lines()
@@ -2278,6 +2507,87 @@ fn agent_delta_nodes_json(nodes: &[MemoryNode]) -> String {
 
     output.push(']');
     output
+}
+
+fn agent_delta_stats_json(nodes: &[MemoryNode], limit: u32) -> String {
+    let mut by_source = BTreeMap::<String, u32>::new();
+    let mut by_outcome_state = BTreeMap::<String, u32>::new();
+    let mut by_review_category = BTreeMap::<String, u32>::new();
+    let mut requires_review_count = 0_u32;
+
+    for node in nodes {
+        *by_source.entry(node.source.clone()).or_insert(0) += 1;
+        let outcome_state = labelled_value(&node.raw_text, "Outcome state:")
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        *by_outcome_state.entry(outcome_state).or_insert(0) += 1;
+
+        let review_categories = agent_delta_review_categories(&node.raw_text);
+        if !review_categories.is_empty() {
+            requires_review_count += 1;
+        }
+        for category in review_categories {
+            *by_review_category.entry(category).or_insert(0) += 1;
+        }
+    }
+
+    let mut output = String::from("{");
+    output.push_str(&format!("\"limit\":{limit}"));
+    output.push_str(&format!(",\"counted_deltas\":{}", nodes.len()));
+    output.push_str(&format!(
+        ",\"requires_review_count\":{requires_review_count}"
+    ));
+    output.push_str(",\"by_outcome_state\":");
+    push_count_map_json(&mut output, &by_outcome_state, "outcome_state");
+    output.push_str(",\"by_source\":");
+    push_count_map_json(&mut output, &by_source, "source");
+    output.push_str(",\"by_review_category\":");
+    push_count_map_json(&mut output, &by_review_category, "review_required_category");
+    output.push('}');
+    output
+}
+
+fn agent_delta_edges_json(edges: &[ProtocolAgentDeltaEdge], limit: u32) -> String {
+    let mut output = String::from("{");
+    output.push_str(&format!("\"limit\":{limit}"));
+    output.push_str(&format!(",\"counted_edges\":{}", edges.len()));
+    output.push_str(",\"edges\":[");
+
+    for (index, edge) in edges.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_string_field(&mut output, "source_node_id", &edge.source_node_id, false);
+        push_json_string_field(&mut output, "target_node_id", &edge.target_node_id, true);
+        push_json_string_field(
+            &mut output,
+            "relationship_type",
+            &edge.relationship_type,
+            true,
+        );
+        output.push_str(",\"edge_weight\":");
+        output.push_str(&format!("{:.6}", edge.edge_weight.clamp(0.0, 1.0)));
+        push_json_string_field(&mut output, "timestamp_created", &edge.created_at_utc, true);
+        push_json_string_field(&mut output, "timestamp_updated", &edge.updated_at_utc, true);
+        output.push('}');
+    }
+
+    output.push_str("]}");
+    output
+}
+
+fn push_count_map_json(output: &mut String, counts: &BTreeMap<String, u32>, key_name: &str) {
+    output.push('[');
+    for (index, (key, count)) in counts.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_string_field(output, key_name, key, false);
+        output.push_str(&format!(",\"count\":{count}"));
+        output.push('}');
+    }
+    output.push(']');
 }
 
 fn protocol_node_json(node: &ProtocolMemoryNode) -> String {
@@ -3093,7 +3403,7 @@ mod tests {
         store.insert_memory_from_cleaned(&review).unwrap();
 
         let json = store
-            .export_recent_agent_deltas_json_filtered(10, true, None, None, None)
+            .export_recent_agent_deltas_json_filtered(10, true, None, None, None, None)
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let deltas = parsed.as_array().unwrap();
@@ -3147,6 +3457,7 @@ mod tests {
                 Some("agent-delta:follow-up"),
                 None,
                 None,
+                None,
             )
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3195,6 +3506,7 @@ mod tests {
                 None,
                 Some(" acme  capital "),
                 None,
+                None,
             )
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3239,7 +3551,7 @@ mod tests {
         store.insert_memory_from_cleaned(&paid).unwrap();
 
         let json = store
-            .export_recent_agent_deltas_json_filtered(10, false, None, None, Some("paid"))
+            .export_recent_agent_deltas_json_filtered(10, false, None, None, Some("paid"), None)
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let deltas = parsed.as_array().unwrap();
@@ -3251,6 +3563,63 @@ mod tests {
             deltas[0]["outcome_state"]
         );
         assert_eq!(deltas[0]["source"], "agent-delta:billing");
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_agent_delta_export_filters_by_review_category() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-review-category-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let finance = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let private = extract_agent_delta(
+            "Sent Slack message to Orbit Partners. Confirmation reference: MSG-9",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&finance).unwrap();
+        store.insert_memory_from_cleaned(&private).unwrap();
+
+        let json = store
+            .export_recent_agent_deltas_json_filtered(
+                10,
+                true,
+                None,
+                None,
+                None,
+                Some("private-communications"),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(
+            deltas[0]["review_required_categories"],
+            serde_json::json!(["private_communications"])
+        );
+        assert_eq!(deltas[0]["source"], "agent-delta:follow-up");
+        assert!(deltas[0].get("raw_text").is_none());
+        assert!(deltas[0].get("content_hash").is_none());
+        assert!(deltas[0].get("vector_embedding").is_none());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -3333,6 +3702,182 @@ mod tests {
     }
 
     #[test]
+    fn recent_agent_delta_export_combines_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-list-combined-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let acme_billing = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let orbit_billing = extract_agent_delta(
+            "Paid invoice for Orbit Partners. Receipt reference: INV-99",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let acme_follow_up =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        store.insert_memory_from_cleaned(&acme_billing).unwrap();
+        store.insert_memory_from_cleaned(&orbit_billing).unwrap();
+        store.insert_memory_from_cleaned(&acme_follow_up).unwrap();
+
+        let json = store
+            .export_recent_agent_deltas_json_filtered(
+                10,
+                true,
+                Some("agent-delta:billing"),
+                Some("Acme Capital"),
+                Some("paid"),
+                None,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["source"], "agent-delta:billing");
+        assert_eq!(deltas[0]["outcome_state"], "PAID");
+        assert_eq!(deltas[0]["entities"], serde_json::json!(["Acme Capital"]));
+        assert_eq!(
+            deltas[0]["review_required_categories"],
+            serde_json::json!(["finance"])
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_stats_reports_bounded_counts_without_payload_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-stats-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let follow_up =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let sent = extract_agent_delta("Sent follow-up to Orbit Partners.", Some("follow-up"))
+            .unwrap()
+            .to_cleaned_event()
+            .unwrap();
+        let billing = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&follow_up).unwrap();
+        store.insert_memory_from_cleaned(&sent).unwrap();
+        store.insert_memory_from_cleaned(&billing).unwrap();
+
+        let json = store
+            .export_agent_delta_stats_json_filtered(100, false, None, None, None, None)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["limit"], 100);
+        assert_eq!(parsed["counted_deltas"], 3);
+        assert_eq!(parsed["requires_review_count"], 1);
+        assert!(json.contains("\"outcome_state\":\"PAID\""));
+        assert!(json.contains("\"outcome_state\":\"SENT\""));
+        assert!(json.contains("\"outcome_state\":\"UPDATED\""));
+        assert!(json.contains("\"source\":\"agent-delta:billing\""));
+        assert!(json.contains("\"source\":\"agent-delta:follow-up\""));
+        assert!(json.contains("\"review_required_category\":\"finance\""));
+        assert!(!json.contains("Acme Capital"));
+        assert!(!json.contains("Orbit Partners"));
+        assert!(!json.contains("INV-42"));
+        assert!(!json.contains("Agent outcome delta"));
+        assert!(parsed.get("node_id").is_none());
+        assert!(parsed.get("raw_text").is_none());
+        assert!(parsed.get("vector_embedding").is_none());
+        assert!(parsed.get("content_hash").is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_stats_filters_by_review_category() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-stats-category-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let finance = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let private = extract_agent_delta(
+            "Sent Slack message to Orbit Partners. Confirmation reference: MSG-9",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&finance).unwrap();
+        store.insert_memory_from_cleaned(&private).unwrap();
+
+        let json = store
+            .export_agent_delta_stats_json_filtered(
+                100,
+                false,
+                None,
+                None,
+                None,
+                Some("private communications"),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["counted_deltas"], 1);
+        assert_eq!(parsed["requires_review_count"], 1);
+        assert!(json.contains("\"review_required_category\":\"private_communications\""));
+        assert!(!json.contains("\"review_required_category\":\"finance\""));
+        assert!(!json.contains("Acme Capital"));
+        assert!(!json.contains("Orbit Partners"));
+        assert!(parsed.get("raw_text").is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agent_delta_reconciles_to_matching_entity_memory() {
         let root = std::env::temp_dir().join(format!(
             "identity-agent-delta-reconcile-test-{}",
@@ -3374,6 +3919,205 @@ mod tests {
                 && edge.relationship_type == "UPDATED_BY"
         }));
         assert_eq!(store.graph_health().unwrap().outcome_edges, 2);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_edge_export_uses_protocol_node_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-edge-export-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let context = CleanedEvent {
+            id: 79,
+            captured_event_id: 9,
+            source: "manual".to_string(),
+            cleaned_content: "Acme Capital relationship context for outreach.".to_string(),
+            content_hash: "hash-agent-edge-export-context".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        let context_id = store.insert_memory_from_cleaned(&context).unwrap();
+        let delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let delta_id = store.insert_memory_from_cleaned(&delta).unwrap();
+        let context_uid = store.node_uid_for_memory_id(context_id).unwrap().unwrap();
+        let delta_uid = store.node_uid_for_memory_id(delta_id).unwrap().unwrap();
+
+        let json = store
+            .export_agent_delta_edges_json_filtered(10, None, None)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let edges = parsed["edges"].as_array().unwrap();
+
+        assert_eq!(parsed["limit"], 10);
+        assert_eq!(parsed["counted_edges"], 2);
+        assert!(edges.iter().any(|edge| {
+            edge["source_node_id"] == delta_uid
+                && edge["target_node_id"] == context_uid
+                && edge["relationship_type"] == "OUTCOME_FOR"
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge["source_node_id"] == context_uid
+                && edge["target_node_id"] == delta_uid
+                && edge["relationship_type"] == "UPDATED_BY"
+        }));
+        assert!(!json.contains(&format!("\"source_node_id\":{delta_id}")));
+        assert!(!json.contains(&format!("\"target_node_id\":{context_id}")));
+        assert!(!json.contains("Acme Capital"));
+        assert!(!json.contains("Agent outcome delta"));
+        assert!(edges[0].get("id").is_none());
+        assert!(edges[0].get("source_id").is_none());
+        assert!(edges[0].get("target_id").is_none());
+        assert!(edges[0].get("raw_text").is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_edge_export_filters_by_node_and_relationship() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-edge-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let context = CleanedEvent {
+            id: 80,
+            captured_event_id: 10,
+            source: "manual".to_string(),
+            cleaned_content: "Acme Capital relationship context for outreach.".to_string(),
+            content_hash: "hash-agent-edge-filter-context".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        let context_id = store.insert_memory_from_cleaned(&context).unwrap();
+        let first =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        let first_id = store.insert_memory_from_cleaned(&first).unwrap();
+        let second = extract_agent_delta(
+            "Completed Acme Capital follow-up and logged next action.",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        store.insert_memory_from_cleaned(&second).unwrap();
+        let context_uid = store.node_uid_for_memory_id(context_id).unwrap().unwrap();
+        let first_uid = store.node_uid_for_memory_id(first_id).unwrap().unwrap();
+
+        let json = store
+            .export_agent_delta_edges_json_filtered(1000, Some(&first_uid), Some("SUPERSEDED_BY"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let edges = parsed["edges"].as_array().unwrap();
+
+        assert_eq!(parsed["limit"], 100);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["source_node_id"], first_uid);
+        assert_eq!(edges[0]["relationship_type"], "SUPERSEDED_BY");
+        assert_ne!(edges[0]["target_node_id"], context_uid);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_edge_export_scopes_by_delta_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-edge-scope-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let acme_context = CleanedEvent {
+            id: 81,
+            captured_event_id: 11,
+            source: "manual".to_string(),
+            cleaned_content: "Acme Capital invoice context.".to_string(),
+            content_hash: "hash-agent-edge-scope-acme-context".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        let beta_context = CleanedEvent {
+            id: 82,
+            captured_event_id: 12,
+            source: "manual".to_string(),
+            cleaned_content: "Beta Ventures outreach context.".to_string(),
+            content_hash: "hash-agent-edge-scope-beta-context".to_string(),
+            cleaned_at_ms: 2,
+            promoted_at_ms: None,
+        };
+        store.insert_memory_from_cleaned(&acme_context).unwrap();
+        store.insert_memory_from_cleaned(&beta_context).unwrap();
+
+        let billing_delta = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let billing_id = store.insert_memory_from_cleaned(&billing_delta).unwrap();
+        let follow_up_delta = extract_agent_delta(
+            "Sent follow-up to Beta Ventures. Confirmation reference: MSG-9",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let follow_up_id = store.insert_memory_from_cleaned(&follow_up_delta).unwrap();
+        let billing_uid = store.node_uid_for_memory_id(billing_id).unwrap().unwrap();
+        let follow_up_uid = store.node_uid_for_memory_id(follow_up_id).unwrap().unwrap();
+
+        let json = store
+            .export_agent_delta_edges_json_scoped(
+                100,
+                None,
+                Some("OUTCOME_FOR"),
+                false,
+                Some("agent-delta:billing"),
+                None,
+                Some("PAID"),
+                Some("finance"),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let edges = parsed["edges"].as_array().unwrap();
+
+        assert_eq!(parsed["counted_edges"], 1);
+        assert_eq!(edges[0]["source_node_id"], billing_uid);
+        assert_eq!(edges[0]["relationship_type"], "OUTCOME_FOR");
+        assert_ne!(edges[0]["source_node_id"], follow_up_uid);
+        assert!(!json.contains("Acme Capital"));
+        assert!(!json.contains("Beta Ventures"));
+        assert!(edges[0].get("raw_text").is_none());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
