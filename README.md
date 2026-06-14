@@ -107,6 +107,7 @@ cargo run -p identityd -- agent-delta-list --review-category finance --limit 10
 cargo run -p identityd -- agent-delta-list --source follow-up --limit 10
 cargo run -p identityd -- agent-delta-list --entity "Acme Capital" --limit 10
 cargo run -p identityd -- agent-delta-list --state paid --limit 10
+cargo run -p identityd -- agent-delta-show --node-id <uuid>
 cargo run -p identityd -- agent-delta-stats --limit 100
 cargo run -p identityd -- agent-delta-stats --review-only --review-category finance --source billing --state PAID --limit 100
 cargo run -p identityd -- agent-delta-edges --limit 50
@@ -337,14 +338,18 @@ and reports a compact validation JSON object with source, outcome state,
 review-required flags/categories, whether commit would require
 `--allow-sensitive`, and entity/attribute counts, without writing and without
 echoing summaries, entities, attributes, or raw text.
+`agent-delta-schema`, `agent-delta-validate`, and `agent-delta-preview` run
+before workspace setup because they only inspect the candidate contract or
+validate user-provided text/JSON. They do not create or touch a ledger.
 `agent-delta-commit` performs the same extraction or candidate-JSON validation,
-validates the candidate against the local delta schema, and writes only that
-validated candidate into local `.me` memory through the existing embedding,
-vector mirror, and at-rest protection path.
+validates the candidate against the local delta schema before workspace setup,
+and writes only that validated candidate into local `.me` memory through the
+existing embedding, vector mirror, and at-rest protection path.
 Sources are normalized as bounded lowercase slugs under the `agent-delta:`
 prefix and committed memories are classified as `agent.outcome/AGENT_DELTA`.
 Finance, health, legal identity, and private-communication outcome markers fail
-closed unless `--allow-sensitive` is passed after review. Repeating the same
+closed before ledger setup unless `--allow-sensitive` is passed after review.
+Repeating the same
 committed delta reuses a stable local
 cleaned-event id so duplicate detection returns the existing memory node before
 embedding/vector writes and retries do not bloat memory or spend unnecessary
@@ -367,6 +372,29 @@ local search/export remains useful without exposing raw session logs.
 memory, not the local SQLite row id, and includes `write_status=created` or
 `write_status=existing` so duplicate retries are visible without extra writes;
 passing `--json` returns the same bounded protocol-facing commit result as JSON.
+For a reviewed candidate JSON round trip, keep the object explicit and bounded:
+
+```powershell
+$candidate = @'
+{
+  "schema_version": 1,
+  "source": "agent-delta:follow-up",
+  "outcome_state": "SENT",
+  "summary": "Sent the reviewed follow-up to Acme Capital.",
+  "entities": ["Acme Capital"],
+  "attributes": [
+    { "key": "confirmation_reference", "value": "MSG-42" }
+  ],
+  "requires_review": false,
+  "review_required_categories": []
+}
+'@
+$candidate | cargo run -p identityd -- agent-delta-validate --candidate-json-stdin
+$candidate | cargo run -p identityd -- agent-delta-commit --candidate-json-stdin --json
+```
+
+Unknown candidate fields are rejected, and sensitive review categories still
+require `--allow-sensitive` before commit.
 `agent-delta-list` emits recent committed deltas as bounded JSON with
 protocol-facing node ids, UTC timestamps, source, outcome state, extracted
 entities, extracted delta attributes, summary, and structured attributes, plus
@@ -380,8 +408,16 @@ Use `--review-only` to show only committed deltas that require explicit review,
 `--state <STATE>` to inspect one outcome state such as `SENT`, `PAID`, or
 `FAILED`; state filters are normalized at the CLI boundary, so lowercase,
 kebab-case, and whitespace-separated input still maps to the strict stored
-uppercase state labels. Its requested limit is hard-capped at 100 rows to keep
-inspection cheap. `agent-delta-stats` accepts the same bounded filters and emits aggregate
+uppercase state labels. Unknown state and review-category filters are rejected
+before workspace setup, and `--source` / `--entity` must include explicit
+non-empty values when present. Its requested limit is hard-capped at 100 rows to
+keep inspection cheap. `agent-delta-show --node-id <uuid>` requires a UUIDv4-shaped
+protocol node id, emits the same protocol-safe JSON shape for exactly one
+committed delta, and returns no result for ordinary memory nodes or unknown ids.
+Missing or malformed node-id filters for show/edges are rejected before
+workspace setup, so simple syntax mistakes do not create or touch a ledger.
+Accepted node-id filters are normalized to canonical lowercase before lookup.
+`agent-delta-stats` accepts the same bounded filters and emits aggregate
 counts by outcome state, source, and review category, plus a review-required
 count, without summaries, entities, node ids, raw text, hashes, vectors, scores,
 or internal SQLite row ids. `agent-delta-edges` inspects bounded graph edges
@@ -390,9 +426,14 @@ touching committed agent deltas with protocol-facing source and target
 accepts the same `--review-only`, `--review-category`, `--source`, `--entity`,
 and `--state` filters as list/stats to first scope the committed delta nodes
 locally, then applies graph-specific `--node-id <uuid>` and
-`--relationship <type>` filters. Output is capped at 100 rows, relationship
-filter input is normalized the same way, and it
-omits raw text, summaries, hashes, vectors, scores, and internal SQLite row ids. This is not a session watcher and it does not observe
+`--relationship <type>` filters. The graph `--node-id` filter also requires a
+UUIDv4-shaped protocol node id and is normalized to canonical lowercase before
+lookup. Output is capped at 100 rows, relationship filter input is bounded and
+normalized the same way, and malformed relationship filters are rejected before
+workspace setup. It
+omits raw text, summaries, hashes, vectors, scores, and internal SQLite row ids.
+Malformed `--limit` values for list/stats/edges are also rejected before
+workspace setup, so syntax mistakes stay cheap and ledger-free. This is not a session watcher and it does not observe
 browser/API activity automatically; it is the smallest explicit write-back
 primitive for tested agent outcomes.
 

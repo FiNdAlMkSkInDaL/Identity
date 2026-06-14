@@ -312,6 +312,15 @@ impl IdentityStore {
         self.export_recent_agent_deltas_json_filtered(limit, false, None, None, None, None)
     }
 
+    pub fn export_agent_delta_json_by_node_uid(
+        &self,
+        node_uid: &str,
+    ) -> Result<Option<String>, IdentityError> {
+        self.backend
+            .agent_delta_by_node_uid(node_uid)
+            .map(|node| node.map(|node| agent_delta_nodes_json(&[node])))
+    }
+
     pub fn export_recent_agent_deltas_json_filtered(
         &self,
         limit: u32,
@@ -889,6 +898,21 @@ impl SqliteMemoryBackend {
             .into_iter()
             .map(decrypt_memory_node)
             .collect()
+    }
+
+    fn agent_delta_by_node_uid(&self, node_uid: &str) -> Result<Option<MemoryNode>, IdentityError> {
+        self.conn
+            .query_row(
+                "SELECT id, node_uid, cleaned_event_id, source, domain_context, entity_type, summary, structured_attributes, raw_text, content_hash, created_at_ms, created_at_utc, last_accessed_ms, last_accessed_utc
+                 FROM memory_nodes
+                 WHERE node_uid = ?1 AND domain_context = 'agent.outcome' AND entity_type = 'AGENT_DELTA'
+                 LIMIT 1",
+                [node_uid],
+                map_memory_node,
+            )
+            .optional()?
+            .map(decrypt_memory_node)
+            .transpose()
     }
 
     fn list_recent_with_embeddings(
@@ -3326,6 +3350,71 @@ mod tests {
     }
 
     #[test]
+    fn agent_delta_show_exports_one_protocol_safe_node_by_uid() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-show-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let context = CleanedEvent {
+            id: 91,
+            captured_event_id: 9,
+            source: "manual".to_string(),
+            cleaned_content: "Acme Capital context row is not an agent delta.".to_string(),
+            content_hash: "hash-agent-delta-show-context".to_string(),
+            cleaned_at_ms: 1,
+            promoted_at_ms: None,
+        };
+        let context_id = store.insert_memory_from_cleaned(&context).unwrap();
+        let context_uid = store.node_uid_for_memory_id(context_id).unwrap().unwrap();
+        let delta = extract_agent_delta(
+            "Sent follow-up to Acme Capital. Confirmation reference: MSG-42",
+            Some("follow-up"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let delta_id = store.insert_memory_from_cleaned(&delta).unwrap();
+        let delta_uid = store.node_uid_for_memory_id(delta_id).unwrap().unwrap();
+
+        let json = store
+            .export_agent_delta_json_by_node_uid(&delta_uid)
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let deltas = parsed.as_array().unwrap();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["node_id"], delta_uid);
+        assert_eq!(deltas[0]["source"], "agent-delta:follow-up");
+        assert_eq!(deltas[0]["outcome_state"], "SENT");
+        assert_eq!(deltas[0]["entities"], serde_json::json!(["Acme Capital"]));
+        assert_eq!(
+            deltas[0]["delta_attributes"],
+            serde_json::json!({"confirmation_reference": "MSG-42"})
+        );
+        assert!(deltas[0].get("id").is_none());
+        assert!(deltas[0].get("cleaned_event_id").is_none());
+        assert!(deltas[0].get("content_hash").is_none());
+        assert!(deltas[0].get("vector_embedding").is_none());
+        assert!(deltas[0].get("raw_text").is_none());
+        assert!(!json.contains("Agent outcome delta"));
+        assert!(store
+            .export_agent_delta_json_by_node_uid(&context_uid)
+            .unwrap()
+            .is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn recent_agent_delta_export_surfaces_review_categories() {
         let root = std::env::temp_dir().join(format!(
             "identity-agent-delta-list-review-test-{}",
@@ -3872,6 +3961,88 @@ mod tests {
         assert!(!json.contains("Acme Capital"));
         assert!(!json.contains("Orbit Partners"));
         assert!(parsed.get("raw_text").is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_delta_stats_combines_filters_and_respects_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-agent-delta-stats-combined-filter-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = IdentityPaths::from_root(root.clone());
+        paths.ensure().unwrap();
+
+        let store = IdentityStore::open(&paths).unwrap();
+        let first = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let second = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-43",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let orbit = extract_agent_delta(
+            "Paid invoice for Orbit Partners. Receipt reference: INV-99",
+            Some("billing"),
+        )
+        .unwrap()
+        .to_cleaned_event()
+        .unwrap();
+        let follow_up =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("follow-up"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
+        store.insert_memory_from_cleaned(&first).unwrap();
+        store.insert_memory_from_cleaned(&second).unwrap();
+        store.insert_memory_from_cleaned(&orbit).unwrap();
+        store.insert_memory_from_cleaned(&follow_up).unwrap();
+
+        let json = store
+            .export_agent_delta_stats_json_filtered(
+                1,
+                true,
+                Some("agent-delta:billing"),
+                Some("Acme Capital"),
+                Some("paid"),
+                Some("finance"),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["limit"], 1);
+        assert_eq!(parsed["counted_deltas"], 1);
+        assert_eq!(parsed["requires_review_count"], 1);
+        assert_eq!(parsed["by_outcome_state"][0]["outcome_state"], "PAID");
+        assert_eq!(parsed["by_outcome_state"][0]["count"], 1);
+        assert_eq!(parsed["by_source"][0]["source"], "agent-delta:billing");
+        assert_eq!(parsed["by_source"][0]["count"], 1);
+        assert_eq!(
+            parsed["by_review_category"][0]["review_required_category"],
+            "finance"
+        );
+        assert_eq!(parsed["by_review_category"][0]["count"], 1);
+        assert!(!json.contains("Acme Capital"));
+        assert!(!json.contains("Orbit Partners"));
+        assert!(!json.contains("INV-42"));
+        assert!(!json.contains("INV-43"));
+        assert!(!json.contains("INV-99"));
+        assert!(parsed.get("node_id").is_none());
+        assert!(parsed.get("raw_text").is_none());
+        assert!(parsed.get("vector_embedding").is_none());
+        assert!(parsed.get("content_hash").is_none());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();

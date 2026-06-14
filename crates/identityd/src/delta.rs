@@ -191,6 +191,16 @@ pub fn agent_delta_validation_json(delta: &AgentDelta) -> Result<String, AgentDe
     Ok(serde_json::to_string_pretty(&output)?)
 }
 
+pub fn is_allowed_agent_delta_outcome_state(value: &str) -> bool {
+    ALLOWED_OUTCOME_STATES.iter().any(|state| *state == value)
+}
+
+pub fn is_allowed_agent_delta_review_category(value: &str) -> bool {
+    ALLOWED_REVIEW_CATEGORIES
+        .iter()
+        .any(|category| *category == value)
+}
+
 impl AgentDelta {
     pub fn validate(&self) -> Result<(), AgentDeltaError> {
         if self.schema_version != AGENT_DELTA_SCHEMA_VERSION {

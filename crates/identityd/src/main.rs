@@ -13,7 +13,8 @@ use identityd::context_snapshot::{capture_context_snapshot, ContextSnapshot};
 use identityd::crypto::protection_backend;
 use identityd::delta::{
     agent_delta_from_json, agent_delta_schema_json, agent_delta_validation_json,
-    extract_agent_delta, normalize_agent_delta_source,
+    extract_agent_delta, is_allowed_agent_delta_outcome_state,
+    is_allowed_agent_delta_review_category, normalize_agent_delta_source,
 };
 use identityd::embedding::{
     active_embedding_health, embedding_artifact_health_for_model_path,
@@ -79,6 +80,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
         print_help();
         return Ok(());
     }
+    preflight_command_args(&command, &raw_args)?;
+    if is_workspace_free_command(&command) {
+        run_workspace_free_command(&command, &raw_args)?;
+        return Ok(());
+    }
+    let preloaded_agent_delta = if command == "agent-delta-commit" {
+        let delta = read_agent_delta_candidate(&raw_args)?;
+        ensure_agent_delta_commit_allowed(&delta, &raw_args)?;
+        Some(delta)
+    } else {
+        None
+    };
 
     let paths = if let Some(root) = read_flag(&raw_args, "--root") {
         IdentityPaths::from_root(PathBuf::from(root))
@@ -1167,20 +1180,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("{package}");
         }
         "agent-delta-list" => {
-            let limit = read_flag(&raw_args, "--limit")
-                .map(|value| value.parse::<u32>())
-                .transpose()?
-                .unwrap_or(10);
+            let limit = read_agent_delta_limit_flag(&raw_args, "agent-delta-list", 10)?;
             let review_only = has_flag(&raw_args, "--review-only");
-            let source_filter = read_flag(&raw_args, "--source")
-                .map(|source| normalize_agent_delta_source(Some(&source)));
-            let entity_filter = read_flag(&raw_args, "--entity");
-            let state_filter = read_flag(&raw_args, "--state")
-                .map(|value| normalize_outcome_state_filter(&value))
-                .filter(|value| !value.is_empty());
-            let review_category_filter = read_flag(&raw_args, "--review-category")
-                .map(|value| normalize_review_category_filter(&value))
-                .filter(|value| !value.is_empty());
+            let source_filter = read_agent_delta_source_filter_flag(&raw_args, "agent-delta-list")?;
+            let entity_filter = read_agent_delta_entity_filter_flag(&raw_args, "agent-delta-list")?;
+            let state_filter = read_agent_delta_state_filter_flag(&raw_args, "agent-delta-list")?;
+            let review_category_filter =
+                read_agent_delta_review_category_filter_flag(&raw_args, "agent-delta-list")?;
             let store = IdentityStore::open(&paths)?;
 
             println!(
@@ -1195,21 +1201,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 )?
             );
         }
+        "agent-delta-show" => {
+            let node_id = read_protocol_node_id_flag(&raw_args, "agent-delta-show", true)?
+                .ok_or("missing required --node-id value for agent-delta-show command")?;
+            let store = IdentityStore::open(&paths)?;
+            let json = store
+                .export_agent_delta_json_by_node_uid(&node_id)?
+                .ok_or_else(|| format!("no committed agent delta found for node_id={node_id}"))?;
+
+            println!("{json}");
+        }
         "agent-delta-stats" | "agent-delta-summary" => {
-            let limit = read_flag(&raw_args, "--limit")
-                .map(|value| value.parse::<u32>())
-                .transpose()?
-                .unwrap_or(100);
+            let limit = read_agent_delta_limit_flag(&raw_args, "agent-delta-stats", 100)?;
             let review_only = has_flag(&raw_args, "--review-only");
-            let source_filter = read_flag(&raw_args, "--source")
-                .map(|source| normalize_agent_delta_source(Some(&source)));
-            let entity_filter = read_flag(&raw_args, "--entity");
-            let state_filter = read_flag(&raw_args, "--state")
-                .map(|value| normalize_outcome_state_filter(&value))
-                .filter(|value| !value.is_empty());
-            let review_category_filter = read_flag(&raw_args, "--review-category")
-                .map(|value| normalize_review_category_filter(&value))
-                .filter(|value| !value.is_empty());
+            let source_filter =
+                read_agent_delta_source_filter_flag(&raw_args, "agent-delta-stats")?;
+            let entity_filter =
+                read_agent_delta_entity_filter_flag(&raw_args, "agent-delta-stats")?;
+            let state_filter = read_agent_delta_state_filter_flag(&raw_args, "agent-delta-stats")?;
+            let review_category_filter =
+                read_agent_delta_review_category_filter_flag(&raw_args, "agent-delta-stats")?;
             let store = IdentityStore::open(&paths)?;
 
             println!(
@@ -1225,26 +1236,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         "agent-delta-edges" => {
-            let limit = read_flag(&raw_args, "--limit")
-                .map(|value| value.parse::<u32>())
-                .transpose()?
-                .unwrap_or(50);
+            let limit = read_agent_delta_limit_flag(&raw_args, "agent-delta-edges", 50)?;
             let review_only = has_flag(&raw_args, "--review-only");
-            let source_filter = read_flag(&raw_args, "--source")
-                .map(|source| normalize_agent_delta_source(Some(&source)));
-            let entity_filter = read_flag(&raw_args, "--entity");
-            let state_filter = read_flag(&raw_args, "--state")
-                .map(|value| normalize_outcome_state_filter(&value))
-                .filter(|value| !value.is_empty());
-            let review_category_filter = read_flag(&raw_args, "--review-category")
-                .map(|value| normalize_review_category_filter(&value))
-                .filter(|value| !value.is_empty());
-            let node_id_filter = read_flag(&raw_args, "--node-id")
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            let relationship_filter = read_flag(&raw_args, "--relationship")
-                .map(|value| normalize_relationship_filter(&value))
-                .filter(|value| !value.is_empty());
+            let source_filter =
+                read_agent_delta_source_filter_flag(&raw_args, "agent-delta-edges")?;
+            let entity_filter =
+                read_agent_delta_entity_filter_flag(&raw_args, "agent-delta-edges")?;
+            let state_filter = read_agent_delta_state_filter_flag(&raw_args, "agent-delta-edges")?;
+            let review_category_filter =
+                read_agent_delta_review_category_filter_flag(&raw_args, "agent-delta-edges")?;
+            let node_id_filter = read_protocol_node_id_flag(&raw_args, "agent-delta-edges", false)?;
+            let relationship_filter =
+                read_agent_delta_relationship_filter_flag(&raw_args, "agent-delta-edges")?;
             let store = IdentityStore::open(&paths)?;
 
             println!(
@@ -1261,29 +1264,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 )?
             );
         }
-        "agent-delta-schema" => {
-            println!("{}", agent_delta_schema_json()?);
-        }
-        "agent-delta-validate" => {
-            let delta = read_agent_delta_candidate(&raw_args)?;
-
-            println!("{}", agent_delta_validation_json(&delta)?);
-        }
-        "agent-delta-preview" => {
-            let delta = read_agent_delta_candidate(&raw_args)?;
-
-            println!("{}", delta.to_json()?);
-        }
         "agent-delta-commit" => {
             let json_output = has_flag(&raw_args, "--json");
-            let delta = read_agent_delta_candidate(&raw_args)?;
-            if delta.requires_review() && !has_flag(&raw_args, "--allow-sensitive") {
-                return Err(format!(
-                    "agent delta requires explicit review for categories: {}; rerun with --allow-sensitive after confirming this write-back should be stored locally",
-                    delta.review_required_categories.join(",")
-                )
-                .into());
-            }
+            let delta = preloaded_agent_delta
+                .ok_or("agent-delta-commit candidate was not validated before workspace setup")?;
             let cleaned = delta.to_cleaned_event()?;
             let store = IdentityStore::open(&paths)?;
             let existing_node_id = store.node_uid_for_cleaned_event(cleaned.id)?;
@@ -1614,6 +1598,228 @@ fn read_agent_delta_text(args: &[String]) -> Result<String, Box<dyn Error>> {
         })
 }
 
+fn run_workspace_free_command(command: &str, args: &[String]) -> Result<bool, Box<dyn Error>> {
+    match command {
+        "agent-delta-schema" => {
+            println!("{}", agent_delta_schema_json()?);
+            Ok(true)
+        }
+        "agent-delta-validate" => {
+            let delta = read_agent_delta_candidate(args)?;
+            println!("{}", agent_delta_validation_json(&delta)?);
+            Ok(true)
+        }
+        "agent-delta-preview" => {
+            let delta = read_agent_delta_candidate(args)?;
+            println!("{}", delta.to_json()?);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn is_workspace_free_command(command: &str) -> bool {
+    matches!(
+        command,
+        "agent-delta-schema" | "agent-delta-validate" | "agent-delta-preview"
+    )
+}
+
+fn ensure_agent_delta_commit_allowed(
+    delta: &identityd::delta::AgentDelta,
+    args: &[String],
+) -> Result<(), Box<dyn Error>> {
+    if delta.requires_review() && !has_flag(args, "--allow-sensitive") {
+        return Err(format!(
+            "agent delta requires explicit review for categories: {}; rerun with --allow-sensitive after confirming this write-back should be stored locally",
+            delta.review_required_categories.join(",")
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn preflight_command_args(command: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
+    match command {
+        "agent-delta-list" => {
+            read_agent_delta_limit_flag(args, "agent-delta-list", 10)?;
+            read_agent_delta_source_filter_flag(args, "agent-delta-list")?;
+            read_agent_delta_entity_filter_flag(args, "agent-delta-list")?;
+            read_agent_delta_state_filter_flag(args, "agent-delta-list")?;
+            read_agent_delta_review_category_filter_flag(args, "agent-delta-list")?;
+        }
+        "agent-delta-stats" | "agent-delta-summary" => {
+            read_agent_delta_limit_flag(args, "agent-delta-stats", 100)?;
+            read_agent_delta_source_filter_flag(args, "agent-delta-stats")?;
+            read_agent_delta_entity_filter_flag(args, "agent-delta-stats")?;
+            read_agent_delta_state_filter_flag(args, "agent-delta-stats")?;
+            read_agent_delta_review_category_filter_flag(args, "agent-delta-stats")?;
+        }
+        "agent-delta-show" => {
+            read_protocol_node_id_flag(args, "agent-delta-show", true)?;
+        }
+        "agent-delta-edges" => {
+            read_agent_delta_limit_flag(args, "agent-delta-edges", 50)?;
+            read_agent_delta_source_filter_flag(args, "agent-delta-edges")?;
+            read_agent_delta_entity_filter_flag(args, "agent-delta-edges")?;
+            read_agent_delta_state_filter_flag(args, "agent-delta-edges")?;
+            read_agent_delta_review_category_filter_flag(args, "agent-delta-edges")?;
+            read_protocol_node_id_flag(args, "agent-delta-edges", false)?;
+            read_agent_delta_relationship_filter_flag(args, "agent-delta-edges")?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn read_agent_delta_limit_flag(
+    args: &[String],
+    command: &str,
+    default: u32,
+) -> Result<u32, Box<dyn Error>> {
+    let Some(index) = args.iter().position(|arg| arg == "--limit") else {
+        return Ok(default);
+    };
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| format!("missing --limit value for {command} command"))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("invalid --limit value for {command}: {value}").into());
+    }
+
+    trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("invalid --limit value for {command}: {value}").into())
+}
+
+fn read_agent_delta_source_filter_flag(
+    args: &[String],
+    command: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    read_required_optional_flag_value(args, command, "--source")
+        .map(|source| source.map(|source| normalize_agent_delta_source(Some(&source))))
+}
+
+fn read_agent_delta_entity_filter_flag(
+    args: &[String],
+    command: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    read_required_optional_flag_value(args, command, "--entity")
+}
+
+fn read_agent_delta_state_filter_flag(
+    args: &[String],
+    command: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    read_normalized_agent_delta_filter_flag(
+        args,
+        command,
+        "--state",
+        normalize_outcome_state_filter,
+        is_allowed_agent_delta_outcome_state,
+        "outcome state",
+    )
+}
+
+fn read_agent_delta_review_category_filter_flag(
+    args: &[String],
+    command: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    read_normalized_agent_delta_filter_flag(
+        args,
+        command,
+        "--review-category",
+        normalize_review_category_filter,
+        is_allowed_agent_delta_review_category,
+        "review category",
+    )
+}
+
+fn read_normalized_agent_delta_filter_flag<N, A>(
+    args: &[String],
+    command: &str,
+    flag: &str,
+    normalize: N,
+    is_allowed: A,
+    label: &str,
+) -> Result<Option<String>, Box<dyn Error>>
+where
+    N: Fn(&str) -> String,
+    A: Fn(&str) -> bool,
+{
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| format!("missing {flag} value for {command} command"))?;
+    let normalized = normalize(value);
+    if normalized.is_empty() || !is_allowed(&normalized) {
+        return Err(format!("invalid agent delta {label} for {command}: {value}").into());
+    }
+
+    Ok(Some(normalized))
+}
+
+fn read_agent_delta_relationship_filter_flag(
+    args: &[String],
+    command: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(value) = read_required_optional_flag_value(args, command, "--relationship")? else {
+        return Ok(None);
+    };
+    let normalized = normalize_relationship_filter(&value);
+    if normalized.is_empty() || normalized.len() > 64 {
+        return Err(format!("invalid --relationship value for {command}: {value}").into());
+    }
+
+    Ok(Some(normalized))
+}
+
+fn read_required_optional_flag_value(
+    args: &[String],
+    command: &str,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| format!("missing {flag} value for {command} command"))?;
+    if value.starts_with("--") {
+        return Err(format!("missing {flag} value for {command} command").into());
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("missing {flag} value for {command} command").into());
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn read_protocol_node_id_flag(
+    args: &[String],
+    command: &str,
+    required: bool,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let node_id = read_required_optional_flag_value(args, command, "--node-id")?;
+
+    match node_id {
+        Some(node_id) if is_protocol_node_id_like(&node_id) => {
+            Ok(Some(node_id.to_ascii_lowercase()))
+        }
+        Some(node_id) => Err(format!("invalid protocol node id for {command}: {node_id}").into()),
+        None if required => {
+            Err(format!("missing required --node-id value for {command} command").into())
+        }
+        None => Ok(None),
+    }
+}
+
 fn normalize_relationship_filter(value: &str) -> String {
     value
         .trim()
@@ -1642,6 +1848,30 @@ fn normalize_review_category_filter(value: &str) -> String {
         .collect::<Vec<_>>()
         .join("_")
         .to_ascii_lowercase()
+}
+
+fn is_protocol_node_id_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !byte.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+
+    bytes[14] == b'4' && matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
 }
 
 fn read_flag(args: &[String], flag: &str) -> Option<String> {
@@ -1738,6 +1968,7 @@ fn print_help() {
             "  slice-preview --intent <text> [--limit 3]\n",
             "  prompt-package --intent <text> --prompt <text> [--limit 3]\n",
             "  agent-delta-list [--limit 10] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
+            "  agent-delta-show --node-id <uuid>\n",
             "  agent-delta-stats [--limit 100] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
             "  agent-delta-edges [--limit 50] [--node-id <uuid>] [--relationship <type>] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
             "  agent-delta-schema\n",
@@ -2168,11 +2399,16 @@ fn join_f32_prefix(values: &[f32], limit: usize) -> String {
 mod tests {
     use super::{
         command_arg, completion_percent, count_ready, ensure_loopback_addr, is_help_request,
-        normalize_outcome_state_filter, normalize_relationship_filter,
-        normalize_review_category_filter, optional_string, optional_u64, optional_usize,
-        phase1_embedding_artifact_status, phase1_local_pipeline_status, phase1_next_milestone,
-        phase1_remaining_summary,
+        is_protocol_node_id_like, is_workspace_free_command, normalize_outcome_state_filter,
+        normalize_relationship_filter, normalize_review_category_filter, optional_string,
+        optional_u64, optional_usize, phase1_embedding_artifact_status,
+        phase1_local_pipeline_status, phase1_next_milestone, phase1_remaining_summary,
+        preflight_command_args, read_agent_delta_entity_filter_flag, read_agent_delta_limit_flag,
+        read_agent_delta_relationship_filter_flag, read_agent_delta_review_category_filter_flag,
+        read_agent_delta_source_filter_flag, read_agent_delta_state_filter_flag,
+        read_protocol_node_id_flag,
     };
+    use identityd::delta::extract_agent_delta;
     use std::net::SocketAddr;
 
     #[test]
@@ -2238,6 +2474,287 @@ mod tests {
             normalize_review_category_filter("private-communications"),
             "private_communications"
         );
+    }
+
+    #[test]
+    fn protocol_node_id_filter_requires_uuidv4_shape() {
+        assert!(is_protocol_node_id_like(
+            "12345678-9abc-4def-8012-3456789abcde"
+        ));
+        assert!(is_protocol_node_id_like(
+            "12345678-9abc-4def-B012-3456789abcde"
+        ));
+        assert!(!is_protocol_node_id_like(
+            "12345678-9abc-5def-8012-3456789abcde"
+        ));
+        assert!(!is_protocol_node_id_like(
+            "12345678-9abc-4def-7012-3456789abcde"
+        ));
+        assert!(!is_protocol_node_id_like("not-a-node-id"));
+    }
+
+    #[test]
+    fn agent_delta_node_id_preflight_is_strict_and_syntactic() {
+        let valid_show = vec![
+            "agent-delta-show".to_string(),
+            "--node-id".to_string(),
+            "12345678-9abc-4def-8012-3456789abcde".to_string(),
+        ];
+        let missing_show = vec!["agent-delta-show".to_string()];
+        let invalid_show = vec![
+            "agent-delta-show".to_string(),
+            "--node-id".to_string(),
+            "not-a-node-id".to_string(),
+        ];
+        let unfiltered_edges = vec!["agent-delta-edges".to_string()];
+        let invalid_edges = vec![
+            "agent-delta-edges".to_string(),
+            "--node-id".to_string(),
+            "12345678-9abc-5def-8012-3456789abcde".to_string(),
+        ];
+        let missing_edges = vec!["agent-delta-edges".to_string(), "--node-id".to_string()];
+        let next_flag_edges = vec![
+            "agent-delta-edges".to_string(),
+            "--node-id".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+        ];
+
+        assert!(preflight_command_args("agent-delta-show", &valid_show).is_ok());
+        assert!(preflight_command_args("agent-delta-show", &missing_show)
+            .unwrap_err()
+            .to_string()
+            .contains("missing required --node-id"));
+        assert!(preflight_command_args("agent-delta-show", &invalid_show)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid protocol node id"));
+        assert!(preflight_command_args("agent-delta-edges", &unfiltered_edges).is_ok());
+        assert!(preflight_command_args("agent-delta-edges", &invalid_edges)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid protocol node id"));
+        assert!(preflight_command_args("agent-delta-edges", &missing_edges)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --node-id value"));
+        assert!(
+            preflight_command_args("agent-delta-edges", &next_flag_edges)
+                .unwrap_err()
+                .to_string()
+                .contains("missing --node-id value")
+        );
+    }
+
+    #[test]
+    fn protocol_node_id_filter_normalizes_to_canonical_lowercase() {
+        let args = vec![
+            "agent-delta-show".to_string(),
+            "--node-id".to_string(),
+            "12345678-9ABC-4DEF-B012-3456789ABCDE".to_string(),
+        ];
+
+        assert_eq!(
+            read_protocol_node_id_flag(&args, "agent-delta-show", true).unwrap(),
+            Some("12345678-9abc-4def-b012-3456789abcde".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_delta_limit_preflight_is_strict_and_syntactic() {
+        let default_list = vec!["agent-delta-list".to_string()];
+        let valid_edges = vec![
+            "agent-delta-edges".to_string(),
+            "--limit".to_string(),
+            "25".to_string(),
+        ];
+        let invalid_list = vec![
+            "agent-delta-list".to_string(),
+            "--limit".to_string(),
+            "many".to_string(),
+        ];
+        let missing_stats = vec!["agent-delta-stats".to_string(), "--limit".to_string()];
+
+        assert_eq!(
+            read_agent_delta_limit_flag(&default_list, "agent-delta-list", 10).unwrap(),
+            10
+        );
+        assert_eq!(
+            read_agent_delta_limit_flag(&valid_edges, "agent-delta-edges", 50).unwrap(),
+            25
+        );
+        assert!(preflight_command_args("agent-delta-edges", &valid_edges).is_ok());
+        assert!(preflight_command_args("agent-delta-list", &invalid_list)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid --limit value"));
+        assert!(preflight_command_args("agent-delta-stats", &missing_stats)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --limit value"));
+    }
+
+    #[test]
+    fn agent_delta_enum_filter_preflight_is_strict_and_normalizing() {
+        let valid = vec![
+            "agent-delta-edges".to_string(),
+            "--state".to_string(),
+            " paid ".to_string(),
+            "--review-category".to_string(),
+            "legal identity".to_string(),
+        ];
+        let invalid_state = vec![
+            "agent-delta-list".to_string(),
+            "--state".to_string(),
+            "not real".to_string(),
+        ];
+        let invalid_review_category = vec![
+            "agent-delta-stats".to_string(),
+            "--review-category".to_string(),
+            "not sensitive".to_string(),
+        ];
+        let missing_review_category = vec![
+            "agent-delta-edges".to_string(),
+            "--review-category".to_string(),
+        ];
+
+        assert_eq!(
+            read_agent_delta_state_filter_flag(&valid, "agent-delta-edges").unwrap(),
+            Some("PAID".to_string())
+        );
+        assert_eq!(
+            read_agent_delta_review_category_filter_flag(&valid, "agent-delta-edges").unwrap(),
+            Some("legal_identity".to_string())
+        );
+        assert!(preflight_command_args("agent-delta-edges", &valid).is_ok());
+        assert!(preflight_command_args("agent-delta-list", &invalid_state)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid agent delta outcome state"));
+        assert!(
+            preflight_command_args("agent-delta-stats", &invalid_review_category)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid agent delta review category")
+        );
+        assert!(
+            preflight_command_args("agent-delta-edges", &missing_review_category)
+                .unwrap_err()
+                .to_string()
+                .contains("missing --review-category value")
+        );
+    }
+
+    #[test]
+    fn agent_delta_relationship_filter_preflight_is_bounded_and_normalizing() {
+        let valid = vec![
+            "agent-delta-edges".to_string(),
+            "--relationship".to_string(),
+            "attribute-conflicts-with".to_string(),
+        ];
+        let missing = vec![
+            "agent-delta-edges".to_string(),
+            "--relationship".to_string(),
+        ];
+        let next_flag = vec![
+            "agent-delta-edges".to_string(),
+            "--relationship".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+        ];
+        let oversized = vec![
+            "agent-delta-edges".to_string(),
+            "--relationship".to_string(),
+            "X".repeat(65),
+        ];
+
+        assert_eq!(
+            read_agent_delta_relationship_filter_flag(&valid, "agent-delta-edges").unwrap(),
+            Some("ATTRIBUTE_CONFLICTS_WITH".to_string())
+        );
+        assert!(preflight_command_args("agent-delta-edges", &valid).is_ok());
+        assert!(preflight_command_args("agent-delta-edges", &missing)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --relationship value"));
+        assert!(preflight_command_args("agent-delta-edges", &next_flag)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --relationship value"));
+        assert!(preflight_command_args("agent-delta-edges", &oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid --relationship value"));
+    }
+
+    #[test]
+    fn agent_delta_source_and_entity_filter_preflight_requires_values() {
+        let valid = vec![
+            "agent-delta-list".to_string(),
+            "--source".to_string(),
+            "Follow Up".to_string(),
+            "--entity".to_string(),
+            " Acme Capital ".to_string(),
+        ];
+        let missing_source = vec!["agent-delta-list".to_string(), "--source".to_string()];
+        let missing_entity = vec![
+            "agent-delta-edges".to_string(),
+            "--entity".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+        ];
+
+        assert_eq!(
+            read_agent_delta_source_filter_flag(&valid, "agent-delta-list").unwrap(),
+            Some("agent-delta:follow-up".to_string())
+        );
+        assert_eq!(
+            read_agent_delta_entity_filter_flag(&valid, "agent-delta-list").unwrap(),
+            Some("Acme Capital".to_string())
+        );
+        assert!(preflight_command_args("agent-delta-list", &valid).is_ok());
+        assert!(preflight_command_args("agent-delta-list", &missing_source)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --source value"));
+        assert!(preflight_command_args("agent-delta-edges", &missing_entity)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --entity value"));
+    }
+
+    #[test]
+    fn read_only_agent_delta_candidate_commands_are_workspace_free() {
+        assert!(is_workspace_free_command("agent-delta-schema"));
+        assert!(is_workspace_free_command("agent-delta-validate"));
+        assert!(is_workspace_free_command("agent-delta-preview"));
+        assert!(!is_workspace_free_command("agent-delta-commit"));
+        assert!(!is_workspace_free_command("agent-delta-list"));
+        assert!(!is_workspace_free_command("agent-delta-show"));
+        assert!(!is_workspace_free_command("agent-delta-stats"));
+        assert!(!is_workspace_free_command("agent-delta-edges"));
+    }
+
+    #[test]
+    fn agent_delta_commit_review_gate_runs_before_workspace_setup() {
+        let normal =
+            extract_agent_delta("Sent follow-up to Acme Capital.", Some("follow-up")).unwrap();
+        let sensitive = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap();
+        let no_flags = Vec::<String>::new();
+        let allow_sensitive = vec!["--allow-sensitive".to_string()];
+
+        assert!(super::ensure_agent_delta_commit_allowed(&normal, &no_flags).is_ok());
+        assert!(
+            super::ensure_agent_delta_commit_allowed(&sensitive, &no_flags)
+                .unwrap_err()
+                .to_string()
+                .contains("--allow-sensitive")
+        );
+        assert!(super::ensure_agent_delta_commit_allowed(&sensitive, &allow_sensitive).is_ok());
     }
 
     #[test]
