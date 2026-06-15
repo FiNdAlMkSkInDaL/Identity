@@ -1212,15 +1212,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("{json}");
         }
         "agent-delta-stats" | "agent-delta-summary" => {
-            let limit = read_agent_delta_limit_flag(&raw_args, "agent-delta-stats", 100)?;
+            let command_label = command.as_str();
+            let limit = read_agent_delta_limit_flag(&raw_args, command_label, 100)?;
             let review_only = has_flag(&raw_args, "--review-only");
-            let source_filter =
-                read_agent_delta_source_filter_flag(&raw_args, "agent-delta-stats")?;
-            let entity_filter =
-                read_agent_delta_entity_filter_flag(&raw_args, "agent-delta-stats")?;
-            let state_filter = read_agent_delta_state_filter_flag(&raw_args, "agent-delta-stats")?;
+            let source_filter = read_agent_delta_source_filter_flag(&raw_args, command_label)?;
+            let entity_filter = read_agent_delta_entity_filter_flag(&raw_args, command_label)?;
+            let state_filter = read_agent_delta_state_filter_flag(&raw_args, command_label)?;
             let review_category_filter =
-                read_agent_delta_review_category_filter_flag(&raw_args, "agent-delta-stats")?;
+                read_agent_delta_review_category_filter_flag(&raw_args, command_label)?;
             let store = IdentityStore::open(&paths)?;
 
             println!(
@@ -1568,7 +1567,11 @@ fn read_page_capture_text(args: &[String]) -> Result<String, Box<dyn Error>> {
 fn read_agent_delta_candidate(
     args: &[String],
 ) -> Result<identityd::delta::AgentDelta, Box<dyn Error>> {
-    if let Some(candidate_json) = read_flag(args, "--candidate-json") {
+    ensure_single_agent_delta_candidate_input(args)?;
+
+    if let Some(candidate_json) =
+        read_required_optional_flag_value(args, "agent-delta", "--candidate-json")?
+    {
         return Ok(agent_delta_from_json(&candidate_json)?);
     }
 
@@ -1578,7 +1581,7 @@ fn read_agent_delta_candidate(
         return Ok(agent_delta_from_json(&candidate_json)?);
     }
 
-    let source = read_flag(args, "--source");
+    let source = read_required_optional_flag_value(args, "agent-delta", "--source")?;
     let text = read_agent_delta_text(args)?;
     Ok(extract_agent_delta(&text, source.as_deref())?)
 }
@@ -1590,12 +1593,53 @@ fn read_agent_delta_text(args: &[String]) -> Result<String, Box<dyn Error>> {
         return Ok(content);
     }
 
-    read_flag(args, "--text")
-        .or_else(|| read_flag(args, "--content"))
-        .ok_or_else(|| {
-            "agent-delta command requires --text <outcome text>, --content <outcome text>, --stdin, --candidate-json <json>, or --candidate-json-stdin"
-                .into()
-        })
+    if let Some(text) = read_required_optional_flag_value(args, "agent-delta", "--text")? {
+        return Ok(text);
+    }
+
+    if let Some(content) = read_required_optional_flag_value(args, "agent-delta", "--content")? {
+        return Ok(content);
+    }
+
+    Err(
+        "agent-delta command requires --text <outcome text>, --content <outcome text>, --stdin, --candidate-json <json>, or --candidate-json-stdin"
+            .into(),
+    )
+}
+
+fn ensure_single_agent_delta_candidate_input(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut input_modes = Vec::new();
+    for flag in [
+        "--candidate-json",
+        "--candidate-json-stdin",
+        "--stdin",
+        "--text",
+        "--content",
+    ] {
+        ensure_flag_at_most_once(args, "agent-delta", flag)?;
+        if has_flag(args, flag) {
+            input_modes.push(flag);
+        }
+    }
+
+    if input_modes.len() > 1 {
+        return Err(format!(
+            "agent-delta command accepts exactly one candidate input mode; received {}",
+            input_modes.join(",")
+        )
+        .into());
+    }
+
+    if (has_flag(args, "--candidate-json") || has_flag(args, "--candidate-json-stdin"))
+        && has_flag(args, "--source")
+    {
+        return Err(
+            "agent-delta --source is only valid with text input; reviewed candidate JSON must include source"
+                .into(),
+        );
+    }
+
+    Ok(())
 }
 
 fn run_workspace_free_command(command: &str, args: &[String]) -> Result<bool, Box<dyn Error>> {
@@ -1650,11 +1694,11 @@ fn preflight_command_args(command: &str, args: &[String]) -> Result<(), Box<dyn 
             read_agent_delta_review_category_filter_flag(args, "agent-delta-list")?;
         }
         "agent-delta-stats" | "agent-delta-summary" => {
-            read_agent_delta_limit_flag(args, "agent-delta-stats", 100)?;
-            read_agent_delta_source_filter_flag(args, "agent-delta-stats")?;
-            read_agent_delta_entity_filter_flag(args, "agent-delta-stats")?;
-            read_agent_delta_state_filter_flag(args, "agent-delta-stats")?;
-            read_agent_delta_review_category_filter_flag(args, "agent-delta-stats")?;
+            read_agent_delta_limit_flag(args, command, 100)?;
+            read_agent_delta_source_filter_flag(args, command)?;
+            read_agent_delta_entity_filter_flag(args, command)?;
+            read_agent_delta_state_filter_flag(args, command)?;
+            read_agent_delta_review_category_filter_flag(args, command)?;
         }
         "agent-delta-show" => {
             read_protocol_node_id_flag(args, "agent-delta-show", true)?;
@@ -1679,12 +1723,16 @@ fn read_agent_delta_limit_flag(
     command: &str,
     default: u32,
 ) -> Result<u32, Box<dyn Error>> {
+    ensure_flag_at_most_once(args, command, "--limit")?;
     let Some(index) = args.iter().position(|arg| arg == "--limit") else {
         return Ok(default);
     };
     let value = args
         .get(index + 1)
         .ok_or_else(|| format!("missing --limit value for {command} command"))?;
+    if value.starts_with("--") {
+        return Err(format!("missing --limit value for {command} command").into());
+    }
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(format!("invalid --limit value for {command}: {value}").into());
@@ -1699,8 +1747,14 @@ fn read_agent_delta_source_filter_flag(
     args: &[String],
     command: &str,
 ) -> Result<Option<String>, Box<dyn Error>> {
-    read_required_optional_flag_value(args, command, "--source")
-        .map(|source| source.map(|source| normalize_agent_delta_source(Some(&source))))
+    read_required_optional_flag_value(args, command, "--source")?
+        .map(|source| {
+            if !agent_delta_source_filter_has_token(&source) {
+                return Err(format!("invalid --source value for {command}: {source}").into());
+            }
+            Ok(normalize_agent_delta_source(Some(&source)))
+        })
+        .transpose()
 }
 
 fn read_agent_delta_entity_filter_flag(
@@ -1750,12 +1804,16 @@ where
     N: Fn(&str) -> String,
     A: Fn(&str) -> bool,
 {
+    ensure_flag_at_most_once(args, command, flag)?;
     let Some(index) = args.iter().position(|arg| arg == flag) else {
         return Ok(None);
     };
     let value = args
         .get(index + 1)
         .ok_or_else(|| format!("missing {flag} value for {command} command"))?;
+    if value.starts_with("--") {
+        return Err(format!("missing {flag} value for {command} command").into());
+    }
     let normalized = normalize(value);
     if normalized.is_empty() || !is_allowed(&normalized) {
         return Err(format!("invalid agent delta {label} for {command}: {value}").into());
@@ -1784,6 +1842,7 @@ fn read_required_optional_flag_value(
     command: &str,
     flag: &str,
 ) -> Result<Option<String>, Box<dyn Error>> {
+    ensure_flag_at_most_once(args, command, flag)?;
     let Some(index) = args.iter().position(|arg| arg == flag) else {
         return Ok(None);
     };
@@ -1799,6 +1858,19 @@ fn read_required_optional_flag_value(
     }
 
     Ok(Some(trimmed.to_string()))
+}
+
+fn ensure_flag_at_most_once(
+    args: &[String],
+    command: &str,
+    flag: &str,
+) -> Result<(), Box<dyn Error>> {
+    let count = args.iter().filter(|arg| arg.as_str() == flag).count();
+    if count > 1 {
+        return Err(format!("duplicate {flag} value for {command} command").into());
+    }
+
+    Ok(())
 }
 
 fn read_protocol_node_id_flag(
@@ -1848,6 +1920,18 @@ fn normalize_review_category_filter(value: &str) -> String {
         .collect::<Vec<_>>()
         .join("_")
         .to_ascii_lowercase()
+}
+
+fn agent_delta_source_filter_has_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    let label = trimmed
+        .get(.."agent-delta:".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("agent-delta:"))
+        .map(|_| &trimmed["agent-delta:".len()..])
+        .unwrap_or(trimmed);
+    label
+        .chars()
+        .any(|character| character.is_ascii_alphanumeric())
 }
 
 fn is_protocol_node_id_like(value: &str) -> bool {
@@ -1970,11 +2054,12 @@ fn print_help() {
             "  agent-delta-list [--limit 10] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
             "  agent-delta-show --node-id <uuid>\n",
             "  agent-delta-stats [--limit 100] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
+            "  agent-delta-summary [same filters as agent-delta-stats]\n",
             "  agent-delta-edges [--limit 50] [--node-id <uuid>] [--relationship <type>] [--review-only] [--review-category <category>] [--source <label>] [--entity <name>] [--state <STATE>] (max 100)\n",
             "  agent-delta-schema\n",
-            "  agent-delta-validate (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>]\n",
-            "  agent-delta-preview (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>]\n",
-            "  agent-delta-commit (--text <outcome text> | --stdin | --candidate-json <json> | --candidate-json-stdin) [--source <label>] [--allow-sensitive] [--json]\n",
+            "  agent-delta-validate ((--text <outcome text> | --content <outcome text> | --stdin) [--source <label>] | --candidate-json <json> | --candidate-json-stdin)\n",
+            "  agent-delta-preview ((--text <outcome text> | --content <outcome text> | --stdin) [--source <label>] | --candidate-json <json> | --candidate-json-stdin)\n",
+            "  agent-delta-commit ((--text <outcome text> | --content <outcome text> | --stdin) [--source <label>] | --candidate-json <json> | --candidate-json-stdin) [--allow-sensitive] [--json]\n",
             "  process-once [--limit 10]\n",
             "  process-idle-once [--limit 10] [--idle-ms 5000]\n",
             "  pipeline-once [--process-limit 10] [--promote-limit 10] [--idle-ms 5000]\n",
@@ -2574,6 +2659,12 @@ mod tests {
             "many".to_string(),
         ];
         let missing_stats = vec!["agent-delta-stats".to_string(), "--limit".to_string()];
+        let next_flag_limit = vec![
+            "agent-delta-summary".to_string(),
+            "--limit".to_string(),
+            "--state".to_string(),
+            "paid".to_string(),
+        ];
 
         assert_eq!(
             read_agent_delta_limit_flag(&default_list, "agent-delta-list", 10).unwrap(),
@@ -2592,6 +2683,35 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing --limit value"));
+        assert!(
+            preflight_command_args("agent-delta-summary", &next_flag_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("missing --limit value")
+        );
+    }
+
+    #[test]
+    fn agent_delta_summary_alias_uses_own_preflight_label() {
+        let missing_limit = vec!["agent-delta-summary".to_string(), "--limit".to_string()];
+        let invalid_state = vec![
+            "agent-delta-summary".to_string(),
+            "--state".to_string(),
+            "not real".to_string(),
+        ];
+
+        assert!(
+            preflight_command_args("agent-delta-summary", &missing_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("agent-delta-summary")
+        );
+        assert!(
+            preflight_command_args("agent-delta-summary", &invalid_state)
+                .unwrap_err()
+                .to_string()
+                .contains("agent-delta-summary")
+        );
     }
 
     #[test]
@@ -2616,6 +2736,12 @@ mod tests {
         let missing_review_category = vec![
             "agent-delta-edges".to_string(),
             "--review-category".to_string(),
+        ];
+        let next_flag_state = vec![
+            "agent-delta-summary".to_string(),
+            "--state".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
         ];
 
         assert_eq!(
@@ -2642,6 +2768,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("missing --review-category value")
+        );
+        assert!(
+            preflight_command_args("agent-delta-summary", &next_flag_state)
+                .unwrap_err()
+                .to_string()
+                .contains("missing --state value")
         );
     }
 
@@ -2692,11 +2824,21 @@ mod tests {
         let valid = vec![
             "agent-delta-list".to_string(),
             "--source".to_string(),
-            "Follow Up".to_string(),
+            " Agent-Delta:Follow Up ".to_string(),
             "--entity".to_string(),
             " Acme Capital ".to_string(),
         ];
         let missing_source = vec!["agent-delta-list".to_string(), "--source".to_string()];
+        let invalid_source = vec![
+            "agent-delta-list".to_string(),
+            "--source".to_string(),
+            "!!!".to_string(),
+        ];
+        let invalid_prefixed_source = vec![
+            "agent-delta-list".to_string(),
+            "--source".to_string(),
+            "Agent-Delta:!!!".to_string(),
+        ];
         let missing_entity = vec![
             "agent-delta-edges".to_string(),
             "--entity".to_string(),
@@ -2717,6 +2859,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing --source value"));
+        assert!(preflight_command_args("agent-delta-list", &invalid_source)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid --source value"));
+        assert!(
+            preflight_command_args("agent-delta-list", &invalid_prefixed_source)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid --source value")
+        );
         assert!(preflight_command_args("agent-delta-edges", &missing_entity)
             .unwrap_err()
             .to_string()
@@ -2732,7 +2884,182 @@ mod tests {
         assert!(!is_workspace_free_command("agent-delta-list"));
         assert!(!is_workspace_free_command("agent-delta-show"));
         assert!(!is_workspace_free_command("agent-delta-stats"));
+        assert!(!is_workspace_free_command("agent-delta-summary"));
         assert!(!is_workspace_free_command("agent-delta-edges"));
+    }
+
+    #[test]
+    fn agent_delta_candidate_input_flags_require_values() {
+        let missing_candidate_json = vec![
+            "agent-delta-validate".to_string(),
+            "--candidate-json".to_string(),
+        ];
+        let next_flag_candidate_json = vec![
+            "agent-delta-commit".to_string(),
+            "--candidate-json".to_string(),
+            "--allow-sensitive".to_string(),
+        ];
+        let next_flag_text = vec![
+            "agent-delta-preview".to_string(),
+            "--text".to_string(),
+            "--source".to_string(),
+            "follow-up".to_string(),
+        ];
+        let next_flag_source = vec![
+            "agent-delta-preview".to_string(),
+            "--source".to_string(),
+            "--text".to_string(),
+            "Sent follow-up to Acme Capital.".to_string(),
+        ];
+
+        assert!(super::read_agent_delta_candidate(&missing_candidate_json)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --candidate-json value"));
+        assert!(super::read_agent_delta_candidate(&next_flag_candidate_json)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --candidate-json value"));
+        assert!(super::read_agent_delta_candidate(&next_flag_text)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --text value"));
+        assert!(super::read_agent_delta_candidate(&next_flag_source)
+            .unwrap_err()
+            .to_string()
+            .contains("missing --source value"));
+    }
+
+    #[test]
+    fn agent_delta_candidate_input_modes_are_mutually_exclusive() {
+        let text_and_stdin = vec![
+            "agent-delta-preview".to_string(),
+            "--text".to_string(),
+            "Sent follow-up to Acme Capital.".to_string(),
+            "--stdin".to_string(),
+        ];
+        let json_and_text = vec![
+            "agent-delta-commit".to_string(),
+            "--candidate-json".to_string(),
+            "{}".to_string(),
+            "--text".to_string(),
+            "Sent follow-up to Acme Capital.".to_string(),
+        ];
+        let text_and_content = vec![
+            "agent-delta-validate".to_string(),
+            "--text".to_string(),
+            "Sent follow-up to Acme Capital.".to_string(),
+            "--content".to_string(),
+            "Updated Acme Capital follow-up status.".to_string(),
+        ];
+
+        for args in [&text_and_stdin, &json_and_text, &text_and_content] {
+            assert!(super::read_agent_delta_candidate(args)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one candidate input mode"));
+        }
+    }
+
+    #[test]
+    fn agent_delta_single_value_flags_reject_duplicates() {
+        let duplicate_text = vec![
+            "agent-delta-preview".to_string(),
+            "--text".to_string(),
+            "Sent follow-up to Acme Capital.".to_string(),
+            "--text".to_string(),
+            "Updated follow-up status.".to_string(),
+        ];
+        let duplicate_stdin = vec![
+            "agent-delta-preview".to_string(),
+            "--stdin".to_string(),
+            "--stdin".to_string(),
+        ];
+        let duplicate_limit = vec![
+            "agent-delta-summary".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+            "--limit".to_string(),
+            "20".to_string(),
+        ];
+        let duplicate_source = vec![
+            "agent-delta-list".to_string(),
+            "--source".to_string(),
+            "billing".to_string(),
+            "--source".to_string(),
+            "follow-up".to_string(),
+        ];
+        let duplicate_node_id = vec![
+            "agent-delta-show".to_string(),
+            "--node-id".to_string(),
+            "12345678-9abc-4def-b012-3456789abcde".to_string(),
+            "--node-id".to_string(),
+            "abcdef12-3456-4abc-8def-123456789abc".to_string(),
+        ];
+        let duplicate_relationship = vec![
+            "agent-delta-edges".to_string(),
+            "--relationship".to_string(),
+            "OUTCOME_FOR".to_string(),
+            "--relationship".to_string(),
+            "UPDATED_BY".to_string(),
+        ];
+
+        assert!(super::read_agent_delta_candidate(&duplicate_text)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate --text value"));
+        assert!(super::read_agent_delta_candidate(&duplicate_stdin)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate --stdin value"));
+        assert!(
+            preflight_command_args("agent-delta-summary", &duplicate_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate --limit value")
+        );
+        assert!(
+            preflight_command_args("agent-delta-list", &duplicate_source)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate --source value")
+        );
+        assert!(
+            preflight_command_args("agent-delta-show", &duplicate_node_id)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate --node-id value")
+        );
+        assert!(
+            preflight_command_args("agent-delta-edges", &duplicate_relationship)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate --relationship value")
+        );
+    }
+
+    #[test]
+    fn agent_delta_candidate_json_rejects_external_source_override() {
+        let inline_json_and_source = vec![
+            "agent-delta-preview".to_string(),
+            "--candidate-json".to_string(),
+            "{}".to_string(),
+            "--source".to_string(),
+            "follow-up".to_string(),
+        ];
+        let stdin_json_and_source = vec![
+            "agent-delta-validate".to_string(),
+            "--candidate-json-stdin".to_string(),
+            "--source".to_string(),
+            "follow-up".to_string(),
+        ];
+
+        for args in [&inline_json_and_source, &stdin_json_and_source] {
+            assert!(super::read_agent_delta_candidate(args)
+                .unwrap_err()
+                .to_string()
+                .contains("reviewed candidate JSON must include source"));
+        }
     }
 
     #[test]

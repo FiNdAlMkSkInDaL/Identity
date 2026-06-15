@@ -164,7 +164,10 @@ pub fn agent_delta_schema_json() -> Result<String, AgentDeltaError> {
         "rules": {
             "source": "agent-delta:<bounded lowercase slug>",
             "outcome_state": "one of allowed_outcome_states",
+            "summary": "non-empty trimmed single-line bounded text",
+            "entity": "non-empty trimmed single-line bounded text; duplicates are rejected case-insensitively",
             "attribute_key": "lowercase alphanumeric snake_case",
+            "attribute_value": "non-empty trimmed single-line bounded text",
             "requires_review": "must be true exactly when review_required_categories is non-empty",
             "unknown_fields": "rejected"
         },
@@ -237,10 +240,12 @@ impl AgentDelta {
         }
 
         if self.summary.trim().is_empty()
+            || self.summary.trim() != self.summary
+            || has_control_character(&self.summary)
             || self.summary.chars().count() > MAX_DELTA_SUMMARY_CHARS + 3
         {
             return Err(AgentDeltaError::InvalidSchema(
-                "summary must be non-empty and bounded".to_string(),
+                "summary must be non-empty, trimmed, single-line, and bounded".to_string(),
             ));
         }
 
@@ -251,9 +256,13 @@ impl AgentDelta {
         }
         let mut seen_entities = Vec::new();
         for entity in &self.entities {
-            if entity.trim().is_empty() || entity.chars().count() > MAX_DELTA_ENTITY_CHARS + 3 {
+            if entity.trim().is_empty()
+                || entity.trim() != entity
+                || has_control_character(entity)
+                || entity.chars().count() > MAX_DELTA_ENTITY_CHARS + 3
+            {
                 return Err(AgentDeltaError::InvalidSchema(
-                    "entities must be non-empty and bounded".to_string(),
+                    "entities must be non-empty, trimmed, single-line, and bounded".to_string(),
                 ));
             }
             let key = entity.to_ascii_lowercase();
@@ -280,10 +289,13 @@ impl AgentDelta {
                 ));
             }
             if attribute.value.trim().is_empty()
+                || attribute.value.trim() != attribute.value
+                || has_control_character(&attribute.value)
                 || attribute.value.chars().count() > MAX_DELTA_ATTRIBUTE_VALUE_CHARS + 3
             {
                 return Err(AgentDeltaError::InvalidSchema(
-                    "attribute values must be non-empty and bounded".to_string(),
+                    "attribute values must be non-empty, trimmed, single-line, and bounded"
+                        .to_string(),
                 ));
             }
             if seen_attributes.iter().any(|seen| seen == &attribute.key) {
@@ -392,10 +404,14 @@ pub fn normalize_agent_delta_source(source: Option<&str>) -> String {
     let source = source.unwrap_or(DEFAULT_AGENT_DELTA_SOURCE).trim();
     if source.is_empty() {
         DEFAULT_AGENT_DELTA_SOURCE.to_string()
-    } else if source.starts_with(AGENT_DELTA_SOURCE_PREFIX) {
+    } else if source
+        .get(..AGENT_DELTA_SOURCE_PREFIX.len())
+        .map(|prefix| prefix.eq_ignore_ascii_case(AGENT_DELTA_SOURCE_PREFIX))
+        .unwrap_or(false)
+    {
         format!(
             "{AGENT_DELTA_SOURCE_PREFIX}{}",
-            normalize_source_label(source.trim_start_matches(AGENT_DELTA_SOURCE_PREFIX))
+            normalize_source_label(&source[AGENT_DELTA_SOURCE_PREFIX.len()..])
         )
     } else {
         format!(
@@ -751,6 +767,10 @@ fn is_valid_attribute_key(key: &str) -> bool {
     saw_character && !previous_underscore
 }
 
+fn has_control_character(value: &str) -> bool {
+    value.chars().any(|character| character.is_control())
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
@@ -835,6 +855,11 @@ mod tests {
             Some("agent-delta:Billing Review!"),
         )
         .unwrap();
+        let mixed_case_prefixed = extract_agent_delta(
+            "Updated Acme Capital follow-up status.",
+            Some("Agent-Delta:Billing Review!"),
+        )
+        .unwrap();
         let long = extract_agent_delta(
             "Updated Acme Capital follow-up status.",
             Some("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"),
@@ -843,6 +868,7 @@ mod tests {
 
         assert_eq!(delta.source, "agent-delta:follow-up-crm");
         assert_eq!(prefixed.source, "agent-delta:billing-review");
+        assert_eq!(mixed_case_prefixed.source, "agent-delta:billing-review");
         assert!(long.source.starts_with(AGENT_DELTA_SOURCE_PREFIX));
         assert!(
             long.source
@@ -927,6 +953,26 @@ mod tests {
             .unwrap()
             .iter()
             .any(|category| category == "finance"));
+        assert!(parsed["rules"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("trimmed"));
+        assert!(parsed["rules"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("single-line"));
+        assert!(parsed["rules"]["entity"]
+            .as_str()
+            .unwrap()
+            .contains("duplicates"));
+        assert!(parsed["rules"]["attribute_value"]
+            .as_str()
+            .unwrap()
+            .contains("trimmed"));
+        assert!(parsed["rules"]["attribute_value"]
+            .as_str()
+            .unwrap()
+            .contains("single-line"));
         assert_eq!(parsed["rules"]["unknown_fields"], "rejected");
 
         let template_json =
@@ -1006,6 +1052,61 @@ mod tests {
         .unwrap_err();
 
         assert!(rejected.to_string().contains("blocked capture content"));
+    }
+
+    #[test]
+    fn rejects_untrimmed_agent_delta_candidate_fields() {
+        let mut delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("test")).unwrap();
+
+        delta.summary = " Updated Acme Capital follow-up status. ".to_string();
+        assert!(delta
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("summary"));
+        delta.summary = "Updated Acme Capital\nfollow-up status.".to_string();
+        assert!(delta
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("summary"));
+
+        delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("test")).unwrap();
+        delta.entities = vec![" Acme Capital".to_string()];
+        assert!(delta
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("entities"));
+        delta.entities = vec!["Acme\nCapital".to_string()];
+        assert!(delta
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("entities"));
+
+        delta =
+            extract_agent_delta("Updated Acme Capital follow-up status.", Some("test")).unwrap();
+        delta.attributes = vec![DeltaAttribute {
+            key: "reference".to_string(),
+            value: " INV-42 ".to_string(),
+        }];
+        assert!(delta
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("attribute values"));
+        delta.attributes = vec![DeltaAttribute {
+            key: "reference".to_string(),
+            value: "INV\n42".to_string(),
+        }];
+        assert!(delta
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("attribute values"));
     }
 
     #[test]

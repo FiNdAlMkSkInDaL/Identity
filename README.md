@@ -109,6 +109,7 @@ cargo run -p identityd -- agent-delta-list --entity "Acme Capital" --limit 10
 cargo run -p identityd -- agent-delta-list --state paid --limit 10
 cargo run -p identityd -- agent-delta-show --node-id <uuid>
 cargo run -p identityd -- agent-delta-stats --limit 100
+cargo run -p identityd -- agent-delta-summary --review-only --limit 100
 cargo run -p identityd -- agent-delta-stats --review-only --review-category finance --source billing --state PAID --limit 100
 cargo run -p identityd -- agent-delta-edges --limit 50
 cargo run -p identityd -- agent-delta-edges --relationship OUTCOME_FOR --limit 50
@@ -341,6 +342,13 @@ echoing summaries, entities, attributes, or raw text.
 `agent-delta-schema`, `agent-delta-validate`, and `agent-delta-preview` run
 before workspace setup because they only inspect the candidate contract or
 validate user-provided text/JSON. They do not create or touch a ledger.
+Missing candidate input values, including a following flag where a value should
+be, are rejected on that pre-workspace path. Candidate input modes are mutually
+exclusive, so text, stdin, and candidate JSON inputs cannot be combined.
+`--source` is only accepted with text, content, or stdin extraction; reviewed
+candidate JSON must carry its own `source` field. Duplicate single-value
+candidate flags such as `--text` and `--candidate-json` are rejected rather than
+silently choosing one value.
 `agent-delta-commit` performs the same extraction or candidate-JSON validation,
 validates the candidate against the local delta schema before workspace setup,
 and writes only that validated candidate into local `.me` memory through the
@@ -393,8 +401,9 @@ $candidate | cargo run -p identityd -- agent-delta-validate --candidate-json-std
 $candidate | cargo run -p identityd -- agent-delta-commit --candidate-json-stdin --json
 ```
 
-Unknown candidate fields are rejected, and sensitive review categories still
-require `--allow-sensitive` before commit.
+Unknown candidate fields are rejected, reviewed summary/entity/attribute-value
+strings must already be trimmed, single-line, and bounded, and sensitive review
+categories still require `--allow-sensitive` before commit.
 `agent-delta-list` emits recent committed deltas as bounded JSON with
 protocol-facing node ids, UTC timestamps, source, outcome state, extracted
 entities, extracted delta attributes, summary, and structured attributes, plus
@@ -410,8 +419,11 @@ Use `--review-only` to show only committed deltas that require explicit review,
 kebab-case, and whitespace-separated input still maps to the strict stored
 uppercase state labels. Unknown state and review-category filters are rejected
 before workspace setup, and `--source` / `--entity` must include explicit
-non-empty values when present. Its requested limit is hard-capped at 100 rows to
-keep inspection cheap. `agent-delta-show --node-id <uuid>` requires a UUIDv4-shaped
+non-empty values when present. Duplicate single-value filters such as `--limit`,
+`--source`, `--entity`, `--state`, `--review-category`, `--node-id`, and
+`--relationship` are rejected before workspace setup instead of being resolved
+by argument order. Its requested limit is hard-capped at 100 rows to keep
+inspection cheap. `agent-delta-show --node-id <uuid>` requires a UUIDv4-shaped
 protocol node id, emits the same protocol-safe JSON shape for exactly one
 committed delta, and returns no result for ordinary memory nodes or unknown ids.
 Missing or malformed node-id filters for show/edges are rejected before
@@ -420,7 +432,8 @@ Accepted node-id filters are normalized to canonical lowercase before lookup.
 `agent-delta-stats` accepts the same bounded filters and emits aggregate
 counts by outcome state, source, and review category, plus a review-required
 count, without summaries, entities, node ids, raw text, hashes, vectors, scores,
-or internal SQLite row ids. `agent-delta-edges` inspects bounded graph edges
+or internal SQLite row ids. `agent-delta-summary` is the same aggregate view and
+accepts the same filters. `agent-delta-edges` inspects bounded graph edges
 touching committed agent deltas with protocol-facing source and target
 `node_id` values, relationship type, edge weight, and UTC edge timestamps. It
 accepts the same `--review-only`, `--review-category`, `--source`, `--entity`,
@@ -430,12 +443,20 @@ locally, then applies graph-specific `--node-id <uuid>` and
 UUIDv4-shaped protocol node id and is normalized to canonical lowercase before
 lookup. Output is capped at 100 rows, relationship filter input is bounded and
 normalized the same way, and malformed relationship filters are rejected before
-workspace setup. It
-omits raw text, summaries, hashes, vectors, scores, and internal SQLite row ids.
-Malformed `--limit` values for list/stats/edges are also rejected before
+workspace setup. It omits raw text, summaries, hashes, vectors, scores, and
+internal SQLite row ids.
+Malformed `--limit` values for list/stats-summary/edges are also rejected before
 workspace setup, so syntax mistakes stay cheap and ledger-free. This is not a session watcher and it does not observe
 browser/API activity automatically; it is the smallest explicit write-back
 primitive for tested agent outcomes.
+
+Compact inspection examples after a committed JSON write:
+
+```powershell
+cargo run -p identityd -- agent-delta-show --node-id <node_id-from-commit-json>
+cargo run -p identityd -- agent-delta-edges --node-id <same-node-id> --relationship OUTCOME_FOR --limit 20
+cargo run -p identityd -- agent-delta-edges --source billing --entity "Acme Capital" --state paid --review-category finance --relationship UPDATED_BY --limit 20
+```
 
 Use `doctor` as the Phase 1 readiness check. It reports raw queue/vector health,
 primary vector mirror health, explicit Phase 1 markers, and a

@@ -4290,6 +4290,49 @@ mod tests {
         assert!(!json.contains("Beta Ventures"));
         assert!(edges[0].get("raw_text").is_none());
 
+        let node_scoped_json = store
+            .export_agent_delta_edges_json_scoped(
+                100,
+                Some(&billing_uid),
+                Some("UPDATED_BY"),
+                true,
+                Some("agent-delta:billing"),
+                Some("Acme Capital"),
+                Some("paid"),
+                Some("finance"),
+            )
+            .unwrap();
+        let node_scoped: serde_json::Value = serde_json::from_str(&node_scoped_json).unwrap();
+        let node_scoped_edges = node_scoped["edges"].as_array().unwrap();
+
+        assert_eq!(node_scoped["counted_edges"], 1);
+        assert_eq!(node_scoped_edges[0]["target_node_id"], billing_uid);
+        assert_eq!(node_scoped_edges[0]["relationship_type"], "UPDATED_BY");
+        assert_ne!(node_scoped_edges[0]["target_node_id"], follow_up_uid);
+        assert!(!node_scoped_json.contains("Acme Capital"));
+        assert!(!node_scoped_json.contains("INV-42"));
+        assert!(node_scoped_edges[0].get("id").is_none());
+
+        let mismatched_json = store
+            .export_agent_delta_edges_json_scoped(
+                100,
+                Some(&follow_up_uid),
+                Some("UPDATED_BY"),
+                true,
+                Some("agent-delta:billing"),
+                Some("Acme Capital"),
+                Some("paid"),
+                Some("finance"),
+            )
+            .unwrap();
+        let mismatched: serde_json::Value = serde_json::from_str(&mismatched_json).unwrap();
+
+        assert_eq!(mismatched["counted_edges"], 0);
+        assert!(mismatched["edges"].as_array().unwrap().is_empty());
+        assert!(!mismatched_json.contains("Acme Capital"));
+        assert!(!mismatched_json.contains("Beta Ventures"));
+        assert!(!mismatched_json.contains("INV-42"));
+
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
