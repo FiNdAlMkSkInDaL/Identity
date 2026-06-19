@@ -1284,16 +1284,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
             };
 
             if json_output {
-                let output = serde_json::json!({
-                    "node_id": node_id,
-                    "write_status": write_status,
-                    "source": delta.source,
-                    "outcome_state": delta.outcome_state,
-                    "requires_review": delta.requires_review(),
-                    "review_required_categories": delta.review_required_categories,
-                    "summary": delta.summary,
-                });
-                println!("{}", serde_json::to_string_pretty(&output)?);
+                println!(
+                    "{}",
+                    agent_delta_commit_result_json(&node_id, write_status, &delta)?
+                );
             } else {
                 println!(
                     "committed agent delta: node_id={} write_status={} source={} outcome_state={} review_required={} summary={}",
@@ -1518,6 +1512,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn agent_delta_commit_result_json(
+    node_id: &str,
+    write_status: &str,
+    delta: &identityd::delta::AgentDelta,
+) -> Result<String, serde_json::Error> {
+    let output = serde_json::json!({
+        "node_id": node_id,
+        "write_status": write_status,
+        "source": &delta.source,
+        "outcome_state": &delta.outcome_state,
+        "requires_review": delta.requires_review(),
+        "review_required_categories": &delta.review_required_categories,
+    });
+    serde_json::to_string_pretty(&output)
 }
 
 fn current_binary_size_bytes() -> Option<u64> {
@@ -1761,7 +1771,14 @@ fn read_agent_delta_entity_filter_flag(
     args: &[String],
     command: &str,
 ) -> Result<Option<String>, Box<dyn Error>> {
-    read_required_optional_flag_value(args, command, "--entity")
+    read_required_optional_flag_value(args, command, "--entity")?
+        .map(|entity| {
+            if !agent_delta_entity_filter_has_token(&entity) {
+                return Err(format!("invalid --entity value for {command}: {entity}").into());
+            }
+            Ok(entity)
+        })
+        .transpose()
 }
 
 fn read_agent_delta_state_filter_flag(
@@ -1830,7 +1847,10 @@ fn read_agent_delta_relationship_filter_flag(
         return Ok(None);
     };
     let normalized = normalize_relationship_filter(&value);
-    if normalized.is_empty() || normalized.len() > 64 {
+    if normalized.is_empty()
+        || normalized.len() > 64
+        || !is_agent_delta_relationship_filter(&normalized)
+    {
         return Err(format!("invalid --relationship value for {command}: {value}").into());
     }
 
@@ -1902,6 +1922,21 @@ fn normalize_relationship_filter(value: &str) -> String {
         .to_ascii_uppercase()
 }
 
+fn is_agent_delta_relationship_filter(value: &str) -> bool {
+    let mut saw_alphanumeric = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            saw_alphanumeric = true;
+            continue;
+        }
+        if character != '_' {
+            return false;
+        }
+    }
+
+    saw_alphanumeric
+}
+
 fn normalize_outcome_state_filter(value: &str) -> String {
     value
         .trim()
@@ -1930,6 +1965,13 @@ fn agent_delta_source_filter_has_token(value: &str) -> bool {
         .map(|_| &trimmed["agent-delta:".len()..])
         .unwrap_or(trimmed);
     label
+        .chars()
+        .any(|character| character.is_ascii_alphanumeric())
+}
+
+fn agent_delta_entity_filter_has_token(value: &str) -> bool {
+    value
+        .trim()
         .chars()
         .any(|character| character.is_ascii_alphanumeric())
 }
@@ -2799,6 +2841,11 @@ mod tests {
             "--relationship".to_string(),
             "X".repeat(65),
         ];
+        let punctuation_only = vec![
+            "agent-delta-edges".to_string(),
+            "--relationship".to_string(),
+            "!!!".to_string(),
+        ];
 
         assert_eq!(
             read_agent_delta_relationship_filter_flag(&valid, "agent-delta-edges").unwrap(),
@@ -2817,6 +2864,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid --relationship value"));
+        assert!(
+            preflight_command_args("agent-delta-edges", &punctuation_only)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid --relationship value")
+        );
     }
 
     #[test]
@@ -2838,6 +2891,11 @@ mod tests {
             "agent-delta-list".to_string(),
             "--source".to_string(),
             "Agent-Delta:!!!".to_string(),
+        ];
+        let invalid_entity = vec![
+            "agent-delta-stats".to_string(),
+            "--entity".to_string(),
+            "!!!".to_string(),
         ];
         let missing_entity = vec![
             "agent-delta-edges".to_string(),
@@ -2869,6 +2927,10 @@ mod tests {
                 .to_string()
                 .contains("invalid --source value")
         );
+        assert!(preflight_command_args("agent-delta-stats", &invalid_entity)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid --entity value"));
         assert!(preflight_command_args("agent-delta-edges", &missing_entity)
             .unwrap_err()
             .to_string()
@@ -3082,6 +3144,40 @@ mod tests {
                 .contains("--allow-sensitive")
         );
         assert!(super::ensure_agent_delta_commit_allowed(&sensitive, &allow_sensitive).is_ok());
+    }
+
+    #[test]
+    fn agent_delta_commit_json_is_minimal_protocol_receipt() {
+        let delta = extract_agent_delta(
+            "Paid invoice for Acme Capital. Receipt reference: INV-42",
+            Some("billing"),
+        )
+        .unwrap();
+
+        let json = super::agent_delta_commit_result_json(
+            "12345678-9abc-4def-8012-3456789abcde",
+            "created",
+            &delta,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["node_id"], "12345678-9abc-4def-8012-3456789abcde");
+        assert_eq!(parsed["write_status"], "created");
+        assert_eq!(parsed["source"], "agent-delta:billing");
+        assert_eq!(parsed["outcome_state"], "PAID");
+        assert_eq!(parsed["requires_review"], true);
+        assert_eq!(
+            parsed["review_required_categories"],
+            serde_json::json!(["finance"])
+        );
+        assert!(parsed.get("summary").is_none());
+        assert!(parsed.get("entities").is_none());
+        assert!(parsed.get("attributes").is_none());
+        assert!(parsed.get("raw_text").is_none());
+        assert!(parsed.get("content_hash").is_none());
+        assert!(!json.contains("Acme Capital"));
+        assert!(!json.contains("INV-42"));
     }
 
     #[test]

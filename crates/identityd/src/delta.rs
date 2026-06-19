@@ -169,6 +169,7 @@ pub fn agent_delta_schema_json() -> Result<String, AgentDeltaError> {
             "attribute_key": "lowercase alphanumeric snake_case",
             "attribute_value": "non-empty trimmed single-line bounded text",
             "requires_review": "must be true exactly when review_required_categories is non-empty",
+            "review_required_categories": "must include any sensitive categories inferred from outcome_state, summary, entities, and attributes",
             "unknown_fields": "rejected"
         },
         "candidate_template": candidate_template
@@ -328,6 +329,19 @@ impl AgentDelta {
             }
             seen_review_categories.push(category.clone());
         }
+        let inferred_review_categories =
+            review_required_categories(&self.review_category_surface());
+        for category in inferred_review_categories {
+            if !self
+                .review_required_categories
+                .iter()
+                .any(|existing| existing == &category)
+            {
+                return Err(AgentDeltaError::InvalidSchema(format!(
+                    "review_required_categories must include inferred sensitive category: {category}"
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -382,6 +396,18 @@ impl AgentDelta {
 
     pub fn requires_review(&self) -> bool {
         self.requires_review
+    }
+
+    fn review_category_surface(&self) -> String {
+        let mut parts = vec![self.outcome_state.as_str(), self.summary.as_str()];
+        for entity in &self.entities {
+            parts.push(entity.as_str());
+        }
+        for attribute in &self.attributes {
+            parts.push(attribute.key.as_str());
+            parts.push(attribute.value.as_str());
+        }
+        parts.join(" ")
     }
 
     fn validate_safety(&self) -> Result<(), AgentDeltaError> {
@@ -973,6 +999,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("single-line"));
+        assert!(parsed["rules"]["review_required_categories"]
+            .as_str()
+            .unwrap()
+            .contains("inferred"));
         assert_eq!(parsed["rules"]["unknown_fields"], "rejected");
 
         let template_json =
@@ -1052,6 +1082,28 @@ mod tests {
         .unwrap_err();
 
         assert!(rejected.to_string().contains("blocked capture content"));
+    }
+
+    #[test]
+    fn rejects_underdeclared_sensitive_agent_delta_json_candidate() {
+        let rejected = agent_delta_from_json(
+            r#"{
+                "schema_version": 1,
+                "source": "agent-delta:billing",
+                "outcome_state": "PAID",
+                "summary": "Paid invoice for Acme Capital.",
+                "entities": ["Acme Capital"],
+                "attributes": [
+                    { "key": "receipt_reference", "value": "INV-42" }
+                ],
+                "requires_review": false,
+                "review_required_categories": []
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(rejected.to_string().contains("review_required_categories"));
+        assert!(rejected.to_string().contains("finance"));
     }
 
     #[test]

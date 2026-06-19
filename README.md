@@ -330,7 +330,8 @@ plus the outbound security blacklist, and emits a bounded structured JSON
 candidate with `schema_version`, outcome state, summary, obvious entities,
 key/value attributes, `requires_review`, and any review-required categories. It
 can also validate a reviewed candidate through `--candidate-json <json>` or
-`--candidate-json-stdin`, rejecting unknown fields and unsafe content.
+`--candidate-json-stdin`, rejecting unknown fields, unsafe content, and
+under-declared sensitive review categories.
 `agent-delta-schema` prints the local reviewed-candidate contract as JSON,
 including the schema version, source prefix, allowed outcome states, allowed
 review categories, field limits, validation rules, and a candidate template.
@@ -379,7 +380,9 @@ local search/export remains useful without exposing raw session logs.
 `agent-delta-commit` reports the protocol-facing node id for the committed
 memory, not the local SQLite row id, and includes `write_status=created` or
 `write_status=existing` so duplicate retries are visible without extra writes;
-passing `--json` returns the same bounded protocol-facing commit result as JSON.
+passing `--json` returns the same bounded protocol-facing commit receipt as
+JSON without echoing the summary, entities, attributes, raw text, hashes,
+vectors, or internal row ids.
 For a reviewed candidate JSON round trip, keep the object explicit and bounded:
 
 ```powershell
@@ -402,13 +405,18 @@ $candidate | cargo run -p identityd -- agent-delta-commit --candidate-json-stdin
 ```
 
 Unknown candidate fields are rejected, reviewed summary/entity/attribute-value
-strings must already be trimmed, single-line, and bounded, and sensitive review
-categories still require `--allow-sensitive` before commit.
+strings must already be trimmed, single-line, and bounded, and reviewed JSON
+must include any sensitive review categories inferred from its outcome state,
+summary, entities, and attributes. Sensitive review categories still require
+`--allow-sensitive` before commit.
 `agent-delta-list` emits recent committed deltas as bounded JSON with
 protocol-facing node ids, UTC timestamps, source, outcome state, extracted
 entities, extracted delta attributes, summary, and structured attributes, plus
 top-level `requires_review` and review-category fields; it does not include raw
-text, hashes, vector blobs, scores, or internal SQLite row ids.
+text, hashes, vector blobs, scores, or internal SQLite row ids. For committed
+agent deltas, source labels are canonicalized and summary/structured-attribute
+fields are reconstructed from bounded agent-delta labels rather than trusted
+from arbitrary stored metadata.
 Use `--review-only` to show only committed deltas that require explicit review,
 `--review-category <category>` to inspect one sensitive review category such as
 `finance`, `health`, `legal_identity`, or `private_communications`,
@@ -435,7 +443,8 @@ count, without summaries, entities, node ids, raw text, hashes, vectors, scores,
 or internal SQLite row ids. `agent-delta-summary` is the same aggregate view and
 accepts the same filters. `agent-delta-edges` inspects bounded graph edges
 touching committed agent deltas with protocol-facing source and target
-`node_id` values, relationship type, edge weight, and UTC edge timestamps. It
+`node_id` values, canonical relationship type, edge weight, and UTC edge
+timestamps. Malformed legacy relationship labels are exported as `UNKNOWN`. It
 accepts the same `--review-only`, `--review-category`, `--source`, `--entity`,
 and `--state` filters as list/stats to first scope the committed delta nodes
 locally, then applies graph-specific `--node-id <uuid>` and

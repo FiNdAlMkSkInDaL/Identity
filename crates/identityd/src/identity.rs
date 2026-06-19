@@ -1,6 +1,10 @@
 use crate::crypto::{
     is_protected_text, protect_text, unprotect_text, CryptoError, PROTECTED_PREFIX,
 };
+use crate::delta::{
+    is_allowed_agent_delta_outcome_state, is_allowed_agent_delta_review_category,
+    normalize_agent_delta_source,
+};
 use crate::embedding::{
     from_le_bytes, EmbeddingArtifactHealth, EmbeddingEngine, EmbeddingRuntimeInfo, EMBEDDING_DIM,
 };
@@ -15,6 +19,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const AGENT_DELTA_RECONCILE_SCAN_LIMIT: u32 = 200;
 const AGENT_DELTA_RECONCILE_LINK_LIMIT: usize = 4;
 const AGENT_DELTA_LIST_MAX_LIMIT: u32 = 100;
+const AGENT_DELTA_EXPORT_MAX_SUMMARY_CHARS: usize = 240;
+const AGENT_DELTA_EXPORT_MAX_ENTITIES: usize = 6;
+const AGENT_DELTA_EXPORT_MAX_ENTITY_CHARS: usize = 80;
+const AGENT_DELTA_EXPORT_MAX_ATTRIBUTES: usize = 8;
+const AGENT_DELTA_EXPORT_MAX_ATTRIBUTE_KEY_CHARS: usize = 64;
+const AGENT_DELTA_EXPORT_MAX_ATTRIBUTE_VALUE_CHARS: usize = 240;
+const AGENT_DELTA_EXPORT_MAX_REVIEW_CATEGORIES: usize = 4;
+const UNMATCHABLE_AGENT_DELTA_SOURCE_FILTER: &str = "agent-delta:\0";
+const UNMATCHABLE_AGENT_DELTA_ENTITY_FILTER: &str = "\0";
+const UNMATCHABLE_AGENT_DELTA_STATE_FILTER: &str = "\0";
+const UNMATCHABLE_AGENT_DELTA_REVIEW_CATEGORY_FILTER: &str = "\0";
+const UNMATCHABLE_AGENT_DELTA_NODE_ID_FILTER: &str = "\0";
+const UNMATCHABLE_AGENT_DELTA_RELATIONSHIP_FILTER: &str = "\0";
 
 #[derive(Debug)]
 pub struct MemoryNode {
@@ -316,8 +333,9 @@ impl IdentityStore {
         &self,
         node_uid: &str,
     ) -> Result<Option<String>, IdentityError> {
+        let node_uid = canonical_protocol_node_id(node_uid);
         self.backend
-            .agent_delta_by_node_uid(node_uid)
+            .agent_delta_by_node_uid(&node_uid)
             .map(|node| node.map(|node| agent_delta_nodes_json(&[node])))
     }
 
@@ -391,19 +409,24 @@ impl IdentityStore {
         state_filter: Option<&str>,
         review_category_filter: Option<&str>,
     ) -> Result<String, IdentityError> {
+        let source_filter = normalized_agent_delta_source_filter(source_filter);
+        let entity_filter = normalized_agent_delta_entity_filter(entity_filter);
+        let state_filter = normalized_agent_delta_state_filter(state_filter);
+        let review_category_filter =
+            normalized_agent_delta_review_category_filter(review_category_filter);
         let has_delta_filter = review_only
-            || source_filter.is_some()
-            || entity_filter.is_some()
-            || state_filter.is_some()
-            || review_category_filter.is_some();
+            || source_filter.as_deref().is_some()
+            || entity_filter.as_deref().is_some()
+            || state_filter.as_deref().is_some()
+            || review_category_filter.as_deref().is_some();
         let delta_node_uids = if has_delta_filter {
             self.recent_agent_delta_nodes_filtered(
                 AGENT_DELTA_LIST_MAX_LIMIT,
                 review_only,
-                source_filter,
-                entity_filter,
-                state_filter,
-                review_category_filter,
+                source_filter.as_deref(),
+                entity_filter.as_deref(),
+                state_filter.as_deref(),
+                review_category_filter.as_deref(),
             )?
             .into_iter()
             .map(|node| node.node_uid)
@@ -440,11 +463,16 @@ impl IdentityStore {
         review_category_filter: Option<&str>,
     ) -> Result<Vec<MemoryNode>, IdentityError> {
         let limit = limit.min(AGENT_DELTA_LIST_MAX_LIMIT);
+        let source_filter = normalized_agent_delta_source_filter(source_filter);
+        let entity_filter = normalized_agent_delta_entity_filter(entity_filter);
+        let state_filter = normalized_agent_delta_state_filter(state_filter);
+        let review_category_filter =
+            normalized_agent_delta_review_category_filter(review_category_filter);
         let has_filter = review_only
-            || source_filter.is_some()
-            || entity_filter.is_some()
-            || state_filter.is_some()
-            || review_category_filter.is_some();
+            || source_filter.as_deref().is_some()
+            || entity_filter.as_deref().is_some()
+            || state_filter.as_deref().is_some()
+            || review_category_filter.as_deref().is_some();
         let scan_limit = if has_filter {
             AGENT_DELTA_LIST_MAX_LIMIT
         } else {
@@ -459,17 +487,21 @@ impl IdentityStore {
             .into_iter()
             .filter(|node| {
                 let source_matches = source_filter
-                    .map(|source| node.source == source)
+                    .as_deref()
+                    .map(|source| agent_delta_export_source(node) == source)
                     .unwrap_or(true);
                 let entity_matches = entity_filter
+                    .as_deref()
                     .map(|entity| agent_delta_has_entity(&node.raw_text, entity))
                     .unwrap_or(true);
                 let state_matches = state_filter
+                    .as_deref()
                     .map(|state| agent_delta_has_outcome_state(&node.raw_text, state))
                     .unwrap_or(true);
                 let review_categories = agent_delta_review_categories(&node.raw_text);
                 let review_matches = !review_only || !review_categories.is_empty();
                 let review_category_matches = review_category_filter
+                    .as_deref()
                     .map(|category| {
                         agent_delta_has_review_category_in(&review_categories, category)
                     })
@@ -1459,12 +1491,8 @@ impl SqliteMemoryBackend {
         relationship_filter: Option<&str>,
         delta_node_filter: Option<&[String]>,
     ) -> Result<Vec<ProtocolAgentDeltaEdge>, IdentityError> {
-        let node_id_filter = node_id_filter
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let relationship_filter = relationship_filter
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+        let node_id_filter = normalized_agent_delta_node_id_filter(node_id_filter);
+        let relationship_filter = normalized_agent_delta_relationship_filter(relationship_filter);
         let delta_node_filter = delta_node_filter
             .map(|nodes| {
                 nodes
@@ -1520,10 +1548,11 @@ impl SqliteMemoryBackend {
         let rows = statement.query_map(params_from_iter(values), |row| {
             let created_at_ms = row.get::<_, i64>(4)?;
             let updated_at_ms = row.get::<_, i64>(5)?;
+            let relationship_type = row.get::<_, String>(2)?;
             Ok(ProtocolAgentDeltaEdge {
                 source_node_id: row.get(0)?,
                 target_node_id: row.get(1)?,
-                relationship_type: row.get(2)?,
+                relationship_type: agent_delta_export_relationship_type(&relationship_type),
                 edge_weight: row.get(3)?,
                 created_at_utc: iso8601_utc_from_ms(created_at_ms),
                 updated_at_utc: iso8601_utc_from_ms(updated_at_ms),
@@ -2242,13 +2271,30 @@ fn agent_delta_attributes(content: &str) -> String {
 }
 
 fn agent_delta_entity_values(content: &str) -> Vec<String> {
-    content
+    let mut entities = Vec::<String>::new();
+    for entity in content
         .lines()
         .filter_map(|line| line.strip_prefix("Entity:"))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
+        .filter_map(|value| {
+            bounded_agent_delta_export_value(value, AGENT_DELTA_EXPORT_MAX_ENTITY_CHARS)
+        })
+    {
+        let normalized = normalize_entity_filter(&entity);
+        if normalized.is_empty()
+            || !agent_delta_filter_has_ascii_token(&normalized)
+            || entities
+                .iter()
+                .any(|existing| normalize_entity_filter(existing) == normalized)
+        {
+            continue;
+        }
+        entities.push(entity);
+        if entities.len() >= AGENT_DELTA_EXPORT_MAX_ENTITIES {
+            break;
+        }
+    }
+
+    entities
 }
 
 fn agent_delta_has_entity(content: &str, expected: &str) -> bool {
@@ -2282,31 +2328,149 @@ fn agent_delta_has_outcome_state(content: &str, expected: &str) -> bool {
 }
 
 fn normalize_outcome_state_filter(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_uppercase()
+    value
+        .trim()
+        .replace('-', "_")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_ascii_uppercase()
+}
+
+fn agent_delta_outcome_state_value(content: &str) -> String {
+    labelled_value(content, "Outcome state:")
+        .map(|state| normalize_outcome_state_filter(&state))
+        .filter(|state| is_allowed_agent_delta_outcome_state(state))
+        .unwrap_or_else(|| "UNKNOWN".to_string())
+}
+
+fn agent_delta_export_summary(content: &str) -> String {
+    let outcome_state = agent_delta_outcome_state_value(content);
+    let summary = labelled_value(content, "Summary:").and_then(|value| {
+        bounded_agent_delta_export_value(&value, AGENT_DELTA_EXPORT_MAX_SUMMARY_CHARS)
+    });
+    let entities = agent_delta_entity_values(content);
+    let mut parts = Vec::new();
+
+    if outcome_state != "UNKNOWN" {
+        parts.push(format!("agent outcome {outcome_state}"));
+    }
+    if let Some(summary) = summary {
+        parts.push(summary);
+    }
+    if !entities.is_empty() {
+        parts.push(format!("entities {}", entities.join(", ")));
+    }
+
+    if parts.is_empty() {
+        "agent outcome delta".to_string()
+    } else {
+        summarize(&parts.join("; "))
+    }
 }
 
 fn agent_delta_review_categories(content: &str) -> Vec<String> {
-    labelled_value(content, "Review required categories:")
-        .map(|categories| {
-            categories
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut output = Vec::new();
+    let Some(categories) = labelled_value(content, "Review required categories:") else {
+        return output;
+    };
+
+    for category in categories
+        .split(',')
+        .map(normalize_review_category_filter)
+        .filter(|category| is_allowed_agent_delta_review_category(category))
+    {
+        if output.iter().any(|existing| existing == &category) {
+            continue;
+        }
+        output.push(category);
+        if output.len() >= AGENT_DELTA_EXPORT_MAX_REVIEW_CATEGORIES {
+            break;
+        }
+    }
+
+    output
 }
 
 fn agent_delta_has_review_category_in(categories: &[String], expected: &str) -> bool {
     let expected = normalize_review_category_filter(expected);
-    if expected.is_empty() {
-        return true;
+    if expected.is_empty() || !is_allowed_agent_delta_review_category(&expected) {
+        return false;
     }
 
     categories
         .iter()
         .any(|category| normalize_review_category_filter(category) == expected)
+}
+
+fn normalized_agent_delta_source_filter(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(UNMATCHABLE_AGENT_DELTA_SOURCE_FILTER.to_string());
+    }
+    if !agent_delta_source_filter_has_token(value) {
+        return Some(UNMATCHABLE_AGENT_DELTA_SOURCE_FILTER.to_string());
+    }
+
+    Some(normalize_agent_delta_source(Some(value)))
+}
+
+fn normalized_agent_delta_entity_filter(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(UNMATCHABLE_AGENT_DELTA_ENTITY_FILTER.to_string());
+    }
+    if !agent_delta_filter_has_ascii_token(value) {
+        return Some(UNMATCHABLE_AGENT_DELTA_ENTITY_FILTER.to_string());
+    }
+
+    Some(value.to_string())
+}
+
+fn normalized_agent_delta_state_filter(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(UNMATCHABLE_AGENT_DELTA_STATE_FILTER.to_string());
+    }
+    let normalized = normalize_outcome_state_filter(value);
+    if !is_allowed_agent_delta_outcome_state(&normalized) {
+        return Some(UNMATCHABLE_AGENT_DELTA_STATE_FILTER.to_string());
+    }
+
+    Some(normalized)
+}
+
+fn normalized_agent_delta_review_category_filter(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(UNMATCHABLE_AGENT_DELTA_REVIEW_CATEGORY_FILTER.to_string());
+    }
+    let normalized = normalize_review_category_filter(value);
+    if !is_allowed_agent_delta_review_category(&normalized) {
+        return Some(UNMATCHABLE_AGENT_DELTA_REVIEW_CATEGORY_FILTER.to_string());
+    }
+
+    Some(normalized)
+}
+
+fn agent_delta_source_filter_has_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    let label = trimmed
+        .get(.."agent-delta:".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("agent-delta:"))
+        .map(|_| &trimmed["agent-delta:".len()..])
+        .unwrap_or(trimmed);
+    agent_delta_filter_has_ascii_token(label)
+}
+
+fn agent_delta_filter_has_ascii_token(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| character.is_ascii_alphanumeric())
 }
 
 fn normalize_review_category_filter(value: &str) -> String {
@@ -2319,14 +2483,142 @@ fn normalize_review_category_filter(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn normalize_relationship_filter(value: &str) -> String {
+    value
+        .trim()
+        .replace('-', "_")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+        .to_ascii_uppercase()
+}
+
+fn normalized_agent_delta_node_id_filter(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(UNMATCHABLE_AGENT_DELTA_NODE_ID_FILTER.to_string());
+    }
+
+    Some(canonical_protocol_node_id(value))
+}
+
+fn normalized_agent_delta_relationship_filter(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(UNMATCHABLE_AGENT_DELTA_RELATIONSHIP_FILTER.to_string());
+    }
+
+    let normalized = normalize_relationship_filter(value);
+    if normalized.len() > 64 || !is_agent_delta_relationship_filter(&normalized) {
+        return Some(UNMATCHABLE_AGENT_DELTA_RELATIONSHIP_FILTER.to_string());
+    }
+
+    Some(normalized)
+}
+
+fn agent_delta_export_relationship_type(value: &str) -> String {
+    let normalized = normalize_relationship_filter(value);
+    if is_agent_delta_protocol_relationship(&normalized) {
+        normalized
+    } else {
+        "UNKNOWN".to_string()
+    }
+}
+
+fn is_agent_delta_protocol_relationship(value: &str) -> bool {
+    matches!(
+        value,
+        "OUTCOME_FOR"
+            | "UPDATED_BY"
+            | "SUPERSEDES"
+            | "SUPERSEDED_BY"
+            | "ATTRIBUTE_CONFLICTS_WITH"
+            | "ATTRIBUTE_REPLACED_BY"
+            | "UPDATES"
+            | "RELATED_TO"
+            | "DOCUMENTS"
+            | "REFERENCES"
+            | "MANUAL_RELATED_TO"
+    )
+}
+
+fn is_agent_delta_relationship_filter(value: &str) -> bool {
+    let mut saw_alphanumeric = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            saw_alphanumeric = true;
+            continue;
+        }
+        if character != '_' {
+            return false;
+        }
+    }
+
+    saw_alphanumeric
+}
+
+fn bounded_agent_delta_export_value(value: &str, max_chars: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || has_agent_delta_export_control_character(value) {
+        return None;
+    }
+
+    Some(truncate_agent_delta_export_chars(value, max_chars))
+}
+
+fn truncate_agent_delta_export_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn has_agent_delta_export_control_character(value: &str) -> bool {
+    value.chars().any(|character| character.is_control())
+}
+
+fn is_agent_delta_export_attribute_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.chars().count() <= AGENT_DELTA_EXPORT_MAX_ATTRIBUTE_KEY_CHARS
+        && key.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
 fn agent_delta_attribute_pairs(content: &str) -> Vec<(String, String)> {
-    content
+    let mut attributes = Vec::new();
+    for (key, value) in content
         .lines()
         .filter_map(|line| line.strip_prefix("Attribute "))
         .filter_map(|line| line.split_once(':'))
-        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
-        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
-        .collect()
+    {
+        let key = key.trim();
+        if !is_agent_delta_export_attribute_key(key) {
+            continue;
+        }
+        let Some(value) =
+            bounded_agent_delta_export_value(value, AGENT_DELTA_EXPORT_MAX_ATTRIBUTE_VALUE_CHARS)
+        else {
+            continue;
+        };
+        if attributes
+            .iter()
+            .any(|(existing_key, _)| existing_key == key)
+        {
+            continue;
+        }
+        attributes.push((key.to_string(), value));
+        if attributes.len() >= AGENT_DELTA_EXPORT_MAX_ATTRIBUTES {
+            break;
+        }
+    }
+
+    attributes
 }
 
 fn agent_delta_attributes_conflict(
@@ -2494,9 +2786,9 @@ fn agent_delta_nodes_json(nodes: &[MemoryNode]) -> String {
             &node.last_accessed_utc,
             true,
         );
-        push_json_string_field(&mut output, "source", &node.source, true);
-        let outcome_state = labelled_value(&node.raw_text, "Outcome state:")
-            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let source = agent_delta_export_source(node);
+        push_json_string_field(&mut output, "source", &source, true);
+        let outcome_state = agent_delta_outcome_state_value(&node.raw_text);
         push_json_string_field(&mut output, "outcome_state", &outcome_state, true);
         push_json_string_array_field(
             &mut output,
@@ -2510,7 +2802,8 @@ fn agent_delta_nodes_json(nodes: &[MemoryNode]) -> String {
             &agent_delta_attribute_pairs(&node.raw_text),
             true,
         );
-        push_json_string_field(&mut output, "summary", &node.summary, true);
+        let summary = agent_delta_export_summary(&node.raw_text);
+        push_json_string_field(&mut output, "summary", &summary, true);
         let review_categories = agent_delta_review_categories(&node.raw_text);
         output.push_str(",\"requires_review\":");
         output.push_str(if review_categories.is_empty() {
@@ -2525,12 +2818,46 @@ fn agent_delta_nodes_json(nodes: &[MemoryNode]) -> String {
             true,
         );
         output.push_str(",\"structured_attributes\":");
-        output.push_str(normalized_json_object(&node.structured_attributes));
+        output.push_str(&agent_delta_structured_attributes_json(node));
         output.push('}');
     }
 
     output.push(']');
     output
+}
+
+fn agent_delta_structured_attributes_json(node: &MemoryNode) -> String {
+    let mut output = String::from("{");
+    let outcome_state = agent_delta_outcome_state_value(&node.raw_text);
+    let summary = agent_delta_export_summary(&node.raw_text);
+    let source = agent_delta_export_source(node);
+    push_json_string_field(&mut output, "outcome_state", &outcome_state, false);
+    push_json_string_field(&mut output, "delta_source", &source, true);
+    push_json_string_field(&mut output, "summary", &summary, true);
+    push_json_string_array_field(
+        &mut output,
+        "entities",
+        &agent_delta_entity_values(&node.raw_text),
+        true,
+    );
+    push_json_string_array_field(
+        &mut output,
+        "review_required_categories",
+        &agent_delta_review_categories(&node.raw_text),
+        true,
+    );
+    push_json_object_field(
+        &mut output,
+        "delta_attributes",
+        &agent_delta_attribute_pairs(&node.raw_text),
+        true,
+    );
+    output.push('}');
+    output
+}
+
+fn agent_delta_export_source(node: &MemoryNode) -> String {
+    normalize_agent_delta_source(Some(&node.source))
 }
 
 fn agent_delta_stats_json(nodes: &[MemoryNode], limit: u32) -> String {
@@ -2540,9 +2867,10 @@ fn agent_delta_stats_json(nodes: &[MemoryNode], limit: u32) -> String {
     let mut requires_review_count = 0_u32;
 
     for node in nodes {
-        *by_source.entry(node.source.clone()).or_insert(0) += 1;
-        let outcome_state = labelled_value(&node.raw_text, "Outcome state:")
-            .unwrap_or_else(|| "UNKNOWN".to_string());
+        *by_source
+            .entry(agent_delta_export_source(node))
+            .or_insert(0) += 1;
+        let outcome_state = agent_delta_outcome_state_value(&node.raw_text);
         *by_outcome_state.entry(outcome_state).or_insert(0) += 1;
 
         let review_categories = agent_delta_review_categories(&node.raw_text);
@@ -2654,6 +2982,10 @@ fn push_json_string_field(output: &mut String, key: &str, value: &str, needs_com
     output.push_str("\":\"");
     output.push_str(&json_escape(value));
     output.push('"');
+}
+
+fn canonical_protocol_node_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn normalized_json_object(value: &str) -> &str {
@@ -3109,6 +3441,7 @@ mod tests {
         summarize_capture, summarize_web_capture, summarize_windows_activity,
         web_capture_attributes, windows_activity_attributes, IdentityStore, MemoryNode,
         ProtocolGraphEdge, ProtocolMemoryNode, SqliteMemoryBackend,
+        AGENT_DELTA_EXPORT_MAX_ATTRIBUTES, AGENT_DELTA_EXPORT_MAX_ENTITIES,
     };
     use crate::crypto::is_protected_text;
     use crate::delta::extract_agent_delta;
@@ -3399,6 +3732,13 @@ mod tests {
             deltas[0]["delta_attributes"],
             serde_json::json!({"confirmation_reference": "MSG-42"})
         );
+        let uppercase_delta_uid = format!(" {} ", delta_uid.to_ascii_uppercase());
+        let uppercase_json = store
+            .export_agent_delta_json_by_node_uid(&uppercase_delta_uid)
+            .unwrap()
+            .unwrap();
+        let uppercase_parsed: serde_json::Value = serde_json::from_str(&uppercase_json).unwrap();
+        assert_eq!(uppercase_parsed[0]["node_id"], delta_uid);
         assert!(deltas[0].get("id").is_none());
         assert!(deltas[0].get("cleaned_event_id").is_none());
         assert!(deltas[0].get("content_hash").is_none());
@@ -3614,6 +3954,16 @@ mod tests {
 
     #[test]
     fn recent_agent_delta_export_filters_by_outcome_state() {
+        assert_eq!(super::normalize_outcome_state_filter(" paid "), "PAID");
+        assert_eq!(
+            super::normalize_outcome_state_filter("review-needed"),
+            "REVIEW_NEEDED"
+        );
+        assert_eq!(
+            super::normalize_outcome_state_filter("review needed"),
+            "REVIEW_NEEDED"
+        );
+
         let root = std::env::temp_dir().join(format!(
             "identity-agent-delta-list-state-filter-test-{}",
             SystemTime::now()
@@ -3710,6 +4060,12 @@ mod tests {
         assert!(deltas[0].get("content_hash").is_none());
         assert!(deltas[0].get("vector_embedding").is_none());
 
+        let blank_category_json = store
+            .export_recent_agent_deltas_json_filtered(10, false, None, None, None, Some("   "))
+            .unwrap();
+        let blank_category: serde_json::Value = serde_json::from_str(&blank_category_json).unwrap();
+        assert!(blank_category.as_array().unwrap().is_empty());
+
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3737,7 +4093,11 @@ mod tests {
             .backend
             .conn
             .execute(
-                "UPDATE memory_nodes SET structured_attributes = '{not-json}' WHERE id = ?1",
+                "UPDATE memory_nodes
+                    SET structured_attributes = '{\"raw_text\":\"private structured leak\",\"content_hash\":\"hash-leak\",\"id\":42}',
+                        summary = 'private summary leak',
+                        source = 'Agent-Delta:Follow Up Source With Spaces'
+                  WHERE id = ?1",
                 [memory_id],
             )
             .unwrap();
@@ -3745,8 +4105,158 @@ mod tests {
         let json = store.export_recent_agent_deltas_json(10).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed[0]["structured_attributes"], serde_json::json!({}));
-        assert!(!json.contains("{not-json}"));
+        assert!(parsed[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Updated Acme Capital"));
+        assert_eq!(
+            parsed[0]["structured_attributes"]["outcome_state"],
+            "UPDATED"
+        );
+        assert_eq!(
+            parsed[0]["structured_attributes"]["summary"],
+            parsed[0]["summary"]
+        );
+        assert_eq!(
+            parsed[0]["source"],
+            "agent-delta:follow-up-source-with-spaces"
+        );
+        assert_eq!(
+            parsed[0]["structured_attributes"]["delta_source"],
+            parsed[0]["source"]
+        );
+        assert_eq!(
+            parsed[0]["structured_attributes"]["entities"],
+            serde_json::json!(["Acme Capital"])
+        );
+        assert!(parsed[0]["structured_attributes"].get("raw_text").is_none());
+        assert!(parsed[0]["structured_attributes"]
+            .get("content_hash")
+            .is_none());
+        assert!(parsed[0]["structured_attributes"].get("id").is_none());
+        assert!(!json.contains("private structured leak"));
+        assert!(!json.contains("private summary leak"));
+        assert!(!json.contains("hash-leak"));
+        assert!(!json.contains("Agent-Delta:Follow Up Source With Spaces"));
+
+        let source_filter_json = store
+            .export_recent_agent_deltas_json_filtered(
+                10,
+                false,
+                Some("follow up source with spaces"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let source_filter: serde_json::Value = serde_json::from_str(&source_filter_json).unwrap();
+        assert_eq!(source_filter.as_array().unwrap().len(), 1);
+
+        let long_entity = "A".repeat(120);
+        let long_value = "v".repeat(280);
+        let bad_outcome = "raw private state that should not be exported ".repeat(8);
+        let mut legacy_text = format!(
+            "Agent outcome delta\nOutcome state: {bad_outcome}\nDelta source: agent-delta:manual\nSummary: Legacy oversized row.\n",
+        );
+        legacy_text.push_str("Entity: !!!\n");
+        legacy_text.push_str(&format!("Entity: {long_entity}\n"));
+        for index in 0..8 {
+            legacy_text.push_str(&format!("Entity: Entity {index}\n"));
+        }
+        legacy_text.push_str("Review required categories: finance, finance, unknown free text, private communications, health, legal identity\n");
+        for index in 0..10 {
+            legacy_text.push_str(&format!("Attribute key_{index}: {long_value}\n"));
+        }
+        legacy_text.push_str("Attribute Bad Key: should be omitted\n");
+        legacy_text.push_str("Attribute key_0: duplicate should be omitted\n");
+        store
+            .backend
+            .conn
+            .execute(
+                "UPDATE memory_nodes SET raw_text = ?1 WHERE id = ?2",
+                params![legacy_text, memory_id],
+            )
+            .unwrap();
+
+        let bounded_json = store.export_recent_agent_deltas_json(10).unwrap();
+        let bounded: serde_json::Value = serde_json::from_str(&bounded_json).unwrap();
+        let entities = bounded[0]["entities"].as_array().unwrap();
+        let attributes = bounded[0]["delta_attributes"].as_object().unwrap();
+
+        assert_eq!(bounded[0]["outcome_state"], "UNKNOWN");
+        assert!(!bounded_json.contains("raw private state"));
+        assert!(bounded[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Legacy oversized row."));
+        assert_eq!(
+            bounded[0]["structured_attributes"]["summary"],
+            bounded[0]["summary"]
+        );
+        assert_eq!(entities.len(), AGENT_DELTA_EXPORT_MAX_ENTITIES);
+        assert!(entities[0].as_str().unwrap().ends_with("..."));
+        assert!(!bounded_json.contains("!!!"));
+        assert!(!bounded_json.contains("Entity 5"));
+        assert_eq!(
+            bounded[0]["review_required_categories"],
+            serde_json::json!([
+                "finance",
+                "private_communications",
+                "health",
+                "legal_identity"
+            ])
+        );
+        assert_eq!(attributes.len(), AGENT_DELTA_EXPORT_MAX_ATTRIBUTES);
+        assert!(attributes["key_0"].as_str().unwrap().ends_with("..."));
+        assert!(attributes.get("Bad Key").is_none());
+        assert!(!bounded_json.contains("duplicate should be omitted"));
+
+        let stats_json = store
+            .export_agent_delta_stats_json_filtered(10, false, None, None, None, None)
+            .unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        assert_eq!(stats["by_outcome_state"][0]["outcome_state"], "UNKNOWN");
+        assert_eq!(
+            stats["by_source"][0]["source"],
+            "agent-delta:follow-up-source-with-spaces"
+        );
+        assert!(!stats_json.contains("raw private state"));
+
+        let invalid_entity_json = store
+            .export_recent_agent_deltas_json_filtered(10, false, None, Some("!!!"), None, None)
+            .unwrap();
+        let invalid_entity: serde_json::Value = serde_json::from_str(&invalid_entity_json).unwrap();
+        assert!(invalid_entity.as_array().unwrap().is_empty());
+
+        let invalid_state_json = store
+            .export_recent_agent_deltas_json_filtered(
+                10,
+                false,
+                None,
+                None,
+                Some(&bad_outcome),
+                None,
+            )
+            .unwrap();
+        let invalid_state: serde_json::Value = serde_json::from_str(&invalid_state_json).unwrap();
+        assert!(invalid_state.as_array().unwrap().is_empty());
+
+        store
+            .backend
+            .conn
+            .execute(
+                "UPDATE memory_nodes SET raw_text = 'unlabelled raw secret payload' WHERE id = ?1",
+                [memory_id],
+            )
+            .unwrap();
+        let fallback_json = store.export_recent_agent_deltas_json(10).unwrap();
+        let fallback: serde_json::Value = serde_json::from_str(&fallback_json).unwrap();
+        assert_eq!(fallback[0]["summary"], "agent outcome delta");
+        assert_eq!(
+            fallback[0]["structured_attributes"]["summary"],
+            fallback[0]["summary"]
+        );
+        assert!(!fallback_json.contains("unlabelled raw secret payload"));
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -3822,15 +4332,21 @@ mod tests {
                 .unwrap()
                 .to_cleaned_event()
                 .unwrap();
+        let manual_delta =
+            extract_agent_delta("Observed Acme Capital account note.", Some("manual"))
+                .unwrap()
+                .to_cleaned_event()
+                .unwrap();
         store.insert_memory_from_cleaned(&acme_billing).unwrap();
         store.insert_memory_from_cleaned(&orbit_billing).unwrap();
         store.insert_memory_from_cleaned(&acme_follow_up).unwrap();
+        store.insert_memory_from_cleaned(&manual_delta).unwrap();
 
         let json = store
             .export_recent_agent_deltas_json_filtered(
                 10,
                 true,
-                Some("agent-delta:billing"),
+                Some(" Billing "),
                 Some("Acme Capital"),
                 Some("paid"),
                 None,
@@ -3847,6 +4363,30 @@ mod tests {
             deltas[0]["review_required_categories"],
             serde_json::json!(["finance"])
         );
+
+        let invalid_source_json = store
+            .export_recent_agent_deltas_json_filtered(10, false, Some("!!!"), None, None, None)
+            .unwrap();
+        let invalid_source: serde_json::Value = serde_json::from_str(&invalid_source_json).unwrap();
+        assert!(invalid_source.as_array().unwrap().is_empty());
+
+        let blank_source_json = store
+            .export_recent_agent_deltas_json_filtered(10, false, Some("   "), None, None, None)
+            .unwrap();
+        let blank_source: serde_json::Value = serde_json::from_str(&blank_source_json).unwrap();
+        assert!(blank_source.as_array().unwrap().is_empty());
+
+        let blank_entity_json = store
+            .export_recent_agent_deltas_json_filtered(10, false, None, Some("   "), None, None)
+            .unwrap();
+        let blank_entity: serde_json::Value = serde_json::from_str(&blank_entity_json).unwrap();
+        assert!(blank_entity.as_array().unwrap().is_empty());
+
+        let blank_state_json = store
+            .export_recent_agent_deltas_json_filtered(10, false, None, None, Some("   "), None)
+            .unwrap();
+        let blank_state: serde_json::Value = serde_json::from_str(&blank_state_json).unwrap();
+        assert!(blank_state.as_array().unwrap().is_empty());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -4014,7 +4554,7 @@ mod tests {
             .export_agent_delta_stats_json_filtered(
                 1,
                 true,
-                Some("agent-delta:billing"),
+                Some(" billing "),
                 Some("Acme Capital"),
                 Some("paid"),
                 Some("finance"),
@@ -4154,6 +4694,26 @@ mod tests {
         assert!(edges[0].get("target_id").is_none());
         assert!(edges[0].get("raw_text").is_none());
 
+        store
+            .backend
+            .conn
+            .execute(
+                "UPDATE graph_edges SET relationship_type = ?1 WHERE source_node_id = ?2 AND target_node_id = ?3",
+                params!["private relationship leak !!!", delta_id, context_id],
+            )
+            .unwrap();
+        let legacy_json = store
+            .export_agent_delta_edges_json_filtered(10, None, None)
+            .unwrap();
+        let legacy: serde_json::Value = serde_json::from_str(&legacy_json).unwrap();
+        let legacy_edges = legacy["edges"].as_array().unwrap();
+        assert!(!legacy_json.contains("private relationship leak"));
+        assert!(legacy_edges.iter().any(|edge| {
+            edge["source_node_id"] == delta_uid
+                && edge["target_node_id"] == context_uid
+                && edge["relationship_type"] == "UNKNOWN"
+        }));
+
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
@@ -4197,9 +4757,14 @@ mod tests {
         store.insert_memory_from_cleaned(&second).unwrap();
         let context_uid = store.node_uid_for_memory_id(context_id).unwrap().unwrap();
         let first_uid = store.node_uid_for_memory_id(first_id).unwrap().unwrap();
+        let uppercase_first_uid = format!(" {} ", first_uid.to_ascii_uppercase());
 
         let json = store
-            .export_agent_delta_edges_json_filtered(1000, Some(&first_uid), Some("SUPERSEDED_BY"))
+            .export_agent_delta_edges_json_filtered(
+                1000,
+                Some(&uppercase_first_uid),
+                Some(" superseded by "),
+            )
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let edges = parsed["edges"].as_array().unwrap();
@@ -4209,6 +4774,39 @@ mod tests {
         assert_eq!(edges[0]["source_node_id"], first_uid);
         assert_eq!(edges[0]["relationship_type"], "SUPERSEDED_BY");
         assert_ne!(edges[0]["target_node_id"], context_uid);
+
+        let invalid_json = store
+            .export_agent_delta_edges_json_filtered(100, None, Some("!!!"))
+            .unwrap();
+        let invalid: serde_json::Value = serde_json::from_str(&invalid_json).unwrap();
+        assert_eq!(invalid["counted_edges"], 0);
+        assert!(invalid["edges"].as_array().unwrap().is_empty());
+
+        let blank_node_json = store
+            .export_agent_delta_edges_json_filtered(100, Some("   "), None)
+            .unwrap();
+        let blank_node: serde_json::Value = serde_json::from_str(&blank_node_json).unwrap();
+        assert_eq!(blank_node["counted_edges"], 0);
+        assert!(blank_node["edges"].as_array().unwrap().is_empty());
+
+        let blank_relationship_json = store
+            .export_agent_delta_edges_json_filtered(100, None, Some("   "))
+            .unwrap();
+        let blank_relationship: serde_json::Value =
+            serde_json::from_str(&blank_relationship_json).unwrap();
+        assert_eq!(blank_relationship["counted_edges"], 0);
+        assert!(blank_relationship["edges"].as_array().unwrap().is_empty());
+
+        let oversized_relationship_json = store
+            .export_agent_delta_edges_json_filtered(100, None, Some(&"X".repeat(65)))
+            .unwrap();
+        let oversized_relationship: serde_json::Value =
+            serde_json::from_str(&oversized_relationship_json).unwrap();
+        assert_eq!(oversized_relationship["counted_edges"], 0);
+        assert!(oversized_relationship["edges"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -4273,7 +4871,7 @@ mod tests {
                 None,
                 Some("OUTCOME_FOR"),
                 false,
-                Some("agent-delta:billing"),
+                Some(" billing "),
                 None,
                 Some("PAID"),
                 Some("finance"),
@@ -4296,7 +4894,7 @@ mod tests {
                 Some(&billing_uid),
                 Some("UPDATED_BY"),
                 true,
-                Some("agent-delta:billing"),
+                Some(" AGENT-DELTA:BILLING "),
                 Some("Acme Capital"),
                 Some("paid"),
                 Some("finance"),
